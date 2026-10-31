@@ -53,13 +53,13 @@ Id Model::Add(int p, const std::wstring &path, Id group, int index, bool activat
     if (index < 0 || index > (int)v.size())
         index = (int)v.size();
     v.insert(v.begin() + index, std::move(t));
+    if (activate && group)
+        SetGroupCollapsed(p, group, false);
     if (activate || !panes[p].selected) {
         panes[p].selected = id;
         if (activate)
             active = p;
     }
-    if (activate && group)
-        SetGroupCollapsed(p, group, false);
     return id;
 }
 void Model::Navigate(Id id, const std::wstring &path, bool append) {
@@ -113,6 +113,9 @@ void Model::Cleanup(int p) {
     std::erase_if(pane.groups, [&](auto &g) {
         return std::none_of(pane.tabs.begin(), pane.tabs.end(), [&](auto &t) { return t.group == g.id; });
     });
+    for (auto &g : pane.groups)
+        if (auto *t = Find(g.lastSelected); !t || t->group != g.id || PaneOf(t->id) != p)
+            g.lastSelected = 0;
     if (pane.tabs.empty())
         Add(p, Home, 0, -1, false);
     if (Index(p, pane.selected) < 0)
@@ -248,12 +251,28 @@ void Model::SetGroupCollapsed(int p, Id group, bool collapsed) {
     auto *g = FindGroup(p, group);
     if (!g)
         return;
+    // 必须在改变本栏选择前记录被收起组的当前标签。
+    auto remember = [&](Group &item) {
+        if (!item.collapsed)
+            if (auto *tab = Find(panes[p].selected); tab && tab->group == item.id)
+                item.lastSelected = tab->id;
+    };
+    bool expanding = g->collapsed && !collapsed;
+    if (collapsed)
+        remember(*g);
     g->collapsed = collapsed;
     if (!collapsed && singleExpandedGroup) {
         for (auto &other : panes[p].groups)
-            if (other.id != group)
+            if (other.id != group) {
+                remember(other);
                 other.collapsed = true;
-        if (!Visible(p, panes[p].selected))
+            }
+    }
+    if (expanding || !Visible(p, panes[p].selected)) {
+        auto *saved = Find(g->lastSelected);
+        if (!collapsed && saved && saved->group == group && PaneOf(saved->id) == p)
+            panes[p].selected = saved->id;
+        else if (!collapsed)
             for (const auto &tab : panes[p].tabs)
                 if (tab.group == group) {
                     panes[p].selected = tab.id;
@@ -277,8 +296,12 @@ void Model::NormalizeGroups(int p) {
                     keep = g->id;
                     break;
                 }
-        for (auto &g : panes[p].groups)
+        for (auto &g : panes[p].groups) {
+            if (g.id != keep && !g.collapsed)
+                if (auto *tab = Find(panes[p].selected); tab && tab->group == g.id)
+                    g.lastSelected = tab->id;
             g.collapsed = g.id != keep;
+        }
     }
     EnsureVisibleSelection(p);
 }
@@ -295,15 +318,17 @@ GroupExpansionState Model::CaptureGroups(int p) const {
     state.pane = p;
     state.selected = panes[p].selected;
     for (const auto &g : panes[p].groups)
-        state.groups.emplace_back(g.id, g.collapsed);
+        state.groups.push_back({g.id, g.collapsed, g.lastSelected});
     return state;
 }
 void Model::RestoreGroups(const GroupExpansionState &state) {
     if (state.pane < 0 || state.pane > 1)
         return;
-    for (const auto &[id, collapsed] : state.groups)
-        if (auto *g = FindGroup(state.pane, id))
+    for (const auto &[id, collapsed, lastSelected] : state.groups)
+        if (auto *g = FindGroup(state.pane, id)) {
             g->collapsed = collapsed;
+            g->lastSelected = lastSelected;
+        }
     if (Visible(state.pane, state.selected))
         panes[state.pane].selected = state.selected;
     NormalizeGroups(state.pane);
@@ -381,9 +406,9 @@ void Model::MoveGroup(int source, Id group, int target, int index) {
     index = std::clamp(index, 0, (int)v.size());
     v.insert(v.begin() + index, moving.begin(), moving.end());
     if (carries) {
+        SetGroupCollapsed(target, group, false);
         panes[target].selected = selected;
         active = target;
-        SetGroupCollapsed(target, group, false);
     } else
         active = oldActive;
     if (source != target && !carries)
@@ -391,6 +416,8 @@ void Model::MoveGroup(int source, Id group, int target, int index) {
     Cleanup(target);
 }
 bool Model::Valid() const {
+    if (windowDpi && (windowDpi < 48 || windowDpi > 960))
+        return false;
     if (active < 0 || active > 1 || !std::isfinite(split) || split < .1 || split > .9 || recent.size() > 10)
         return false;
     std::set<Id> all;

@@ -1,4 +1,5 @@
 #include "platform.h"
+#include <commoncontrols.h>
 #include <iomanip>
 #include <sstream>
 namespace zen {
@@ -198,11 +199,51 @@ bool Confirm(HWND w, const std::wstring &text) {
     int selected = 0;
     return SUCCEEDED(TaskDialogIndirect(&c, &selected, nullptr, nullptr)) && selected == IDOK;
 }
+HICON SystemImageIcon(int index, int size) {
+    if (index < 0 || size <= 0)
+        return nullptr;
+    // 从足够大的系统图像列表取图，再缩小到目标像素尺寸，不放大小图。
+    for (int kind : {SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO}) {
+        ComPtr<IImageList> list;
+        if (FAILED(SHGetImageList(kind, IID_PPV_ARGS(&list))))
+            continue;
+        int width = 0, height = 0;
+        if (FAILED(list->GetIconSize(&width, &height)) || width < size || height < size)
+            continue;
+        HICON original = nullptr;
+        if (FAILED(list->GetIcon(index, ILD_TRANSPARENT, &original)))
+            continue;
+        HICON result = (HICON)CopyImage(original, IMAGE_ICON, size, size, 0);
+        DestroyIcon(original);
+        return result;
+    }
+    return nullptr;
+}
 struct Prompt {
     HWND edit{};
+    HFONT font{};
+    UINT dpi = 96;
     bool done = false, ok = false;
     std::wstring value, hint;
 };
+static void LayoutPrompt(HWND w, Prompt &p) {
+    auto scale = [&](int v) { return MulDiv(v, p.dpi, 96); };
+    HFONT next = CreateFontW(-scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+                             CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    if (next) {
+        for (HWND child = GetWindow(w, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+            SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
+        if (p.font)
+            DeleteObject(p.font);
+        p.font = next;
+    }
+    MoveWindow(p.edit, scale(16), scale(20), scale(380), scale(28), TRUE);
+    int y = p.hint.empty() ? 65 : 125;
+    MoveWindow(GetDlgItem(w, IDOK), scale(215), scale(y), scale(85), scale(30), TRUE);
+    MoveWindow(GetDlgItem(w, IDCANCEL), scale(310), scale(y), scale(85), scale(30), TRUE);
+    if (!p.hint.empty())
+        MoveWindow(GetDlgItem(w, 102), scale(16), scale(58), scale(380), scale(62), TRUE);
+}
 static LRESULT CALLBACK PromptProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     auto *p = (Prompt *)GetWindowLongPtrW(w, GWLP_USERDATA);
     if (m == WM_NCCREATE) {
@@ -218,11 +259,25 @@ static LRESULT CALLBACK PromptProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 310, p->hint.empty() ? 65 : 125,
                       85, 30, w, (HMENU)IDCANCEL, nullptr, nullptr);
         if (!p->hint.empty())
-            CreateWindowW(L"STATIC", p->hint.c_str(), WS_CHILD | WS_VISIBLE, 16, 58, 380, 62, w, nullptr,
+            CreateWindowW(L"STATIC", p->hint.c_str(), WS_CHILD | WS_VISIBLE, 16, 58, 380, 62, w, (HMENU)102,
                           nullptr, nullptr);
+        p->dpi = GetDpiForWindow(w);
+        LayoutPrompt(w, *p);
         SendMessageW(p->edit, EM_SETSEL, 0, -1);
         SetFocus(p->edit);
         return 0;
+    }
+    if (m == WM_DPICHANGED && p) {
+        p->dpi = HIWORD(a);
+        const auto &r = *(RECT *)b;
+        SetWindowPos(w, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutPrompt(w, *p);
+        return 0;
+    }
+    if (m == WM_NCDESTROY && p && p->font) {
+        DeleteObject(p->font);
+        p->font = nullptr;
     }
     if (m == WM_COMMAND && (LOWORD(a) == IDOK || LOWORD(a) == IDCANCEL)) {
         p->ok = LOWORD(a) == IDOK;
@@ -250,9 +305,15 @@ std::optional<std::wstring> Input(HWND owner, const std::wstring &title, const s
     p.hint = hint;
     RECT r{};
     GetWindowRect(owner, &r);
+    p.dpi = GetDpiForWindow(owner);
+    if (!p.dpi)
+        p.dpi = 96;
+    RECT bounds{0, 0, MulDiv(412, p.dpi, 96), MulDiv(hint.empty() ? 110 : 170, p.dpi, 96)};
+    AdjustWindowRectExForDpi(&bounds, WS_CAPTION | WS_SYSMENU | WS_POPUP, FALSE, WS_EX_DLGMODALFRAME, p.dpi);
     HWND w = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ZenPrompt", title.c_str(),
-                             WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + 100, r.top + 100, 430,
-                             hint.empty() ? 150 : 210, owner, nullptr, wc.hInstance, &p);
+                             WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + MulDiv(40, p.dpi, 96),
+                             r.top + MulDiv(40, p.dpi, 96), bounds.right - bounds.left,
+                             bounds.bottom - bounds.top, owner, nullptr, wc.hInstance, &p);
     if (!w)
         return {};
     EnableWindow(owner, FALSE);

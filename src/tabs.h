@@ -40,6 +40,7 @@ class TabStrip : public IDropTarget {
     void Create();
     int Arrange(int width);
     void Paint();
+    void RefreshDragFont(HFONT font);
     TabHit Hit(POINT) const;
     void EnsureVisible(Id);
     void RestoreExpanded();

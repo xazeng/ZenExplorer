@@ -29,6 +29,7 @@ class App {
     ComPtr<IContextMenu2> menu2;
     ComPtr<IContextMenu3> menu3;
     std::unordered_map<Id, HICON> icons;
+    std::unordered_map<Id, int> iconIndices;
     App();
     ~App();
     int Run(HINSTANCE, int, const std::wstring &);
@@ -38,6 +39,7 @@ class App {
         return MulDiv(x, dpi, 96);
     }
     void RefreshWindowIcons();
+    void RefreshDpiResources();
     void Layout(bool updateStatus = true);
     void Activate(int p, Id id = 0, bool focus = false);
     void EnsureView(Id id);

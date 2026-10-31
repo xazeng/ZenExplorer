@@ -95,11 +95,12 @@ static void CheckSingleExpandedGroups() {
     m.SetSingleExpandedGroup(false);
     m.SetGroupCollapsed(0, gb, false);
     CHECK(!m.FindGroup(0, ga)->collapsed && !m.FindGroup(0, gb)->collapsed);
+    m.panes[0].selected = a;
     m.SetSingleExpandedGroup(true);
     CHECK(!m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
-    Id plain = m.Add(0, Home);
+    m.Add(0, Home);
     m.SetGroupCollapsed(0, gb, false);
-    CHECK(m.panes[0].selected == plain);
+    CHECK(m.panes[0].selected == b);
     m.SetGroupCollapsed(0, gb, true);
     CHECK(m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
     m.Add(0, Home, ga);
@@ -113,16 +114,69 @@ static void CheckSingleExpandedGroups() {
     // v2 保存开关；便携 v1 没有开关字段，默认启用并保留当前标签组。
     m.SetSingleExpandedGroup(false);
     m.SetGroupCollapsed(1, gr, false);
+    m.panes[1].selected = a;
     auto file = ConfigDir() / L"groups.dat";
     CHECK(SaveModel(m, file));
     Model loaded;
     bool recovered = false, future = false;
     CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
-    auto bytes = ReadEnvelope(file, 0x434E455A, 2);
+    auto bytes = ReadEnvelope(file, 0x434E455A, 4);
+    bytes.resize(bytes.size() - sizeof(UINT));
+    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 3));
+    CHECK(LoadModel(loaded, file, recovered, future) && loaded.windowDpi == 0);
+    bytes.resize(bytes.size() - (m.panes[0].groups.size() + m.panes[1].groups.size()) * sizeof(Id));
+    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 2));
+    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
     bytes.resize(bytes.size() - sizeof(bool));
     CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 1));
     CHECK(LoadModel(loaded, file, recovered, future) && loaded.singleExpandedGroup);
     CHECK(!loaded.FindGroup(1, ga)->collapsed && loaded.FindGroup(1, gr)->collapsed);
+}
+static void CheckGroupSelectionMemory() {
+    Model m;
+    Id a = m.panes[0].selected;
+    Id ga = m.MakeGroup(0, a);
+    Id b = m.Add(0, L"C:/b", ga);
+    Id other = m.Add(0, Home);
+    Id gb = m.MakeGroup(0, other);
+    m.SetGroupCollapsed(0, ga, false);
+    m.panes[0].selected = b;
+    m.SetGroupCollapsed(0, gb, false);
+    CHECK(m.FindGroup(0, ga)->lastSelected == b && m.panes[0].selected == other);
+    m.SetGroupCollapsed(0, ga, false);
+    CHECK(m.panes[0].selected == b);
+    m.SetSingleExpandedGroup(false);
+    m.SetGroupCollapsed(0, ga, true);
+    m.SetGroupCollapsed(0, ga, false);
+    CHECK(m.panes[0].selected == b);
+    auto before = m.CaptureGroups(0);
+    m.panes[0].selected = a;
+    m.SetGroupCollapsed(0, ga, true);
+    m.RestoreGroups(before);
+    CHECK(m.panes[0].selected == b && m.FindGroup(0, ga)->lastSelected == b);
+    m.SetGroupCollapsed(0, ga, true);
+    auto file = ConfigDir() / L"group-selection.dat";
+    CHECK(SaveModel(m, file));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future));
+    loaded.SetGroupCollapsed(0, ga, false);
+    CHECK(loaded.panes[0].selected == b);
+    loaded.SetGroupCollapsed(0, ga, true);
+    loaded.Remove(0, {b});
+    loaded.SetGroupCollapsed(0, ga, false);
+    CHECK(loaded.panes[0].selected == a);
+    m.SetGroupCollapsed(0, ga, false);
+    m.AssignGroup(b, 0);
+    m.AssignGroup(b, ga);
+    m.SetGroupCollapsed(0, ga, false);
+    m.SetGroupCollapsed(0, ga, true);
+    Id fresh = m.Add(0, Home, ga);
+    CHECK(m.panes[0].selected == fresh);
+    m.SetGroupCollapsed(0, ga, true);
+    m.MoveGroup(0, ga, 1, 1);
+    m.SetGroupCollapsed(1, ga, false);
+    CHECK(m.panes[1].selected == fresh && m.Valid());
 }
 static void CheckGroupColors() {
     Model m;
@@ -234,7 +288,7 @@ int main() {
         folded.SetGroupCollapsed(0, foldGroup, true);
         CHECK(folded.panes[0].selected == right && folded.active == 1);
         folded.SetGroupCollapsed(0, foldGroup, false);
-        CHECK(folded.panes[0].selected == right);
+        CHECK(folded.panes[0].selected == inside);
         folded.Remove(0, {right});
         folded.panes[0].selected = inside;
         folded.SetGroupCollapsed(0, foldGroup, true);
@@ -307,7 +361,7 @@ int main() {
         Model loaded;
         bool recovered = false, future = false;
         CHECK(LoadModel(loaded, file, recovered, future));
-        CHECK(!loaded.wrap && loaded.Valid() && !recovered);
+        CHECK(!loaded.wrap && loaded.Valid() && !recovered && loaded.windowDpi == m.windowDpi);
         CHECK(loaded.recent == m.recent && loaded.Find(c)->history == m.Find(c)->history);
         CHECK(loaded.Find(c)->historyIndex == m.Find(c)->historyIndex);
         CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history"),
@@ -332,7 +386,7 @@ int main() {
         CHECK(!LoadModel(legacy, fixture, recovered, future) && !future && !recovered);
 
         // 历史丢失时必须恢复同一代配置和历史，不能与其他快照混用。
-        auto configBytes = ReadEnvelope(file, 0x434E455A, 2);
+        auto configBytes = ReadEnvelope(file, 0x434E455A, 4);
         Reader configReader{configBytes};
         auto generation = configReader.Pod<GUID>();
         wchar_t generationName[40]{};
@@ -361,7 +415,7 @@ int main() {
         CHECK(h != INVALID_HANDLE_VALUE);
         SetFilePointer(h, 4, nullptr, FILE_BEGIN);
         DWORD written = 0;
-        uint32_t version = 3;
+        uint32_t version = 5;
         CHECK(WriteFile(h, &version, sizeof(version), &written, nullptr) && written == sizeof(version));
         CloseHandle(h);
         CHECK(!LoadModel(loaded, file, recovered, future) && future && !recovered);
@@ -381,6 +435,7 @@ int main() {
         CHECK(m.Find(d) != nullptr);
         CheckSingleExpandedGroups();
         CheckGroupColors();
+        CheckGroupSelectionMemory();
         std::cout << "model, grouping, history, recent, atomic persistence and backup tests passed\n";
         return 0;
     } catch (const std::exception &e) {

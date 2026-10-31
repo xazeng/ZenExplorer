@@ -33,6 +33,7 @@ struct Tab {
     std::vector<Column> columns;
 };
 struct Group {
+    Id lastSelected = 0;
     Id id = 0;
     std::wstring name = L"新建组";
     COLORREF color = RGB(50, 120, 220);
@@ -45,9 +46,14 @@ struct Pane {
 };
 // 拖动期间按栏记录展开状态和选择，取消时恢复整套状态。
 struct GroupExpansionState {
+    struct Entry {
+        Id id;
+        bool collapsed;
+        Id lastSelected;
+    };
     int pane = -1;
     Id selected = 0;
-    std::vector<std::pair<Id, bool>> groups;
+    std::vector<Entry> groups;
 };
 struct Model {
     Pane panes[2];
@@ -56,6 +62,7 @@ struct Model {
     bool wrap = true;
     bool singleExpandedGroup = true;
     RECT window{100, 100, 1380, 900};
+    UINT windowDpi = 96;
     bool maximized = false;
     std::vector<std::wstring> recent;
     Id nextId = 1;

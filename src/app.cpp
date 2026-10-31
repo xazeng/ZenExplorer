@@ -243,6 +243,21 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
         CloseHandle(mutex);
         return 2;
     }
+    {
+        int savedWidth = model.window.right - model.window.left;
+        int savedHeight = model.window.bottom - model.window.top;
+        if (model.windowDpi) {
+            savedWidth = MulDiv(savedWidth, dpi, model.windowDpi);
+            savedHeight = MulDiv(savedHeight, dpi, model.windowDpi);
+        }
+        int workWidth = monitor.rcWork.right - monitor.rcWork.left;
+        int workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+        width = std::clamp(savedWidth, std::min(S(640), workWidth), workWidth);
+        height = std::clamp(savedHeight, std::min(S(400), workHeight), workHeight);
+        r.left = std::clamp(r.left, monitor.rcWork.left, monitor.rcWork.right - width);
+        r.top = std::clamp(r.top, monitor.rcWork.top, monitor.rcWork.bottom - height);
+        SetWindowPos(window, nullptr, r.left, r.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     ShowWindow(window, model.maximized ? SW_SHOWMAXIMIZED : show);
     RefreshWindowIcons();
     UpdateWindow(window);
@@ -312,18 +327,8 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         return TRUE;
     }
     case WM_CREATE: {
-        auto stock = [](SHSTOCKICONID id) {
-            SHSTOCKICONINFO info{sizeof(info)};
-            return SUCCEEDED(SHGetStockIconInfo(id, SHGSI_ICON | SHGSI_SMALLICON, &info)) ? info.hIcon
-                                                                                          : nullptr;
-        };
-        folderIcon = stock(SIID_FOLDER);
-        computerIcon = stock(SIID_DESKTOPPC);
-        missingIcon = stock(SIID_ERROR);
         dpi = GetDpiForWindow(window);
-        font =
-            CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        RefreshDpiResources();
         BuildMenu();
         for (int i = 0; i < 4; ++i) {
             const wchar_t *labels[] = {L"后退", L"前进", L"上一级", L"刷新"};
@@ -446,12 +451,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
     case WM_DPICHANGED: {
         dpi = HIWORD(a);
         RefreshWindowIcons();
-        if (font)
-            DeleteObject(font);
-        font = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
-                           CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-        for (int p = 0; p < 2; ++p)
-            SendMessageW(address[p], WM_SETFONT, (WPARAM)font, TRUE);
+        RefreshDpiResources();
         auto *r = (RECT *)b;
         SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -551,6 +551,50 @@ void App::RefreshWindowIcons() {
     replace(windowLargeIcon, ICON_BIG, SM_CXICON, SM_CYICON);
     replace(windowSmallIcon, ICON_SMALL, SM_CXSMICON, SM_CYSMICON);
 }
+void App::RefreshDpiResources() {
+    HFONT next = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+                             CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    if (next) {
+        // 先替换所有持有旧字体的自有控件，再释放旧字体；不接管 Shell 内部控件字体。
+        for (HWND child : {address[0], address[1], error[0], error[1], status})
+            if (child)
+                SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
+        for (int i = 0; i < 4; ++i)
+            if (HWND button = GetDlgItem(window, Back + i))
+                SendMessageW(button, WM_SETFONT, (WPARAM)next, TRUE);
+        for (auto &strip : strips)
+            if (strip)
+                strip->RefreshDragFont(next);
+        if (font)
+            DeleteObject(font);
+        font = next;
+    }
+    auto stock = [&](HICON &owned, SHSTOCKICONID id) {
+        SHSTOCKICONINFO info{sizeof(info)};
+        if (SUCCEEDED(SHGetStockIconInfo(id, SHGSI_SYSICONINDEX, &info)))
+            if (HICON icon = SystemImageIcon(info.iSysImageIndex, S(16))) {
+                if (owned)
+                    DestroyIcon(owned);
+                owned = icon;
+            }
+    };
+    stock(folderIcon, SIID_FOLDER);
+    stock(computerIcon, SIID_DESKTOPPC);
+    stock(missingIcon, SIID_ERROR);
+    // 只用已有索引刷新图像，不因 DPI 变化重新访问网络目录。
+    for (auto &[id, owned] : icons) {
+        auto it = iconIndices.find(id);
+        HICON icon = it != iconIndices.end() ? SystemImageIcon(it->second, S(16)) : nullptr;
+        if (!icon)
+            icon = CopyIcon(model.Find(id) && model.Find(id)->path == Home ? computerIcon : folderIcon);
+        if (icon) {
+            if (owned)
+                DestroyIcon(owned);
+            owned = icon;
+        }
+    }
+    Log(L"更新 DPI 资源 dpi=" + std::to_wstring(dpi));
+}
 void App::Layout(bool updateStatus) {
     if (!status)
         return;
@@ -643,6 +687,7 @@ void App::Save() {
     WINDOWPLACEMENT wp{sizeof(wp)};
     if (GetWindowPlacement(window, &wp)) {
         model.window = wp.rcNormalPosition;
+        model.windowDpi = dpi;
         model.maximized = wp.showCmd == SW_SHOWMAXIMIZED;
     }
     if (SaveModel(model, ConfigDir() / L"session.dat")) {
@@ -750,16 +795,23 @@ void App::RefreshLocalIcon(Id id) {
     if (!t)
         return;
     HICON icon = nullptr;
+    iconIndices.erase(id);
     auto state = InspectLocalPath(t->path);
+    if (t->path == Home || state == LocalPathState::Missing) {
+        SHSTOCKICONINFO info{sizeof(info)};
+        if (SUCCEEDED(
+                SHGetStockIconInfo(t->path == Home ? SIID_DESKTOPPC : SIID_ERROR, SHGSI_SYSICONINDEX, &info)))
+            iconIndices[id] = info.iSysImageIndex;
+    }
     if (t->path == Home)
         icon = CopyIcon(computerIcon);
     else if (state == LocalPathState::Missing)
         icon = CopyIcon(missingIcon);
     else if (state == LocalPathState::Exists) {
         SHFILEINFOW info{};
-        if (SHGetFileInfoW(t->path.c_str(), 0, &info, sizeof(info),
-                           SHGFI_ICON | SHGFI_SMALLICON | SHGFI_DISPLAYNAME)) {
-            icon = info.hIcon;
+        if (SHGetFileInfoW(t->path.c_str(), 0, &info, sizeof(info), SHGFI_SYSICONINDEX | SHGFI_DISPLAYNAME)) {
+            iconIndices[id] = info.iIcon;
+            icon = SystemImageIcon(info.iIcon, S(16));
             // 版本 1 没有显示名称缓存；复用已有本地图标查询补齐，不额外加载视图。
             if (t->displayName.empty() && info.szDisplayName[0]) {
                 t->displayName = info.szDisplayName;
@@ -782,11 +834,13 @@ void App::RefreshMetadata(Id id, IShellItem *item) {
     PIDLIST_ABSOLUTE pidl = nullptr;
     if (SUCCEEDED(SHGetIDListFromObject(item, &pidl))) {
         SHFILEINFOW info{};
-        if (SHGetFileInfoW((LPCWSTR)pidl, 0, &info, sizeof(info),
-                           SHGFI_PIDL | SHGFI_ICON | SHGFI_SMALLICON)) {
-            if (icons[id])
-                DestroyIcon(icons[id]);
-            icons[id] = info.hIcon;
+        if (SHGetFileInfoW((LPCWSTR)pidl, 0, &info, sizeof(info), SHGFI_PIDL | SHGFI_SYSICONINDEX)) {
+            iconIndices[id] = info.iIcon;
+            if (HICON icon = SystemImageIcon(info.iIcon, S(16))) {
+                if (icons[id])
+                    DestroyIcon(icons[id]);
+                icons[id] = icon;
+            }
         }
         CoTaskMemFree(pidl);
     }

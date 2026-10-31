@@ -4,6 +4,12 @@
 #include <gdiplus.h>
 namespace zen {
 TabStrip::TabStrip(App &a, int p) : app(a), pane(p) {}
+void TabStrip::RefreshDragFont(HFONT font) {
+    if (tooltip)
+        SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, app.S(520));
+    if (ghost)
+        SendMessageW(ghost, WM_SETFONT, (WPARAM)font, TRUE);
+}
 TabStrip::~TabStrip() {
     if (ghost)
         DestroyWindow(ghost);
@@ -257,8 +263,15 @@ void TabStrip::Paint() {
                 if (diameter > 0) {
                     path.AddArc(x, y, diameter, diameter, 180, 90);
                     path.AddArc(x + w - diameter, y, diameter, diameter, 270, 90);
-                    path.AddArc(x + w - diameter, y + hh - diameter, diameter, diameter, 0, 90);
-                    path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
+                    if (g->collapsed) {
+                        path.AddArc(x + w - diameter, y + hh - diameter, diameter, diameter, 0, 90);
+                        path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
+                    } else {
+                        // 展开时向下接到底线；文字仍用原 chip，保持位置与点击区域不变。
+                        path.AddLine(x + w, y + diameter / 2, x + w, (float)h.rect.bottom);
+                        path.AddLine(x + w, (float)h.rect.bottom, x, (float)h.rect.bottom);
+                        path.AddLine(x, (float)h.rect.bottom, x, y + diameter / 2);
+                    }
                     path.CloseFigure();
                     Gdiplus::SolidBrush brush(
                         Gdiplus::Color(255, GetRValue(g->color), GetGValue(g->color), GetBValue(g->color)));
@@ -477,7 +490,7 @@ void TabStrip::FinishMove(POINT screen) {
     if (source.tab && group)
         for (const auto &state : expanded)
             if (state.pane == target)
-                for (const auto &[id, collapsed] : state.groups)
+                for (const auto &[id, collapsed, lastSelected] : state.groups)
                     if (id == group && collapsed)
                         if (auto *g = app.model.FindGroup(target, group))
                             keepExpanded = !g->collapsed;
@@ -553,8 +566,8 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         TrackMouseEvent(&tr);
         InvalidateRect(hwnd, nullptr, FALSE);
         if (GetCapture() == hwnd && (source.tab || source.group) && !dragging && !closePressed &&
-            (abs(pt.x - down.x) > GetSystemMetrics(SM_CXDRAG) ||
-             abs(pt.y - down.y) > GetSystemMetrics(SM_CYDRAG))) {
+            (abs(pt.x - down.x) > GetSystemMetricsForDpi(SM_CXDRAG, app.dpi) ||
+             abs(pt.y - down.y) > GetSystemMetricsForDpi(SM_CYDRAG, app.dpi))) {
             dragging = true;
             SendMessageW(tooltip, TTM_ACTIVATE, FALSE, 0);
         }

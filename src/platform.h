@@ -38,6 +38,7 @@ void Report(HWND owner, const std::wstring &text, HRESULT hr = S_OK);
 enum class LocalPathState { Deferred, Exists, Missing, Unknown };
 LocalPathState InspectLocalPath(const std::wstring &path);
 void DrawSystemGlyph(HDC dc, RECT rect, wchar_t glyph, UINT dpi, COLORREF color);
+HICON SystemImageIcon(int index, int size);
 std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstring &path);
 bool Confirm(HWND owner, const std::wstring &text);
 std::optional<std::wstring> Input(HWND owner, const std::wstring &title, const std::wstring &value,
