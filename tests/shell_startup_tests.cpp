@@ -86,6 +86,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             // 隔离窗口内验证失焦取消编辑，不提交文字，也不切换活动栏。
             auto addressId = app.model.panes[0].selected;
             auto path = app.model.Find(addressId)->path;
+            auto editText = path == Home ? L"" : path;
             app.EditAddress(0);
             SetWindowTextW(app.address[0], L"C:/unsubmitted-address");
             int active = app.model.active;
@@ -97,13 +98,13 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             active = app.model.active;
             if ((GetWindowLongPtrW(app.address[0], GWL_STYLE) & WS_VISIBLE) ||
                 !(GetWindowLongPtrW(app.crumb[0], GWL_STYLE) & WS_VISIBLE) ||
-                app.model.Find(addressId)->path != path || WindowText(app.address[0]) != path ||
+                app.model.Find(addressId)->path != path || WindowText(app.address[0]) != editText ||
                 app.model.active != active) {
                 std::cerr << "address blur daddressId not cancel editing correctly\n";
                 state->failed = true;
             }
             app.EditAddress(0);
-            if (WindowText(app.address[0]) != path)
+            if (WindowText(app.address[0]) != editText)
                 state->failed = true;
             SendMessageW(app.address[0], WM_KEYDOWN, VK_ESCAPE, 0);
             app.Activate(1, state->background);
@@ -116,12 +117,20 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         } else if (state->stage == 3) {
             checkMode(FVM_ICON);
             app.Navigate(id, DataDir().wstring());
+            app.Navigate(app.model.panes[0].selected, DataDir().wstring());
         } else if (state->stage == 4) {
             checkMode(FVM_DETAILS);
             setIcons();
+            app.EditAddress(0);
+            if (WindowText(app.address[0]) != DataDir().wstring())
+                state->failed = true;
+            SetWindowTextW(app.address[0], L"");
+            SendMessageW(app.address[0], WM_KEYDOWN, VK_RETURN, 0);
             app.Activate(1, id);
             app.Travel(-1);
         } else {
+            if (app.model.Find(app.model.panes[0].selected)->path != Home)
+                state->failed = true;
             checkMode(FVM_DETAILS);
             setIcons();
             PostMessageW(app.window, WM_CLOSE, 0, 0);

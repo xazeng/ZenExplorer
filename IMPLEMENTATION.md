@@ -14,6 +14,10 @@
 
 ## 标签、导航和 Shell 适配
 
+地址编辑框将 Home 显示为空字符串；提交空字符串时转换为 Home 再导航，内部路径、会话格式和历史存储不变。正常地址刷新及失焦重置使用同一显示规则，候选列表确认和 Esc 取消沿用原逻辑。
+
+此修改 Release 构建及 shell_commands 回归通过；shell_startup_restore 首次因旧显示断言失败，更新断言并增加普通目录清空地址回车返回此电脑的检查后通过（4.43 秒），同时覆盖此电脑空串显示、失焦恢复和普通路径编辑。单 EXE 更新至 `build/package/ZenExplorer.exe`。
+
 ### 屏幕缩放适配
 
 - 延续 PerMonitorV2 声明和主窗口 WM_DPICHANGED 布局。名称输入框按所在窗口 DPI 布局、设置字体并处理动态 DPI 变化，外框使用 AdjustWindowRectExForDpi 计算。

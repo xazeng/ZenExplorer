@@ -39,8 +39,7 @@ static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR
             auto text = WindowText(w);
             ShowWindow(w, SW_HIDE);
             ShowWindow(app->crumb[p], SW_SHOW);
-            if (!text.empty())
-                app->Navigate(app->model.panes[p].selected, text);
+            app->Navigate(app->model.panes[p].selected, text.empty() ? Home : text);
             return 0;
         }
         if (a == VK_ESCAPE) {
@@ -55,7 +54,7 @@ static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR
     if (m == WM_APP + 101 && GetFocus() != w && !candidatesVisible()) {
         // 延迟到系统候选列表处理失焦后再判断，避免点击候选时提前取消。
         if (auto *tab = app->model.Find(app->model.panes[p].selected))
-            SetWindowTextW(w, tab->path.c_str());
+            SetWindowTextW(w, tab->path == Home ? L"" : tab->path.c_str());
         ShowWindow(w, SW_HIDE);
         ShowWindow(app->crumb[p], SW_SHOW);
     }
@@ -705,7 +704,7 @@ void App::UpdateAddress(int p) {
     if (!t)
         return;
     if (GetFocus() != address[p])
-        SetWindowTextW(address[p], t->path.c_str());
+        SetWindowTextW(address[p], t->path == Home ? L"" : t->path.c_str());
     InvalidateRect(crumb[p], nullptr, FALSE);
 }
 void App::EditAddress(int p) {
