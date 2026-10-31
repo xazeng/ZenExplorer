@@ -729,7 +729,7 @@ void App::CloseTabs(int p, const std::vector<Id> &ids, bool group) {
         if (auto *t = model.Find(id))
             named |= !t->name.empty();
     if (named &&
-        !Confirm(window, group ? L"当前关闭的组包含命名标签，是否确认" : L"当前关闭的是命名标签，是否确认"))
+        !Confirm(window, group ? L"当前关闭的组包含常用标签，是否确认" : L"当前关闭的是常用标签，是否确认"))
         return;
     model.Remove(p, ids, true, group);
     SyncViews();
@@ -933,9 +933,11 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     HMENU menu = CreatePopupMenu();
     if (tab) {
         auto *t = model.Find(tab);
-        AppendMenuW(menu, MF_STRING, 1, t && !t->name.empty() ? L"修改固定名称…" : L"设置固定名称…");
-        if (t && !t->name.empty())
+        AppendMenuW(menu, MF_STRING, 1, t && !t->name.empty() ? L"修改常用标签名称…" : L"设为常用标签…");
+        if (t && !t->name.empty()) {
             AppendMenuW(menu, MF_STRING, 2, L"将当前目录设为主目录");
+            AppendMenuW(menu, MF_STRING, 6, L"取消常用标签");
+        }
         AppendMenuW(menu, MF_STRING, 5, L"在系统资源管理器中打开");
         AppendMenuW(menu, MF_STRING, 3, L"添加到新组");
         HMENU groups = CreatePopupMenu();
@@ -969,14 +971,16 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
         }
         if (cmd == 1) {
             auto value = Input(
-                window, t->name.empty() ? L"设置固定名称" : L"修改固定名称", Title(*t),
+                window, t->name.empty() ? L"设为常用标签" : L"修改常用标签名称", Title(*t),
                 t->name.empty()
-                    ? L"固定名称后，浏览其他目录时名称保持不变，并将当前目录设为主目录。双击标签可返回。"
-                    : L"修改名称不会改变主目录；清空名称将取消固定名称和主目录。");
+                    ? L"设置标签名称，并以当前目录为主目录。浏览其他目录时名称不变，双击标签返回主目录。"
+                    : L"修改名称不会改变主目录；清空名称或使用右键菜单可取消常用标签。");
             if (value)
                 model.Rename(tab, *value);
         } else if (cmd == 2) {
             t->home = t->path;
+        } else if (cmd == 6) {
+            model.Rename(tab, L"");
         } else if (cmd == 3) {
             auto value = Input(window, L"组名", L"新建组");
             // 取消输入不创建组，也不改变标签原来的分组和位置。

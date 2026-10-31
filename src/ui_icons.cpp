@@ -1,6 +1,33 @@
 #include "ui_icons.h"
 #include <gdiplus.h>
 namespace zen {
+void DrawFavoriteBadge(HDC dc, RECT bounds) {
+    if (!dc || bounds.right <= bounds.left || bounds.bottom <= bounds.top)
+        return;
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetClip(Gdiplus::Rect(bounds.left, bounds.top, bounds.right - bounds.left,
+                                 bounds.bottom - bounds.top));
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.TranslateTransform(static_cast<float>(bounds.left), static_cast<float>(bounds.top));
+    graphics.ScaleTransform((bounds.right - bounds.left) / 8.0f, (bounds.bottom - bounds.top) / 8.0f);
+    // 对应第一张常用标签预览：金色填充、细赭色轮廓、白色隔离边。
+    const Gdiplus::PointF points[] = {{4.0f, 0.65f}, {5.02f, 2.75f}, {7.35f, 3.08f},
+                                    {5.66f, 4.72f}, {6.06f, 7.05f}, {4.0f, 5.95f},
+                                    {1.94f, 7.05f}, {2.34f, 4.72f}, {0.65f, 3.08f},
+                                    {2.98f, 2.75f}};
+    Gdiplus::GraphicsPath star;
+    star.AddPolygon(points, 10);
+    Gdiplus::Pen separator(Gdiplus::Color(255, 255, 255, 255), 1.15f);
+    separator.SetLineJoin(Gdiplus::LineJoinRound);
+    graphics.DrawPath(&separator, &star);
+    Gdiplus::LinearGradientBrush gold(Gdiplus::PointF(0, 0), Gdiplus::PointF(0, 8),
+                                     Gdiplus::Color(255, 255, 199, 48),
+                                     Gdiplus::Color(255, 245, 166, 0));
+    graphics.FillPath(&gold, &star);
+    Gdiplus::Pen outline(Gdiplus::Color(255, 183, 119, 10), 0.55f);
+    outline.SetLineJoin(Gdiplus::LineJoinRound);
+    graphics.DrawPath(&outline, &star);
+}
 void DrawUiIcon(HDC dc, RECT bounds, UiIcon icon, UINT dpi, bool disabled) {
     if (!dc || !dpi)
         return;

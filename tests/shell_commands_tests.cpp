@@ -6,10 +6,13 @@
 #include <gdiplus.h>
 #include <iostream>
 #include <fstream>
+#include <wrl/implements.h>
 using namespace zen;
 static App *app;
 static std::filesystem::path base;
 static bool busy = false, failed = false, legacy = false;
+// 手工诊断入口，不加入 CTest；执行已安装的 VS Code 系统菜单。
+static bool probeCode = false, probeFolder = false;
 static ComPtr<IDataObject> originalClipboard;
 static int stage = 0;
 static Id openedFrom = 0;
@@ -42,6 +45,38 @@ static void Fail(const char *text) {
     std::cerr << text << "\n";
     failed = true;
     PostMessageW(app->window, WM_CLOSE, 0, 0);
+}
+class DirectoryCheck final
+    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+                                          IContextMenu> {
+    std::wstring expected;
+
+  public:
+    explicit DirectoryCheck(std::wstring path) : expected(std::move(path)) {}
+    HRESULT STDMETHODCALLTYPE QueryContextMenu(HMENU, UINT, UINT, UINT, UINT) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetCommandString(UINT_PTR, UINT, UINT *, LPSTR, UINT) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE InvokeCommand(CMINVOKECOMMANDINFO *raw) override {
+        if (!raw || raw->cbSize != sizeof(CMINVOKECOMMANDINFOEX) || !(raw->fMask & CMIC_MASK_UNICODE))
+            return E_INVALIDARG;
+        auto *info = reinterpret_cast<CMINVOKECOMMANDINFOEX *>(raw);
+        if (!info->lpDirectoryW || expected != info->lpDirectoryW || !info->lpDirectory)
+            return E_FAIL;
+        wchar_t ansi[32768]{};
+        MultiByteToWideChar(CP_ACP, 0, info->lpDirectory, -1, ansi, 32768);
+        return expected == ansi ? S_OK : E_FAIL;
+    }
+};
+static void CheckMenuDirectory(ShellMenu &menu, const std::wstring &path) {
+    auto original = menu.context;
+    menu.context = Microsoft::WRL::Make<DirectoryCheck>(path);
+    auto hr = menu.Invoke(1);
+    menu.context = original;
+    if (FAILED(hr))
+        Fail("Shell menu did not pass its view directory in both encodings");
 }
 static void CheckModifiedClipboardKeys(ShellView &view) {
     BYTE original[256]{};
@@ -80,6 +115,28 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
         Fail("command test timeout");
     else if (it != app->views.end() && it->second->shell && !it->second->navigating) {
         auto &view = *it->second;
+        if (probeCode) {
+            if (probeFolder &&
+                view.SelectPasteResults({(base / L"files" / L"selected folder").wstring()}) != S_OK) {
+                busy = false;
+                return;
+            }
+            ShellMenu menu;
+            HRESULT hr = menu.Create(view.shell.Get(), !probeFolder, app->window);
+            UINT cmd = SUCCEEDED(hr) ? menu.Find(L"VSCode") : 0;
+            if (!cmd) {
+                Fail("VSCode background verb missing");
+            } else {
+                hr = menu.Invoke(cmd);
+                std::cout << "VSCode probe folder=" << probeFolder << " hr=" << std::hex << (unsigned long)hr
+                          << std::endl;
+                failed = FAILED(hr);
+            }
+            stage = 20;
+            PostMessageW(app->window, WM_CLOSE, 0, 0);
+            busy = false;
+            return;
+        }
         if (stage < 4 && awaitingRename) {
             HWND editor = nullptr;
             EnumChildWindows(
@@ -109,6 +166,8 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
         } else if (stage < 4) {
             ShellMenu menu;
             HRESULT hr = menu.Create(view.shell.Get(), true, app->window);
+            if (SUCCEEDED(hr))
+                CheckMenuDirectory(menu, app->model.Find(id)->path);
             UINT cmd = SUCCEEDED(hr) ? FindNew(menu, menu.menu, stage % 2 == 0) : 0;
             if (!cmd)
                 Fail("new command missing");
@@ -318,6 +377,8 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 CoTaskMemFree(pidl);
                 ShellMenu menu;
                 HRESULT hr = menu.Create(view.shell.Get(), false, app->window);
+                if (SUCCEEDED(hr))
+                    CheckMenuDirectory(menu, app->model.Find(id)->path);
                 UINT command = SUCCEEDED(hr) ? menu.Find(L"rename") : 0;
                 if (!command || FAILED(menu.Invoke(command)))
                     Fail("native rename menu missing or failed");
@@ -552,10 +613,19 @@ int wmain(int argc, wchar_t **argv) {
         return result;
     }
     legacy = argc == 2 && std::wstring(argv[1]) == L"--legacy-lifetime";
+    probeCode = argc == 2 && (std::wstring(argv[1]) == L"--probe-vscode" ||
+                              std::wstring(argv[1]) == L"--probe-vscode-folder");
+    probeFolder = argc == 2 && std::wstring(argv[1]) == L"--probe-vscode-folder";
+    // 仅手工诊断进程移除开发终端的 Node 模式，避免 Code.exe 被当作脚本解释器。
+    if (probeCode)
+        SetEnvironmentVariableW(L"ELECTRON_RUN_AS_NODE", nullptr);
     OleGetClipboard(&originalClipboard);
     base = std::filesystem::current_path() / L".test-data" /
-           (L"commands-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+           (L"commands 中文空格-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(GetTickCount64()));
     std::filesystem::create_directories(base / L"files");
+    if (probeCode)
+        std::filesystem::create_directories(base / L"files" / L"selected folder");
     SetEnvironmentVariableW(L"ZENEXPLORER_ROOT_DIR", base.c_str());
     std::filesystem::create_directories(base / L"destination");
     std::filesystem::create_directories(base / L"empty-after-delete");

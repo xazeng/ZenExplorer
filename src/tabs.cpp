@@ -202,11 +202,9 @@ void TabStrip::Paint() {
             if (icon)
                 DrawIconEx(dc, r.left, r.top + app.S(5), icon, app.S(16), app.S(16), 0, nullptr, DI_NORMAL);
             if (!t->name.empty()) {
-                RECT lock{r.left + app.S(9), r.top + app.S(13), r.left + app.S(18), r.top + app.S(22)};
-                HBRUSH br = CreateSolidBrush(RGB(95, 105, 115));
-                FillRect(dc, &lock, br);
-                DeleteObject(br);
-                Arc(dc, lock.left + 1, lock.top - app.S(5), lock.right - 1, lock.top + app.S(4), 0, 0, 0, 0);
+                RECT star{r.left + app.S(16) - app.S(12), r.top + app.S(5) + app.S(16) - app.S(12),
+                          r.left + app.S(16), r.top + app.S(5) + app.S(16)};
+                DrawFavoriteBadge(dc, star);
             }
             r.left += app.S(23);
             auto text = app.Title(*t);

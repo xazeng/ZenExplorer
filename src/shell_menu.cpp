@@ -10,6 +10,25 @@ HRESULT ShellMenu::Create(IShellView *view, bool background, HWND window, UINT f
     if (!view || !IsWindow(window) || menu || context)
         return E_INVALIDARG;
     owner = window;
+    ComPtr<IFolderView> folderView;
+    ComPtr<IPersistFolder2> folder;
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&folderView))) &&
+        SUCCEEDED(folderView->GetFolder(IID_PPV_ARGS(&folder))) && SUCCEEDED(folder->GetCurFolder(&pidl))) {
+        ComPtr<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item))))
+            directory = ItemName(item.Get(), SIGDN_FILESYSPATH);
+    }
+    CoTaskMemFree(pidl);
+    // 特殊位置没有文件系统目录时保持空值，不把 Shell 解析名当成工作目录。
+    if (!directory.empty()) {
+        int count = WideCharToMultiByte(CP_ACP, 0, directory.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (count > 0) {
+            directoryAnsi.resize(count);
+            WideCharToMultiByte(CP_ACP, 0, directory.c_str(), -1, directoryAnsi.data(), count, nullptr,
+                                nullptr);
+        }
+    }
     HRESULT hr = view->GetItemObject(background ? SVGIO_BACKGROUND : SVGIO_SELECTION, IID_PPV_ARGS(&context));
     if (FAILED(hr))
         return hr;
@@ -78,11 +97,13 @@ HRESULT ShellMenu::Invoke(UINT command, POINT point, std::optional<DWORD> modifi
     info.hwnd = owner;
     info.lpVerb = MAKEINTRESOURCEA(command - 1);
     info.lpVerbW = MAKEINTRESOURCEW(command - 1);
+    info.lpDirectory = directoryAnsi.empty() ? nullptr : directoryAnsi.c_str();
+    info.lpDirectoryW = directory.empty() ? nullptr : directory.c_str();
     info.nShow = SW_SHOWNORMAL;
     info.ptInvoke = point;
     HRESULT hr = context->InvokeCommand((CMINVOKECOMMANDINFO *)&info);
-    Log(L"Shell 菜单 command=" + std::to_wstring(command) + L" verb=" + Verb(command) + L" result=" +
-        std::to_wstring((unsigned long)hr));
+    Log(L"Shell 菜单 command=" + std::to_wstring(command) + L" verb=" + Verb(command) + L" directory=" +
+        directory + L" result=" + std::to_wstring((unsigned long)hr));
     return hr;
 }
 } // namespace zen
