@@ -75,6 +75,81 @@ static void CheckTabActivation() {
     CHECK(moved.FindGroup(1, hiddenGroup)->collapsed && moved.Visible(1, moved.panes[1].selected));
     CHECK(moved.panes[1].selected != d && moved.Valid());
 }
+static void CheckSingleExpandedGroups() {
+    Model m;
+    CHECK(m.singleExpandedGroup);
+    Id a = m.panes[0].selected;
+    Id ga = m.MakeGroup(0, a);
+    Id b = m.Add(0, L"C:/b");
+    Id gb = m.MakeGroup(0, b);
+    Id gr = m.MakeGroup(1, m.panes[1].selected);
+    CHECK(m.FindGroup(0, ga)->collapsed && !m.FindGroup(0, gb)->collapsed);
+    m.SetGroupCollapsed(0, ga, false);
+    CHECK(m.panes[0].selected == a && m.FindGroup(0, gb)->collapsed);
+    CHECK(!m.FindGroup(1, gr)->collapsed);
+    auto snapshot = m.CaptureGroups(0);
+    m.SetGroupCollapsed(0, gb, false);
+    CHECK(m.panes[0].selected == b);
+    m.RestoreGroups(snapshot);
+    CHECK(m.panes[0].selected == a && !m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
+    m.SetSingleExpandedGroup(false);
+    m.SetGroupCollapsed(0, gb, false);
+    CHECK(!m.FindGroup(0, ga)->collapsed && !m.FindGroup(0, gb)->collapsed);
+    m.SetSingleExpandedGroup(true);
+    CHECK(!m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
+    Id plain = m.Add(0, Home);
+    m.SetGroupCollapsed(0, gb, false);
+    CHECK(m.panes[0].selected == plain);
+    m.SetGroupCollapsed(0, gb, true);
+    CHECK(m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
+    m.Add(0, Home, ga);
+    CHECK(!m.FindGroup(0, ga)->collapsed);
+    // 不携带当前标签时，目标栏原选择及其展开组优先。
+    m.MoveGroup(0, gb, 1, 1);
+    CHECK(m.FindGroup(1, gb)->collapsed && !m.FindGroup(1, gr)->collapsed);
+    m.MoveGroup(0, ga, 1, 1);
+    CHECK(!m.FindGroup(1, ga)->collapsed && m.FindGroup(1, gr)->collapsed);
+
+    // v2 保存开关；便携 v1 没有开关字段，默认启用并保留当前标签组。
+    m.SetSingleExpandedGroup(false);
+    m.SetGroupCollapsed(1, gr, false);
+    auto file = ConfigDir() / L"groups.dat";
+    CHECK(SaveModel(m, file));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
+    auto bytes = ReadEnvelope(file, 0x434E455A, 2);
+    bytes.resize(bytes.size() - sizeof(bool));
+    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 1));
+    CHECK(LoadModel(loaded, file, recovered, future) && loaded.singleExpandedGroup);
+    CHECK(!loaded.FindGroup(1, ga)->collapsed && loaded.FindGroup(1, gr)->collapsed);
+}
+static void CheckGroupColors() {
+    Model m;
+    std::vector<Id> groups;
+    for (const auto &preset : GroupColors) {
+        Id g = m.MakeGroup(0, m.Add(0, Home));
+        groups.push_back(g);
+        CHECK(m.FindGroup(0, g)->color == preset.color);
+    }
+    // 另一栏独立；折叠组仍占颜色；全部用过按次数、固定顺序分配。
+    Id right = m.MakeGroup(1, m.panes[1].selected);
+    CHECK(m.FindGroup(1, right)->color == GroupColors[0].color);
+    Id repeated = m.MakeGroup(0, m.Add(0, Home));
+    CHECK(m.FindGroup(0, repeated)->color == GroupColors[0].color);
+    Id next = m.MakeGroup(0, m.Add(0, Home));
+    CHECK(m.FindGroup(0, next)->color == GroupColors[1].color);
+    m.FindGroup(0, groups[2])->color = RGB(1, 2, 3);
+    Id available = m.MakeGroup(0, m.Add(0, Home));
+    CHECK(m.FindGroup(0, available)->color == GroupColors[2].color);
+    auto file = ConfigDir() / L"colors.dat";
+    CHECK(SaveModel(m, file));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future));
+    CHECK(loaded.FindGroup(0, groups[2])->color == RGB(1, 2, 3));
+    CHECK(loaded.FindGroup(0, available)->color == GroupColors[2].color);
+}
 int main() {
     auto portable =
         std::filesystem::current_path() / L".test-data" /
@@ -257,7 +332,7 @@ int main() {
         CHECK(!LoadModel(legacy, fixture, recovered, future) && !future && !recovered);
 
         // 历史丢失时必须恢复同一代配置和历史，不能与其他快照混用。
-        auto configBytes = ReadEnvelope(file, 0x434E455A);
+        auto configBytes = ReadEnvelope(file, 0x434E455A, 2);
         Reader configReader{configBytes};
         auto generation = configReader.Pod<GUID>();
         wchar_t generationName[40]{};
@@ -304,6 +379,8 @@ int main() {
         std::filesystem::remove(file);
         std::filesystem::remove(backup);
         CHECK(m.Find(d) != nullptr);
+        CheckSingleExpandedGroups();
+        CheckGroupColors();
         std::cout << "model, grouping, history, recent, atomic persistence and backup tests passed\n";
         return 0;
     } catch (const std::exception &e) {

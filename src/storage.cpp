@@ -61,7 +61,7 @@ static std::filesystem::path HistoryPath(const GUID &generation) {
     return DataDir() / L"history" / (std::wstring(name) + L".dat");
 }
 static std::filesystem::path ReferencedHistory(const std::filesystem::path &config) {
-    auto bytes = ReadEnvelope(config, Magic);
+    auto bytes = ReadEnvelope(config, Magic, 2);
     Reader r{bytes};
     return HistoryPath(r.Pod<GUID>());
 }
@@ -117,6 +117,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
             w.Text(t.displayName);
         }
     }
+    w.Pod(m.singleExpandedGroup);
     const auto historyPath = HistoryPath(generation);
     auto backup = p;
     backup += L".bak";
@@ -127,7 +128,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     }
     if (!WriteEnvelope(historyPath, HistoryMagic, history.bytes, false))
         return false;
-    if (!WriteEnvelope(p, Magic, w.bytes, true)) {
+    if (!WriteEnvelope(p, Magic, w.bytes, true, 2)) {
         std::error_code ec;
         std::filesystem::remove(historyPath, ec);
         return false;
@@ -144,7 +145,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     }
     return true;
 }
-static Model Decode(const std::vector<uint8_t> &b) {
+static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
     Reader r{b};
     auto historyBytes = ReadEnvelope(HistoryPath(r.Pod<GUID>()), HistoryMagic);
     Reader history{historyBytes};
@@ -194,16 +195,21 @@ static Model Decode(const std::vector<uint8_t> &b) {
             p.tabs.push_back(t);
         }
     }
+    if (version >= 2)
+        m.singleExpandedGroup = r.Pod<bool>();
     if (r.pos != b.size() || history.pos != historyBytes.size() ||
         historyCount != m.panes[0].tabs.size() + m.panes[1].tabs.size() || !m.Valid())
         throw std::runtime_error("状态不合法");
+    for (int p = 0; p < 2; ++p)
+        m.NormalizeGroups(p);
     return m;
 }
 bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &future) {
     recovered = future = false;
     try {
-        auto bytes = ReadEnvelope(p, Magic);
-        m = Decode(bytes);
+        uint32_t version = 0;
+        auto bytes = ReadEnvelope(p, Magic, 2, &version);
+        m = Decode(bytes, version);
         return true;
     } catch (const std::domain_error &) {
         future = true;
@@ -213,8 +219,9 @@ bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &
     auto bak = p;
     bak += L".bak";
     try {
-        auto bytes = ReadEnvelope(bak, Magic);
-        m = Decode(bytes);
+        uint32_t version = 0;
+        auto bytes = ReadEnvelope(bak, Magic, 2, &version);
+        m = Decode(bytes, version);
         recovered = true;
         return true;
     } catch (const std::domain_error &) {

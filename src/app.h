@@ -73,7 +73,7 @@ class App {
     struct PendingDrop {
         std::filesystem::path result;
         std::shared_ptr<void> process;
-        std::vector<std::pair<int, Id>> expanded;
+        std::vector<GroupExpansionState> expanded;
         uint64_t generation = 0;
     };
     std::vector<PendingDrop> pendingDrops;

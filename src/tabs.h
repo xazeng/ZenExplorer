@@ -22,7 +22,7 @@ class TabStrip : public IDropTarget {
     TabHit source{};
     Id hoverTab = 0, hoverGroup = 0;
     ULONGLONG hoverTime = 0;
-    std::vector<std::pair<int, Id>> expanded;
+    std::vector<GroupExpansionState> expanded;
     ComPtr<IDataObject> externalData;
     ULONGLONG releasedAt = 0;
 
@@ -44,7 +44,7 @@ class TabStrip : public IDropTarget {
     void EnsureVisible(Id);
     void RestoreExpanded();
     void FinishExternal(bool success);
-    std::vector<std::pair<int, Id>> DetachExternal();
+    std::vector<GroupExpansionState> DetachExternal();
     void Hover(POINT screen, bool files);
     void FinishMove(POINT);
     static LRESULT CALLBACK Proc(HWND, UINT, WPARAM, LPARAM);

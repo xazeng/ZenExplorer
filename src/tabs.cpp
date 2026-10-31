@@ -320,9 +320,8 @@ void TabStrip::Paint() {
 void TabStrip::RestoreExpanded() {
     if (!expanded.empty())
         app.Changed();
-    for (auto [p, g] : expanded)
-        if (auto *x = app.model.FindGroup(p, g))
-            app.model.SetGroupCollapsed(p, g, true);
+    for (const auto &state : expanded)
+        app.model.RestoreGroups(state);
     expanded.clear();
     app.SyncViews();
 }
@@ -336,7 +335,7 @@ void TabStrip::FinishExternal(bool success) {
     } else
         RestoreExpanded();
 }
-std::vector<std::pair<int, Id>> TabStrip::DetachExternal() {
+std::vector<GroupExpansionState> TabStrip::DetachExternal() {
     external = false;
     externalData.Reset();
     releasedAt = 0;
@@ -365,9 +364,14 @@ void TabStrip::Hover(POINT screen, bool files) {
             if (hoverGroup) {
                 auto *g = app.model.FindGroup(p, hoverGroup);
                 if (g && g->collapsed) {
-                    g->collapsed = false;
-                    expanded.push_back({p, g->id});
-                    app.Layout();
+                    // 文件跨栏经过多个接收者时，同一栏只保留第一次展开前的快照。
+                    auto &snapshots = files ? strip.expanded : expanded;
+                    if (std::none_of(snapshots.begin(), snapshots.end(),
+                                     [&](const auto &state) { return state.pane == p; }))
+                        snapshots.push_back(app.model.CaptureGroups(p));
+                    app.model.SetGroupCollapsed(p, hoverGroup, false);
+                    app.Changed();
+                    app.SyncViews();
                 }
             } else if (files && hoverTab && app.model.panes[p].selected != hoverTab)
                 app.Activate(p, hoverTab);
@@ -468,6 +472,18 @@ void TabStrip::FinishMove(POINT screen) {
         RestoreExpanded();
         return;
     }
+    // 先恢复悬停改变的状态，避免临时补选影响“整组是否携带当前标签”的判断。
+    bool keepExpanded = false;
+    if (source.tab && group)
+        for (const auto &state : expanded)
+            if (state.pane == target)
+                for (const auto &[id, collapsed] : state.groups)
+                    if (id == group && collapsed)
+                        if (auto *g = app.model.FindGroup(target, group))
+                            keepExpanded = !g->collapsed;
+    RestoreExpanded();
+    if (keepExpanded)
+        app.model.SetGroupCollapsed(target, group, false);
     if (!source.tab && source.group) {
         if (group == source.group && target == pane) {
             RestoreExpanded();
@@ -484,11 +500,6 @@ void TabStrip::FinishMove(POINT screen) {
     } else if (source.tab) {
         app.model.Move(source.tab, target, index, group);
     }
-    for (auto [p, g] : expanded)
-        if (!(p == target && g == group))
-            if (auto *x = app.model.FindGroup(p, g))
-                app.model.SetGroupCollapsed(p, g, true);
-    expanded.clear();
     app.SyncViews();
     app.Changed();
     app.Activate(app.model.active);

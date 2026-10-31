@@ -9,7 +9,7 @@
 #include <gdiplus.h>
 namespace zen {
 static constexpr UINT Back = 101, Forward = 102, Up = 103, Refresh = 104, Exit = 110, ClearRecent = 111,
-                      Wrap = 112, About = 113, ViewBase = 200, RecentBase = 300;
+                      Wrap = 112, About = 113, SingleGroup = 114, ViewBase = 200, RecentBase = 300;
 static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR index, DWORD_PTR ptr) {
     auto *app = (App *)ptr;
     int p = (int)index;
@@ -711,8 +711,7 @@ void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener
     if (!id)
         return;
     if (group)
-        if (auto *g = model.FindGroup(p, group))
-            g->collapsed = false;
+        model.SetGroupCollapsed(p, group, false);
     Activate(p, id);
     strips[p]->EnsureVisible(id);
     BuildMenu();
@@ -862,6 +861,8 @@ void App::BuildMenu() {
         AppendMenuW(view, MF_STRING, ViewBase + i, modes[i]);
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING | (model.wrap ? MF_CHECKED : 0), Wrap, L"标签自动换行");
+    AppendMenuW(view, MF_STRING | (model.singleExpandedGroup ? MF_CHECKED : 0), SingleGroup,
+                L"每栏仅展开一个组");
     AppendMenuW(help, MF_STRING, About, L"关于");
     AppendMenuW(main, MF_POPUP, (UINT_PTR)file, L"文件");
     AppendMenuW(main, MF_POPUP, (UINT_PTR)view, L"查看");
@@ -894,6 +895,11 @@ void App::Command(UINT id) {
         Changed();
         BuildMenu();
         Layout();
+    } else if (id == SingleGroup) {
+        model.SetSingleExpandedGroup(!model.singleExpandedGroup);
+        Changed();
+        BuildMenu();
+        SyncViews();
     } else if (id == ClearRecent) {
         if (Confirm(window, L"是否清空最近访问目录？")) {
             model.recent.clear();
@@ -931,6 +937,8 @@ void App::Command(UINT id) {
 
 void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     HMENU menu = CreatePopupMenu();
+    std::vector<HBITMAP> colorBitmaps;
+    constexpr UINT ColorBase = 20;
     if (tab) {
         auto *t = model.Find(tab);
         AppendMenuW(menu, MF_STRING, 1, t && !t->name.empty() ? L"修改常用标签名称…" : L"设为常用标签…");
@@ -951,7 +959,37 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             AppendMenuW(menu, MF_STRING, 4, L"移出组");
     } else if (group) {
         AppendMenuW(menu, MF_STRING, 10, L"修改组名");
-        AppendMenuW(menu, MF_STRING, 11, L"修改颜色");
+        HMENU colors = CreatePopupMenu();
+        auto *current = model.FindGroup(p, group);
+        for (UINT i = 0; i < std::size(GroupColors); ++i) {
+            const auto &preset = GroupColors[i];
+            AppendMenuW(colors, MF_STRING | (current && current->color == preset.color ? MF_CHECKED : 0),
+                        ColorBase + i, preset.name);
+            // 位图在菜单关闭后统一释放，色块与系统勾选标记各占自己的位置。
+            HDC screen = GetDC(window);
+            HDC dc = CreateCompatibleDC(screen);
+            HBITMAP bitmap = CreateCompatibleBitmap(screen, S(14), S(14));
+            if (dc && bitmap) {
+                auto old = SelectObject(dc, bitmap);
+                RECT rect{0, 0, S(14), S(14)};
+                auto brush = CreateSolidBrush(preset.color);
+                FillRect(dc, &rect, brush);
+                DeleteObject(brush);
+                SelectObject(dc, old);
+                MENUITEMINFOW item{sizeof(item)};
+                item.fMask = MIIM_BITMAP;
+                item.hbmpItem = bitmap;
+                SetMenuItemInfoW(colors, ColorBase + i, FALSE, &item);
+                colorBitmaps.push_back(bitmap);
+            } else if (bitmap)
+                DeleteObject(bitmap);
+            if (dc)
+                DeleteDC(dc);
+            ReleaseDC(window, screen);
+        }
+        AppendMenuW(colors, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(colors, MF_STRING, 11, L"自定义颜色…");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)colors, L"修改颜色");
         AppendMenuW(menu, MF_STRING, 12, L"取消分组");
         AppendMenuW(menu, MF_STRING, 13, L"在组内新建标签");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -959,6 +997,8 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     }
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, window, nullptr);
     DestroyMenu(menu);
+    for (auto bitmap : colorBitmaps)
+        DeleteObject(bitmap);
     if (!cmd)
         return;
     if (tab) {
@@ -1000,6 +1040,9 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             auto name = Input(window, L"组名", g->name);
             if (name && !name->empty())
                 g->name = *name;
+        } else if (cmd >= ColorBase && cmd < ColorBase + std::size(GroupColors)) {
+            g->color = GroupColors[cmd - ColorBase].color;
+            Log(L"设置组预设颜色 group=" + std::to_wstring(group));
         } else if (cmd == 11) {
             static COLORREF custom[16]{};
             CHOOSECOLORW c{sizeof(c)};
@@ -1007,8 +1050,10 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             c.rgbResult = g->color;
             c.lpCustColors = custom;
             c.Flags = CC_FULLOPEN | CC_RGBINIT;
-            if (ChooseColorW(&c))
+            if (ChooseColorW(&c)) {
                 g->color = c.rgbResult;
+                Log(L"设置组自定义颜色 group=" + std::to_wstring(group));
+            }
         } else if (cmd == 12)
             model.Ungroup(p, group);
         else if (cmd == 13) {
@@ -1086,8 +1131,8 @@ void App::OpenSelected(ShellView &v, bool newTab) {
         if (!first)
             first = id;
     }
-    if (auto *g = model.FindGroup(p, group))
-        g->collapsed = false;
+    if (group)
+        model.SetGroupCollapsed(p, group, false);
     Activate(p, first);
     strips[p]->EnsureVisible(first);
 }
@@ -1138,9 +1183,8 @@ void App::PollPastes() {
             Log(L"拖放操作进程退出但没有结果");
         // 用户已经继续交互时，不用迟到结果覆盖其分组选择。
         if (cancelled && pending.generation == dropGeneration) {
-            for (auto [pane, group] : pending.expanded)
-                if (model.FindGroup(pane, group))
-                    model.SetGroupCollapsed(pane, group, true);
+            for (const auto &state : pending.expanded)
+                model.RestoreGroups(state);
             Changed();
             SyncViews();
         }

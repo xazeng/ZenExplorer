@@ -58,6 +58,8 @@ Id Model::Add(int p, const std::wstring &path, Id group, int index, bool activat
         if (activate)
             active = p;
     }
+    if (activate && group)
+        SetGroupCollapsed(p, group, false);
     return id;
 }
 void Model::Navigate(Id id, const std::wstring &path, bool append) {
@@ -191,17 +193,18 @@ void Model::Remove(int p, const std::vector<Id> &ids, bool record, bool wholeGro
     Cleanup(p);
 }
 Id Model::MakeGroup(int p, Id id) {
-    if (PaneOf(id) != p)
+    if (p < 0 || p > 1 || PaneOf(id) != p)
         return 0;
-    static const COLORREF palette[] = {RGB(50, 120, 220), RGB(20, 150, 100), RGB(190, 90, 180),
-                                       RGB(210, 125, 20), RGB(210, 65, 70),  RGB(90, 100, 130)};
     Group g;
     g.id = nextId++;
-    for (auto c : palette) {
-        g.color = c;
-        if (std::none_of(panes[p].groups.begin(), panes[p].groups.end(),
-                         [&](auto &x) { return x.color == c; }))
-            break;
+    size_t least = panes[p].groups.size() + 1;
+    for (const auto &preset : GroupColors) {
+        size_t count = std::count_if(panes[p].groups.begin(), panes[p].groups.end(),
+                                     [&](const auto &x) { return x.color == preset.color; });
+        if (count < least) {
+            least = count;
+            g.color = preset.color;
+        }
     }
     auto gid = g.id;
     // 先将旧组中的标签移出，防止把连续组拆成两段。
@@ -209,6 +212,7 @@ Id Model::MakeGroup(int p, Id id) {
     panes[p].groups.push_back(g);
     Find(id)->group = gid;
     Find(id)->opener = 0;
+    SetGroupCollapsed(p, gid, false);
     return gid;
 }
 void Model::AssignGroup(Id id, Id group) {
@@ -245,8 +249,64 @@ void Model::SetGroupCollapsed(int p, Id group, bool collapsed) {
     if (!g)
         return;
     g->collapsed = collapsed;
-    if (collapsed)
-        EnsureVisibleSelection(p);
+    if (!collapsed && singleExpandedGroup) {
+        for (auto &other : panes[p].groups)
+            if (other.id != group)
+                other.collapsed = true;
+        if (!Visible(p, panes[p].selected))
+            for (const auto &tab : panes[p].tabs)
+                if (tab.group == group) {
+                    panes[p].selected = tab.id;
+                    break;
+                }
+    }
+    EnsureVisibleSelection(p);
+    Log(L"分组展开状态 pane=" + std::to_wstring(p) + L" group=" + std::to_wstring(group) + L" collapsed=" +
+        std::to_wstring(collapsed));
+}
+void Model::NormalizeGroups(int p) {
+    if (p < 0 || p > 1)
+        return;
+    if (singleExpandedGroup) {
+        Id keep = 0;
+        if (auto *tab = Find(panes[p].selected); tab && PaneOf(tab->id) == p)
+            keep = tab->group;
+        if (!keep)
+            for (const auto &tab : panes[p].tabs)
+                if (auto *g = FindGroup(p, tab.group); g && !g->collapsed) {
+                    keep = g->id;
+                    break;
+                }
+        for (auto &g : panes[p].groups)
+            g.collapsed = g.id != keep;
+    }
+    EnsureVisibleSelection(p);
+}
+void Model::SetSingleExpandedGroup(bool enabled) {
+    singleExpandedGroup = enabled;
+    for (int p = 0; p < 2; ++p)
+        NormalizeGroups(p);
+    Log(L"每栏仅展开一个组 enabled=" + std::to_wstring(enabled));
+}
+GroupExpansionState Model::CaptureGroups(int p) const {
+    GroupExpansionState state;
+    if (p < 0 || p > 1)
+        return state;
+    state.pane = p;
+    state.selected = panes[p].selected;
+    for (const auto &g : panes[p].groups)
+        state.groups.emplace_back(g.id, g.collapsed);
+    return state;
+}
+void Model::RestoreGroups(const GroupExpansionState &state) {
+    if (state.pane < 0 || state.pane > 1)
+        return;
+    for (const auto &[id, collapsed] : state.groups)
+        if (auto *g = FindGroup(state.pane, id))
+            g->collapsed = collapsed;
+    if (Visible(state.pane, state.selected))
+        panes[state.pane].selected = state.selected;
+    NormalizeGroups(state.pane);
 }
 void Model::Ungroup(int p, Id group) {
     for (auto &t : panes[p].tabs)
@@ -323,8 +383,11 @@ void Model::MoveGroup(int source, Id group, int target, int index) {
     if (carries) {
         panes[target].selected = selected;
         active = target;
+        SetGroupCollapsed(target, group, false);
     } else
         active = oldActive;
+    if (source != target && !carries)
+        NormalizeGroups(target);
     Cleanup(target);
 }
 bool Model::Valid() const {
