@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 1200 1200">
+  <g transform="translate(-75 -75) scale(1.125)">
+  <path fill="#FFA000" d="M100 400V300A100 100 0 0 1 200 200H450L550 300V1000H200A100 100 0 0 1 100 900Z"/>
+  <rect x="100" y="300" width="1000" height="700" rx="100" fill="#FFCE2B"/>
+  </g>
+</svg>
