@@ -51,6 +51,30 @@ void Log(const std::wstring &s) {
         CloseHandle(f);
     }
 }
+ResourceTrace::ResourceTrace(std::wstring name) : phase(std::move(name)) {
+    wchar_t value[2]{};
+    enabled = GetEnvironmentVariableW(L"ZENEXPLORER_FILE_LOG", value, 2) == 1 && value[0] == L'1';
+    if (!enabled)
+        return;
+    start = GetTickCount64();
+    GetProcessHandleCount(GetCurrentProcess(), &handles);
+    gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    user = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+    Log(phase + L" 开始 handles=" + std::to_wstring(handles) + L" gdi=" + std::to_wstring(gdi) + L" user=" +
+        std::to_wstring(user));
+}
+ResourceTrace::~ResourceTrace() {
+    if (!enabled)
+        return;
+    DWORD endHandles = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &endHandles);
+    auto endGdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    auto endUser = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+    Log(phase + L" 结束 ms=" + std::to_wstring(GetTickCount64() - start) + L" handles=" +
+        std::to_wstring(endHandles) + L" gdi=" + std::to_wstring(endGdi) + L" user=" +
+        std::to_wstring(endUser) + L" delta=" + std::to_wstring((long long)endHandles - handles) + L"," +
+        std::to_wstring((long long)endGdi - gdi) + L"," + std::to_wstring((long long)endUser - user));
+}
 std::wstring ErrorText(HRESULT hr) {
     wchar_t *text = nullptr;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |

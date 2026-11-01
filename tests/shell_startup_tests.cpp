@@ -1,6 +1,7 @@
 #include "app.h"
 #include "shell_view.h"
 #include "tabs.h"
+#include "shell_menu.h"
 #include <gdiplus.h>
 #include <iostream>
 using namespace zen;
@@ -29,7 +30,7 @@ static bool Ready(Id id) {
            bounds.bottom == hostBounds.bottom && (GetWindowLongPtrW(view.host, GWL_STYLE) & WS_VISIBLE);
 }
 static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
-    if (!state || state->busy || !state->app->window)
+    if (!state || state->busy || !state->app->window || state->stage >= 6)
         return;
     state->busy = true;
     auto &app = *state->app;
@@ -83,6 +84,67 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         };
         if (state->stage == 0) {
             checkMode(FVM_ICON);
+            // 菜单和快捷工具共享一行；原生菜单句柄不再占据窗口非客户区。
+            RECT menuBounds{}, backBounds{}, tabBounds{};
+            GetWindowRect(app.toolbar, &menuBounds);
+            GetWindowRect(GetDlgItem(app.window, 101), &backBounds);
+            GetWindowRect(app.strips[0]->hwnd, &tabBounds);
+            if (GetMenu(app.window) || !IsMenu(app.mainMenu) || GetMenuItemCount(app.mainMenu) != 3 ||
+                SendMessageW(app.toolbar, TB_BUTTONCOUNT, 0, 0) != 3 || menuBounds.top != backBounds.top ||
+                menuBounds.right > backBounds.left || menuBounds.bottom > tabBounds.top) {
+                std::cerr << "combined menu and navigation layout mismatch\n";
+                state->failed = true;
+            }
+            if (app.customFrame) {
+                auto hit = [&](int x, int y) {
+                    POINT point{x, y};
+                    ClientToScreen(app.window, &point);
+                    return SendMessageW(app.window, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y));
+                };
+                // 标题空白、菜单控件、系统图标和上边缘各自保留正确的原生命中语义。
+                int titleCenter = app.TitleOffset() + app.S(18);
+                if (hit(app.S(350), titleCenter) != HTCAPTION || hit(app.S(50), titleCenter) != HTCLIENT ||
+                    hit(app.S(16), titleCenter) != HTSYSMENU || hit(app.S(350), 1) != HTTOP) {
+                    std::cerr << "integrated title hit testing mismatch\n";
+                    state->failed = true;
+                }
+                POINT origin{};
+                ClientToScreen(app.window, &origin);
+                if (tabBounds.top - origin.y != app.TitleHeight()) {
+                    std::cerr << "integrated title and tabs layout mismatch\n";
+                    state->failed = true;
+                }
+            }
+            int menuPane = app.model.active;
+            HWND previous = GetFocus();
+            SendMessageW(app.window, WM_SYSCOMMAND, SC_KEYMENU, 0);
+            MSG menuKey{};
+            menuKey.hwnd = app.toolbar;
+            menuKey.message = WM_KEYDOWN;
+            menuKey.wParam = VK_RIGHT;
+            if (GetFocus() != app.toolbar || !app.Key(menuKey) ||
+                SendMessageW(app.toolbar, TB_GETHOTITEM, 0, 0) != 1)
+                state->failed = true;
+            menuKey.wParam = VK_ESCAPE;
+            if (!app.Key(menuKey) || (IsWindow(previous) && GetFocus() != previous) ||
+                app.model.active != menuPane)
+                state->failed = true;
+            SendMessageW(app.window, WM_SYSCOMMAND, SC_KEYMENU, 0);
+            menuKey.wParam = VK_TAB;
+            const wchar_t *captionNames[] = {L"最小化", L"最大化", L"关闭"};
+            for (int i = 0; i < 3; ++i) {
+                HWND button = GetDlgItem(app.window, 123 + i);
+                if (!app.Key(menuKey) || GetFocus() != button || WindowText(button) != captionNames[i])
+                    state->failed = true;
+                RECT bounds{};
+                GetWindowRect(button, &bounds);
+                POINT point{(bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2};
+                if (SendMessageW(app.window, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y)) != HTCLIENT)
+                    state->failed = true;
+            }
+            menuKey.wParam = VK_ESCAPE;
+            if (!app.Key(menuKey) || (IsWindow(previous) && GetFocus() != previous))
+                state->failed = true;
             // 隔离窗口内验证失焦取消编辑，不提交文字，也不切换活动栏。
             auto addressId = app.model.panes[0].selected;
             auto path = app.model.Find(addressId)->path;
@@ -133,6 +195,104 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 state->failed = true;
             checkMode(FVM_DETAILS);
             setIcons();
+            // 完整鼠标消息序列：组单击不切换，双击只切换一次，展开恢复组内选择。
+            Id leftBefore = app.model.panes[0].selected;
+            bool previousTrigger = app.model.groupDoubleClick;
+            app.Command(116);
+            int activeBefore = app.model.active;
+            Id grouped = app.model.Add(0, Home, 0, -1, false);
+            Id groupId = app.model.MakeGroup(0, grouped);
+            app.Layout();
+            auto groupPoint = [&]() {
+                for (auto &hit : app.strips[0]->hits)
+                    if (!hit.tab && hit.group == groupId)
+                        return MAKELPARAM((hit.rect.left + hit.rect.right) / 2,
+                                          (hit.rect.top + hit.rect.bottom) / 2);
+                return (LPARAM)0;
+            };
+            auto clickGroup = [&](bool twice) {
+                LPARAM point = groupPoint();
+                SendMessageW(app.strips[0]->hwnd, WM_LBUTTONDOWN, MK_LBUTTON, point);
+                SendMessageW(app.strips[0]->hwnd, WM_LBUTTONUP, 0, point);
+                if (twice) {
+                    SendMessageW(app.strips[0]->hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, point);
+                    SendMessageW(app.strips[0]->hwnd, WM_LBUTTONUP, 0, point);
+                }
+            };
+            clickGroup(false);
+            if (app.model.active != 0 || app.model.panes[0].selected != leftBefore ||
+                app.model.FindGroup(0, groupId)->collapsed) {
+                std::cerr << "group single click changed selection or expansion\n";
+                state->failed = true;
+            }
+            app.Activate(0, grouped);
+            clickGroup(true);
+            if (!app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected == grouped) {
+                std::cerr << "group double click did not collapse exactly once\n";
+                state->failed = true;
+            }
+            clickGroup(false);
+            if (!app.model.FindGroup(0, groupId)->collapsed)
+                state->failed = true;
+            clickGroup(true);
+            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != grouped) {
+                std::cerr << "group double click did not restore remembered selection\n";
+                state->failed = true;
+            }
+            app.Command(115);
+            clickGroup(true);
+            if (!app.model.FindGroup(0, groupId)->collapsed) {
+                std::cerr << "single click mode double click toggled twice\n";
+                state->failed = true;
+            }
+            clickGroup(false);
+            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != grouped)
+                state->failed = true;
+            app.Command(previousTrigger ? 116 : 115);
+            app.CloseTabs(0, {grouped}, true);
+            app.Activate(0, leftBefore);
+            app.Activate(activeBefore);
+            // 关闭单标签与整组后，图标缓存必须回到原大小。
+            size_t iconsBefore = app.icons.size(), indicesBefore = app.iconIndices.size();
+            auto &view = *app.views.at(id);
+            view.Hook();
+            ULONG refsBefore = view.AddRef();
+            view.Release();
+            DWORD userBefore = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+            for (int cycle = 0; cycle < 32; ++cycle) {
+                Id first = app.model.Add(0, DataDir().wstring(), 0, -1, false);
+                Id second = app.model.Add(0, Home, 0, -1, false);
+                app.RefreshLocalIcon(first);
+                app.RefreshLocalIcon(second);
+                if (cycle % 2) {
+                    Id group = app.model.MakeGroup(0, first);
+                    app.model.AssignGroup(second, group);
+                    app.CloseTabs(0, {first, second}, true);
+                } else {
+                    app.CloseTabs(0, {first});
+                    app.CloseTabs(0, {second});
+                }
+                // 模拟 Shell 导航销毁旧文件子窗口，验证 OLE 注册引用配对释放。
+                HWND child = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD, 0, 0, 10, 10, view.host, nullptr,
+                                           GetModuleHandleW(nullptr), nullptr);
+                if (!child)
+                    state->failed = true;
+                view.Hook();
+                DestroyWindow(child);
+                ShellMenu menu;
+                if (FAILED(menu.Create(view.shell.Get(), true, app.window)))
+                    state->failed = true;
+            }
+            ULONG refsAfter = view.AddRef();
+            view.Release();
+            if (app.icons.size() != iconsBefore || app.iconIndices.size() != indicesBefore ||
+                refsBefore != refsAfter) {
+                std::cerr << "resource lifecycle mismatch icons/indices/refs\n";
+                state->failed = true;
+            }
+            std::cout << "resource cycles=32 user before=" << userBefore
+                      << " after=" << GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS)
+                      << " refs=" << refsAfter << "\n";
             PostMessageW(app.window, WM_CLOSE, 0, 0);
         }
         ++state->stage;

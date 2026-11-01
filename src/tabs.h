@@ -9,6 +9,7 @@ struct TabHit {
 class TabStrip : public IDropTarget {
     LONG refs = 1;
     bool dragging = false, closePressed = false;
+    bool ignoreButtonUp = false;
     HWND ghost{};
     int dropPane = -1, dropIndex = 0;
     Id dropGroup = 0;

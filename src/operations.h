@@ -31,6 +31,8 @@ struct TaskItems {
     std::vector<std::wstring> created;
 };
 TaskItems ReadTaskItems(const std::filesystem::path &result);
+// 仅删除任务目录中已消费结果的精确文件；调用者须确认写入进程已退出。
+bool CleanupTaskResult(const std::filesystem::path &result);
 // 测试可指定待验证程序；生产调用默认启动当前可执行文件。
 bool LaunchTask(HWND owner, const FileTask &task, const std::filesystem::path &executable = {},
                 std::filesystem::path *resultFile = nullptr, std::shared_ptr<void> *process = nullptr,

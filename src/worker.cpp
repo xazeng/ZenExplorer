@@ -108,12 +108,15 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
             throw HRESULT_FROM_WIN32(GetLastError());
         auto task = ReadTask(file);
         if (!task.sourceFeedback.empty()) {
+            Log(L"拖放来源回执开始解封送");
             ComPtr<IStream> stream;
             stream.Attach(SHCreateMemStream(task.sourceFeedback.data(), (UINT)task.sourceFeedback.size()));
             HRESULT hr =
                 stream ? CoUnmarshalInterface(stream.Get(), IID_PPV_ARGS(&sourceFeedback)) : E_OUTOFMEMORY;
             if (FAILED(hr))
                 Log(L"来源回执接口不可用，独立文件操作继续 " + ErrorText(hr));
+            else
+                Log(L"拖放来源回执解封送成功");
         }
         Operation operation = task.operation;
         if (operation == Operation::Paste)
@@ -233,6 +236,7 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
         SetDataEffect(sourceFeedback.Get(), CFSTR_LOGICALPERFORMEDDROPEFFECT, result.effect);
         ComPtr<IDataObjectAsyncCapability> async;
         if (SUCCEEDED(sourceFeedback.As(&async))) {
+            Log(L"拖放来源完成回执开始");
             HRESULT hr = async->EndOperation(result.invoked, nullptr, result.effect);
             Log(L"拖放来源完成回执 hr=" + std::to_wstring((unsigned long)hr));
         }

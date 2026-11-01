@@ -15,11 +15,22 @@ class App {
   public:
     HINSTANCE instance{};
     HWND window{}, toolbar{}, status{}, address[2]{}, crumb[2]{}, error[2]{};
+    HMENU mainMenu{};
+    HWND menuReturnFocus{};
+    bool menuOpen = false;
+    int menuIndex = 0, nextMenu = -1;
+    HMENU selectedMenu{};
+    UINT selectedMenuFlags = 0;
+    void ShowMainMenu(int index);
     ComPtr<IAutoComplete2> addressComplete[2];
     ComPtr<IAutoCompleteDropDown> addressDropDown[2];
     HFONT font{};
     HICON folderIcon{}, computerIcon{}, missingIcon{}, windowLargeIcon{}, windowSmallIcon{};
     UINT dpi = 96;
+    bool customFrame = false;
+    int TitleOffset() const;
+    int TitleHeight() const;
+    void UpdateFrame();
     RECT viewBounds[2]{};
     Model model;
     std::unique_ptr<TabStrip> strips[2];
@@ -79,6 +90,11 @@ class App {
         uint64_t generation = 0;
     };
     std::vector<PendingDrop> pendingDrops;
+    struct RetiredTask {
+        std::filesystem::path result;
+        std::shared_ptr<void> process;
+    };
+    std::vector<RetiredTask> retiredTasks;
     uint64_t pasteGeneration = 0;
     uint64_t dropGeneration = 0;
     bool PasteFeedbackCurrent(const PendingPaste &, HWND foreground, HWND focus);

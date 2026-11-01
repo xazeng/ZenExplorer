@@ -129,10 +129,13 @@ void ShellView::Destroy() {
     if (destroyed)
         return;
     destroyed = true;
-    for (auto h : drops)
+    ResourceTrace trace(L"销毁 Shell 视图 tab=" + std::to_wstring(id));
+    // 撤销注册可能重入窗口消息，先转移列表，避免回调修改正在遍历的容器。
+    auto registered = std::move(drops);
+    drops.clear();
+    for (auto h : registered)
         if (IsWindow(h))
             RevokeDragDrop(h);
-    drops.clear();
     for (auto h : hooks)
         if (IsWindow(h))
             RemoveWindowSubclass(h, Subclass, (UINT_PTR)this);
@@ -233,7 +236,8 @@ HRESULT ShellView::OnDefaultCommand(IShellView *) {
     if (items.size() == 1 && SUCCEEDED(items[0]->GetAttributes(SFGAO_FOLDER, &attr)) &&
         (attr & SFGAO_FOLDER)) {
         auto *r = new NavRequest{id, ItemName(items[0].Get()), false};
-        PostMessageW(app.window, WM_ZEN_NAV, 0, (LPARAM)r);
+        if (!PostMessageW(app.window, WM_ZEN_NAV, 0, (LPARAM)r))
+            delete r;
         return S_OK;
     }
     return S_FALSE;
@@ -662,9 +666,16 @@ LRESULT CALLBACK ShellView::Subclass(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PT
             PostMessageW(s->app.window, WM_ZEN_CHANGED, (WPARAM)s->id, 2);
         }
     }
+    if (m == WM_DESTROY || m == WM_NCDESTROY) {
+        // 导航会在 ShellView 本身仍存活时销毁旧子窗口，必须就地配对撤销。
+        if (std::erase(s->drops, w)) {
+            HRESULT hr = RevokeDragDrop(w);
+            Log(L"撤销视图拖放 tab=" + std::to_wstring(s->id) + L" result=" +
+                std::to_wstring((unsigned long)hr));
+        }
+    }
     if (m == WM_NCDESTROY) {
         std::erase(s->hooks, w);
-        std::erase(s->drops, w);
         RemoveWindowSubclass(w, Subclass, key);
     }
     return DefSubclassProc(w, m, a, b);

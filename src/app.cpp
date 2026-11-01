@@ -7,9 +7,44 @@
 #include <commdlg.h>
 #include <set>
 #include <gdiplus.h>
+#include <dwmapi.h>
 namespace zen {
+static constexpr UINT MenuBase = 120;
+static constexpr UINT CaptionBase = 123;
+static thread_local App *trackingMenu = nullptr;
+static LRESULT CALLBACK MenuFilter(int code, WPARAM w, LPARAM l) {
+    auto *app = trackingMenu;
+    if (code == MSGF_MENU && app) {
+        auto &msg = *reinterpret_cast<MSG *>(l);
+        int next = -1;
+        if (msg.message == WM_KEYDOWN && app->selectedMenu == GetSubMenu(app->mainMenu, app->menuIndex)) {
+            if (msg.wParam == VK_LEFT)
+                next = (app->menuIndex + 2) % 3;
+            else if (msg.wParam == VK_RIGHT && !(app->selectedMenuFlags & MF_POPUP))
+                next = (app->menuIndex + 1) % 3;
+        }
+        if (msg.message == WM_MOUSEMOVE) {
+            POINT point = msg.pt;
+            ScreenToClient(app->toolbar, &point);
+            RECT bounds{};
+            GetClientRect(app->toolbar, &bounds);
+            if (PtInRect(&bounds, point)) {
+                int hit = (int)SendMessageW(app->toolbar, TB_HITTEST, 0, (LPARAM)&point);
+                if (hit >= 0 && hit < 3 && hit != app->menuIndex)
+                    next = hit;
+            }
+        }
+        if (next >= 0) {
+            app->nextMenu = next;
+            EndMenu();
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, w, l);
+}
 static constexpr UINT Back = 101, Forward = 102, Up = 103, Refresh = 104, Exit = 110, ClearRecent = 111,
-                      Wrap = 112, About = 113, SingleGroup = 114, ViewBase = 200, RecentBase = 300;
+                      Wrap = 112, About = 113, SingleGroup = 114, GroupSingleClick = 115,
+                      GroupDoubleClick = 116, ViewBase = 200, RecentBase = 300;
 static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR index, DWORD_PTR ptr) {
     auto *app = (App *)ptr;
     int p = (int)index;
@@ -127,9 +162,9 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         HPEN pen = CreatePen(PS_SOLID, app.S(app.model.active == p ? 2 : 1),
                              app.model.active == p ? RGB(55, 125, 220) : RGB(190, 190, 190));
         auto op = SelectObject(dc, pen);
-        auto ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, 0, 0, rc.right, rc.bottom);
-        SelectObject(dc, ob);
+        // 两栏均不绘制顶边，焦点仅改变左右边及底边的颜色和粗细。
+        POINT border[]{{0, 0}, {0, rc.bottom - 1}, {rc.right - 1, rc.bottom - 1}, {rc.right - 1, 0}};
+        Polyline(dc, border, ARRAYSIZE(border));
         SelectObject(dc, op);
         DeleteObject(pen);
         SelectObject(dc, old);
@@ -172,8 +207,91 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     }
     return DefWindowProcW(w, m, a, b);
 }
+static LRESULT CALLBACK CaptionButtonProc(HWND hwnd, UINT message, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (message == WM_MOUSEMOVE) {
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&track);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    if (message == WM_MOUSELEAVE)
+        InvalidateRect(hwnd, nullptr, FALSE);
+    return DefSubclassProc(hwnd, message, w, l);
+}
 App::App() = default;
+static void PaintCaptionButton(App &app, const DRAWITEMSTRUCT &item) {
+    RECT r = item.rcItem;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(item.hwndItem, &cursor);
+    bool hot = PtInRect(&r, cursor), pressed = (item.itemState & ODS_SELECTED) != 0;
+    bool close = item.CtlID == CaptionBase + 2;
+    COLORREF bg = close && (hot || pressed) ? (pressed ? RGB(190, 20, 30) : RGB(232, 17, 35))
+                  : pressed                 ? RGB(210, 210, 210)
+                  : hot                     ? RGB(225, 225, 225)
+                                            : GetSysColor(COLOR_BTNFACE);
+    HBRUSH brush = CreateSolidBrush(bg);
+    FillRect(item.hDC, &r, brush);
+    HPEN pen = CreatePen(PS_SOLID, app.S(1),
+                         close && (hot || pressed) ? RGB(255, 255, 255) : GetSysColor(COLOR_WINDOWTEXT));
+    auto oldPen = SelectObject(item.hDC, pen);
+    auto oldBrush = SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
+    int x = (r.left + r.right) / 2 - app.S(5), y = (r.top + r.bottom) / 2 - app.S(5);
+    auto line = [&](int x1, int y1, int x2, int y2) {
+        MoveToEx(item.hDC, x + app.S(x1), y + app.S(y1), nullptr);
+        LineTo(item.hDC, x + app.S(x2), y + app.S(y2));
+    };
+    if (item.CtlID == CaptionBase)
+        line(0, 5, 10, 5);
+    else if (close) {
+        line(0, 0, 10, 10);
+        line(10, 0, 0, 10);
+    } else if (IsZoomed(app.window)) {
+        Rectangle(item.hDC, x + app.S(2), y, x + app.S(10), y + app.S(8));
+        RECT front{x, y + app.S(2), x + app.S(8), y + app.S(10)};
+        FillRect(item.hDC, &front, brush);
+        Rectangle(item.hDC, front.left, front.top, front.right, front.bottom);
+    } else
+        Rectangle(item.hDC, x, y, x + app.S(10), y + app.S(10));
+    SelectObject(item.hDC, oldBrush);
+    SelectObject(item.hDC, oldPen);
+    DeleteObject(pen);
+    DeleteObject(brush);
+    if (item.itemState & ODS_FOCUS) {
+        InflateRect(&r, -app.S(4), -app.S(4));
+        DrawFocusRect(item.hDC, &r);
+    }
+}
+int App::TitleOffset() const {
+    return customFrame && !IsZoomed(window)
+               ? GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+               : 0;
+}
+int App::TitleHeight() const {
+    return TitleOffset() + S(customFrame ? 36 : 32);
+}
+void App::UpdateFrame() {
+    if (!window)
+        return;
+    if (customFrame) {
+        // 标题行使用普通不透明客户区，仅保留系统边框效果。
+        MARGINS margins{0, 0, 1, 0};
+        HRESULT hr = DwmExtendFrameIntoClientArea(window, &margins);
+        if (FAILED(hr))
+            Log(L"扩展标题区域失败 " + ErrorText(hr));
+    }
+    RECT title{};
+    GetClientRect(window, &title);
+    title.bottom = TitleHeight();
+    InvalidateRect(window, &title, TRUE);
+    if (toolbar)
+        RedrawWindow(toolbar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    for (int i = 0; i < 4; ++i)
+        if (HWND button = GetDlgItem(window, Back + i))
+            InvalidateRect(button, nullptr, TRUE);
+}
 App::~App() {
+    if (mainMenu)
+        DestroyMenu(mainMenu);
     views.clear();
     strips[0].reset();
     strips[1].reset();
@@ -236,8 +354,10 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
     int height = std::clamp(r.bottom - r.top, 400L, monitor.rcWork.bottom - monitor.rcWork.top);
     r.left = std::clamp(r.left, monitor.rcWork.left, monitor.rcWork.right - width);
     r.top = std::clamp(r.top, monitor.rcWork.top, monitor.rcWork.bottom - height);
-    window = CreateWindowExW(0, cls.c_str(), L"ZenExplorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left,
-                             r.top, width, height, nullptr, nullptr, h, this);
+    customFrame = true;
+    window =
+        CreateWindowExW(0, cls.c_str(), L"ZenExplorer", (WS_OVERLAPPEDWINDOW & ~WS_CAPTION) | WS_CLIPCHILDREN,
+                        r.left, r.top, width, height, nullptr, nullptr, h, this);
     if (!window) {
         CloseHandle(mutex);
         return 2;
@@ -258,6 +378,9 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
         SetWindowPos(window, nullptr, r.left, r.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     ShowWindow(window, model.maximized ? SW_SHOWMAXIMIZED : show);
+    UpdateFrame();
+    SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     RefreshWindowIcons();
     UpdateWindow(window);
     if (recovered) {
@@ -303,8 +426,118 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         if (SUCCEEDED(menu2->HandleMenuMsg(m, a, b)))
             return 0;
     switch (m) {
+    case WM_NOTIFY: {
+        auto *header = reinterpret_cast<NMHDR *>(b);
+        if (header && header->idFrom >= CaptionBase && header->idFrom < CaptionBase + 3 &&
+            header->code == NM_CUSTOMDRAW) {
+            auto *draw = reinterpret_cast<NMCUSTOMDRAW *>(b);
+            if (draw->dwDrawStage == CDDS_PREPAINT) {
+                DRAWITEMSTRUCT item{};
+                item.CtlID = (UINT)header->idFrom;
+                item.hwndItem = header->hwndFrom;
+                item.hDC = draw->hdc;
+                item.rcItem = draw->rc;
+                item.itemState = ((draw->uItemState & CDIS_SELECTED) ? ODS_SELECTED : 0) |
+                                 ((draw->uItemState & CDIS_FOCUS) ? ODS_FOCUS : 0);
+                PaintCaptionButton(*this, item);
+                return CDRF_SKIPDEFAULT;
+            }
+        }
+        break;
+    }
+    case WM_NCCALCSIZE:
+        if (customFrame && a) {
+            auto *params = reinterpret_cast<NCCALCSIZE_PARAMS *>(b);
+            LONG top = params->rgrc[0].top;
+            DefWindowProcW(window, m, a, b);
+            UINT currentDpi = GetDpiForWindow(window);
+            if (!currentDpi)
+                currentDpi = dpi;
+            // 保留系统左右及底部框架；最大化时扣除窗口外延，避免内容被屏幕顶端裁切。
+            params->rgrc[0].top =
+                top + (IsZoomed(window) ? GetSystemMetricsForDpi(SM_CYSIZEFRAME, currentDpi) +
+                                              GetSystemMetricsForDpi(SM_CXPADDEDBORDER, currentDpi)
+                                        : 0);
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST:
+        if (customFrame) {
+            LRESULT native = DefWindowProcW(window, m, a, b);
+            if (native >= HTLEFT && native <= HTBOTTOMRIGHT)
+                return native;
+            POINT point{GET_X_LPARAM(b), GET_Y_LPARAM(b)};
+            ScreenToClient(window, &point);
+            if (!IsZoomed(window) && point.y >= 0 && point.y < TitleOffset())
+                return HTTOP;
+            if (point.y >= TitleOffset() && point.y < TitleHeight()) {
+                RECT icon{S(4), TitleOffset(), S(32), TitleHeight()};
+                if (PtInRect(&icon, point))
+                    return HTSYSMENU;
+                HWND child = ChildWindowFromPointEx(window, point, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+                if (child && child != window)
+                    return HTCLIENT;
+                return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
+        break;
+    case WM_GETMINMAXINFO: {
+        // 预留菜单、四个导航按钮和自绘窗口按钮，不把按钮挤入拖动区域。
+        auto *limits = reinterpret_cast<MINMAXINFO *>(b);
+        DefWindowProcW(window, m, a, b);
+        limits->ptMinTrackSize.x = std::max(limits->ptMinTrackSize.x, (LONG)S(500));
+        limits->ptMinTrackSize.y = std::max(limits->ptMinTrackSize.y, (LONG)S(240));
+        return 0;
+    }
+    case WM_DWMCOMPOSITIONCHANGED: {
+        UpdateFrame();
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        Layout();
+        return 0;
+    }
+    case WM_ACTIVATE:
+        UpdateFrame();
+        break;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(dc, &client, (HBRUSH)(COLOR_BTNFACE + 1));
+        if (windowSmallIcon)
+            DrawIconEx(dc, S(8), TitleOffset() + S(10), windowSmallIcon, S(16), S(16), 0, nullptr, DI_NORMAL);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_MENUSELECT:
+        if (menuOpen) {
+            selectedMenu = (HMENU)b;
+            selectedMenuFlags = HIWORD(a);
+        }
+        break;
+    case WM_SYSCOMMAND:
+        if ((a & 0xfff0) == SC_KEYMENU && toolbar) {
+            if (b == 0) {
+                if (GetFocus() == toolbar) {
+                    if (IsWindow(menuReturnFocus))
+                        SetFocus(menuReturnFocus);
+                } else {
+                    menuReturnFocus = GetFocus();
+                    SetFocus(toolbar);
+                    SendMessageW(toolbar, TB_SETHOTITEM, 0, 0);
+                }
+                return 0;
+            }
+        }
+        break;
     case WM_DRAWITEM: {
         auto *d = (DRAWITEMSTRUCT *)b;
+        if (d->CtlType == ODT_BUTTON && d->CtlID >= CaptionBase && d->CtlID < CaptionBase + 3) {
+            PaintCaptionButton(*this, *d);
+            return TRUE;
+        }
         if (d->CtlType != ODT_BUTTON || d->CtlID < Back || d->CtlID > Refresh)
             break;
         RECT r = d->rcItem;
@@ -329,11 +562,34 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         dpi = GetDpiForWindow(window);
         RefreshDpiResources();
         BuildMenu();
+        toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, L"菜单",
+                                  WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | CCS_NORESIZE |
+                                      CCS_NOPARENTALIGN | CCS_NODIVIDER,
+                                  0, 0, 1, 1, window, nullptr, instance, nullptr);
+        SendMessageW(toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+        SendMessageW(toolbar, WM_SETFONT, (WPARAM)font, TRUE);
+        const wchar_t *menus[] = {L"文件", L"查看", L"帮助"};
+        for (int i = 0; i < 3; ++i) {
+            TBBUTTON button{};
+            button.iBitmap = I_IMAGENONE;
+            button.idCommand = MenuBase + i;
+            button.fsState = TBSTATE_ENABLED;
+            button.fsStyle = BTNS_BUTTON | BTNS_SHOWTEXT;
+            button.iString = (INT_PTR)menus[i];
+            SendMessageW(toolbar, TB_ADDBUTTONSW, 1, (LPARAM)&button);
+        }
         for (int i = 0; i < 4; ++i) {
             const wchar_t *labels[] = {L"后退", L"前进", L"上一级", L"刷新"};
             HWND btn = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 1, 1,
                                      window, (HMENU)(INT_PTR)(Back + i), instance, nullptr);
             SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
+        }
+        const wchar_t *captionNames[] = {L"最小化", L"最大化", L"关闭"};
+        for (int i = 0; i < 3; ++i) {
+            HWND button =
+                CreateWindowW(L"BUTTON", captionNames[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                              0, 0, 1, 1, window, (HMENU)(INT_PTR)(CaptionBase + i), instance, nullptr);
+            SetWindowSubclass(button, CaptionButtonProc, 1, 0);
         }
         HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP, 0, 0,
                                     0, 0, window, nullptr, instance, nullptr);
@@ -441,6 +697,8 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             Command(LOWORD(a));
         return 0;
     case WM_SIZE:
+        SetWindowTextW(GetDlgItem(window, CaptionBase + 1), IsZoomed(window) ? L"还原" : L"最大化");
+        UpdateFrame();
         Layout();
         Changed();
         return 0;
@@ -453,7 +711,8 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         RefreshDpiResources();
         auto *r = (RECT *)b;
         SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        UpdateFrame();
         Layout();
         return 0;
     }
@@ -521,13 +780,20 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
     case WM_QUERYENDSESSION:
         Save();
         return TRUE;
-    case WM_CLOSE:
+    case WM_CLOSE: {
         closing = true;
         Save();
         OleFlushClipboard();
         views.clear();
+        for (auto &strip : strips)
+            if (strip && IsWindow(strip->hwnd))
+                RevokeDragDrop(strip->hwnd);
+        MSG pending{};
+        while (PeekMessageW(&pending, window, WM_ZEN_NAV, WM_ZEN_NAV, PM_REMOVE))
+            delete (NavRequest *)pending.lParam;
         DestroyWindow(window);
         return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -555,7 +821,7 @@ void App::RefreshDpiResources() {
                              CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
     if (next) {
         // 先替换所有持有旧字体的自有控件，再释放旧字体；不接管 Shell 内部控件字体。
-        for (HWND child : {address[0], address[1], error[0], error[1], status})
+        for (HWND child : {address[0], address[1], error[0], error[1], status, toolbar})
             if (child)
                 SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
         for (int i = 0; i < 4; ++i)
@@ -602,9 +868,16 @@ void App::Layout(bool updateStatus) {
     SendMessageW(status, WM_SIZE, 0, 0);
     RECT sr;
     GetWindowRect(status, &sr);
-    int bottom = rc.bottom - (sr.bottom - sr.top), top = S(38);
+    int bottom = rc.bottom - (sr.bottom - sr.top), top = TitleHeight();
+    int titleY = TitleOffset() + (customFrame ? S(2) : 0);
+    int titleX = customFrame ? S(32) : 0;
+    SendMessageW(toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(S(48), S(32)));
+    MoveWindow(toolbar, titleX + S(4), titleY, S(144), S(32), TRUE);
     for (int i = 0; i < 4; ++i)
-        MoveWindow(GetDlgItem(window, Back + i), S(6 + i * 36), S(3), S(32), S(32), TRUE);
+        MoveWindow(GetDlgItem(window, Back + i), titleX + S(160 + i * 36), titleY, S(32), S(32), TRUE);
+    for (int i = 0; i < 3; ++i)
+        MoveWindow(GetDlgItem(window, CaptionBase + i), rc.right - S((3 - i) * 46), TitleOffset(), S(46),
+                   S(36), TRUE);
     int middle = (int)(rc.right * model.split);
     for (int p = 0; p < 2; ++p) {
         int left = p ? middle + S(3) : 0, width = p ? rc.right - left : middle - S(3);
@@ -761,7 +1034,16 @@ void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener
     BuildMenu();
 }
 void App::SyncViews() {
+    ResourceTrace trace(L"清理标签资源");
     std::erase_if(views, [&](auto &pair) { return !model.Find(pair.first); });
+    std::erase_if(icons, [&](auto &pair) {
+        if (model.Find(pair.first))
+            return false;
+        if (pair.second)
+            DestroyIcon(pair.second);
+        return true;
+    });
+    std::erase_if(iconIndices, [&](auto &pair) { return !model.Find(pair.first); });
     for (int p = 0; p < 2; ++p)
         EnsureView(model.panes[p].selected);
     Layout();
@@ -898,15 +1180,17 @@ void App::UpdateStatus() {
     SendMessageW(status, SB_SETTEXTW, 0, (LPARAM)text.c_str());
 }
 void App::BuildMenu() {
-    HMENU main = CreateMenu(), file = CreatePopupMenu(), recent = CreatePopupMenu(), view = CreatePopupMenu(),
-          help = CreatePopupMenu();
+    // 菜单正在跟踪时保留其句柄，下次展开时按最新状态重建。
+    if (menuOpen)
+        return;
+    HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近访问目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
-        AppendMenuW(recent, MF_STRING, RecentBase + i, model.recent[i].c_str());
+        AppendMenuW(file, MF_STRING, RecentBase + i, model.recent[i].c_str());
     if (model.recent.empty())
-        AppendMenuW(recent, MF_STRING | MF_GRAYED, 0, L"暂无记录");
-    AppendMenuW(recent, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(recent, MF_STRING, ClearRecent, L"清空记录");
-    AppendMenuW(file, MF_POPUP, (UINT_PTR)recent, L"最近访问目录");
+        AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING | (model.recent.empty() ? MF_GRAYED : 0), ClearRecent, L"清空最近访问记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, Exit, L"退出");
     const wchar_t *modes[] = {L"详细信息", L"列表", L"小图标", L"中等图标", L"大图标", L"超大图标"};
@@ -916,18 +1200,77 @@ void App::BuildMenu() {
     AppendMenuW(view, MF_STRING | (model.wrap ? MF_CHECKED : 0), Wrap, L"标签自动换行");
     AppendMenuW(view, MF_STRING | (model.singleExpandedGroup ? MF_CHECKED : 0), SingleGroup,
                 L"每栏仅展开一个组");
+    HMENU trigger = CreatePopupMenu();
+    AppendMenuW(trigger, MF_STRING, GroupSingleClick, L"单击切换");
+    AppendMenuW(trigger, MF_STRING, GroupDoubleClick, L"双击切换");
+    CheckMenuRadioItem(trigger, GroupSingleClick, GroupDoubleClick,
+                       model.groupDoubleClick ? GroupDoubleClick : GroupSingleClick, MF_BYCOMMAND);
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)trigger, L"组标题展开/折叠方式");
     AppendMenuW(help, MF_STRING, About, L"关于");
     AppendMenuW(main, MF_POPUP, (UINT_PTR)file, L"文件");
     AppendMenuW(main, MF_POPUP, (UINT_PTR)view, L"查看");
     AppendMenuW(main, MF_POPUP, (UINT_PTR)help, L"帮助");
-    auto old = GetMenu(window);
-    SetMenu(window, main);
+    auto old = mainMenu;
+    mainMenu = main;
     if (old)
         DestroyMenu(old);
-    DrawMenuBar(window);
+}
+void App::ShowMainMenu(int index) {
+    if (index < 0 || index >= 3 || menuOpen || !toolbar)
+        return;
+    BuildMenu();
+    HWND previous = GetFocus();
+    if (previous == toolbar)
+        previous = menuReturnFocus;
+    menuOpen = true;
+    trackingMenu = this;
+    HHOOK hook = SetWindowsHookExW(WH_MSGFILTER, MenuFilter, nullptr, GetCurrentThreadId());
+    UINT command = 0;
+    do {
+        menuIndex = index;
+        nextMenu = -1;
+        selectedMenu = GetSubMenu(mainMenu, index);
+        selectedMenuFlags = 0;
+        SendMessageW(toolbar, TB_SETHOTITEM, index, 0);
+        SendMessageW(toolbar, TB_PRESSBUTTON, MenuBase + index, TRUE);
+        RECT rect{};
+        SendMessageW(toolbar, TB_GETITEMRECT, index, (LPARAM)&rect);
+        MapWindowPoints(toolbar, nullptr, (POINT *)&rect, 2);
+        TPMPARAMS params{sizeof(params), rect};
+        command = TrackPopupMenuEx(GetSubMenu(mainMenu, index), TPM_RETURNCMD | TPM_LEFTALIGN, rect.left,
+                                   rect.bottom, window, &params);
+        SendMessageW(toolbar, TB_PRESSBUTTON, MenuBase + index, FALSE);
+        index = nextMenu;
+    } while (!command && index >= 0 && !closing);
+    if (hook)
+        UnhookWindowsHookEx(hook);
+    trackingMenu = nullptr;
+    menuOpen = false;
+    SendMessageW(toolbar, TB_SETHOTITEM, (WPARAM)-1, 0);
+    if (IsWindow(previous) && GetForegroundWindow() == window)
+        SetFocus(previous);
+    if (command)
+        Command(command);
 }
 void App::Command(UINT id) {
-    if (id == Back)
+    if (id == GroupSingleClick || id == GroupDoubleClick) {
+        model.groupDoubleClick = id == GroupDoubleClick;
+        Changed();
+        BuildMenu();
+        Log(model.groupDoubleClick ? L"组标题改为双击切换" : L"组标题改为单击切换");
+        return;
+    }
+    if (id >= CaptionBase && id < CaptionBase + 3) {
+        WPARAM command = id == CaptionBase       ? SC_MINIMIZE
+                         : id == CaptionBase + 2 ? SC_CLOSE
+                         : IsZoomed(window)      ? SC_RESTORE
+                                                 : SC_MAXIMIZE;
+        SendMessageW(window, WM_SYSCOMMAND, command, 0);
+        return;
+    }
+    if (id >= MenuBase && id < MenuBase + 3)
+        ShowMainMenu(id - MenuBase);
+    else if (id == Back)
         Travel(-1);
     else if (id == Forward)
         Travel(1);
@@ -1011,9 +1354,13 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
         if (t && t->group)
             AppendMenuW(menu, MF_STRING, 4, L"移出组");
     } else if (group) {
+        auto *current = model.FindGroup(p, group);
+        if (current)
+            AppendMenuW(menu, MF_STRING, current->collapsed ? 15 : 16,
+                        current->collapsed ? L"展开组" : L"折叠组");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, 10, L"修改组名");
         HMENU colors = CreatePopupMenu();
-        auto *current = model.FindGroup(p, group);
         for (UINT i = 0; i < std::size(GroupColors); ++i) {
             const auto &preset = GroupColors[i];
             AppendMenuW(colors, MF_STRING | (current && current->color == preset.color ? MF_CHECKED : 0),
@@ -1089,7 +1436,15 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             model.AssignGroup(tab, target);
         }
     } else if (auto *g = model.FindGroup(p, group)) {
-        if (cmd == 10) {
+        if (cmd == 15 || cmd == 16) {
+            // 使用菜单显示时的明确意图，避免菜单打开期间状态变化后反向切换。
+            model.SetGroupCollapsed(p, group, cmd == 16);
+            Activate(p);
+            Changed();
+            SyncViews();
+            strips[p]->EnsureVisible(model.panes[p].selected);
+            return;
+        } else if (cmd == 10) {
             auto name = Input(window, L"组名", g->name);
             if (name && !name->empty())
                 g->name = *name;
@@ -1216,80 +1571,98 @@ bool App::PasteFeedbackCurrent(const PendingPaste &pending, HWND foreground, HWN
            focus == pending.focus && foreground == window && GetTickCount64() <= pending.deadline;
 }
 void App::PollPastes() {
-    std::erase_if(pendingDrops, [&](PendingDrop &pending) {
-        std::error_code ec;
-        bool ready = std::filesystem::exists(pending.result, ec);
-        if (!ready && (!pending.process || WaitForSingleObject(pending.process.get(), 0) != WAIT_OBJECT_0))
-            return false;
-        if (!ready)
-            ready = std::filesystem::exists(pending.result, ec);
-        bool cancelled = false;
-        if (ready) {
-            try {
-                auto result = ReadTaskResult(pending.result);
-                cancelled = TaskCancelled(result.invoked) ||
-                            (SUCCEEDED(result.invoked) && result.effect == DROPEFFECT_NONE);
-            } catch (...) {
-                Log(L"拖放结果不可用，不猜测完成状态");
-            }
-        } else
-            Log(L"拖放操作进程退出但没有结果");
-        // 用户已经继续交互时，不用迟到结果覆盖其分组选择。
-        if (cancelled && pending.generation == dropGeneration) {
-            for (const auto &state : pending.expanded)
-                model.RestoreGroups(state);
-            Changed();
-            SyncViews();
-        }
+    std::erase_if(retiredTasks, [&](const RetiredTask &task) {
+        if (!task.process || WaitForSingleObject(task.process.get(), 0) != WAIT_OBJECT_0)
+            return !task.process;
+        if (!CleanupTaskResult(task.result))
+            Log(L"任务结果清理未完成 " + task.result.filename().wstring());
         return true;
     });
-    std::erase_if(pendingPastes, [&](PendingPaste &pending) {
-        std::error_code ec;
-        if (!std::filesystem::exists(pending.result, ec)) {
-            if (pending.process && WaitForSingleObject(pending.process.get(), 0) == WAIT_OBJECT_0) {
-                // 进程退出可能早于本次 exists；重新检查，避免丢弃刚写完的结果。
-                if (std::filesystem::exists(pending.result, ec))
-                    return false;
-                Log(L"操作进程已退出但没有结果，保留剪贴板和选择 " + pending.result.wstring());
-                return true;
-            }
-            return false;
-        }
-        try {
-            if (!pending.read) {
-                auto result = ReadTaskResult(pending.result);
-                if (FAILED(result.invoked))
-                    return true;
-                // 复制也跟踪反馈，但仅剪切完成后清理仍对应本次操作的剪贴板。
-                if (pending.move && result.moveCompleted &&
-                    GetClipboardSequenceNumber() == pending.clipboardSequence)
-                    OleSetClipboard(nullptr);
-                if (!pending.tab)
-                    return true;
-                auto detailPath = pending.result;
-                detailPath += L".items";
-                // Shell 命令未提供实际结果明细时，不猜测冲突改名后的文件名称。
-                if (!std::filesystem::exists(detailPath, ec))
-                    return true;
-                auto details = ReadTaskItems(pending.result);
-                if (details.destination != pending.destination || details.created.empty())
-                    return true;
-                pending.created = std::move(details.created);
-                pending.read = true;
-                pending.deadline = GetTickCount64() + 5000;
-            }
-            if (!PasteFeedbackCurrent(pending, GetForegroundWindow(), GetFocus()))
-                return true;
-            auto it = views.find(pending.tab);
-            HRESULT selection = it->second->SelectPasteResults(pending.created);
-            if (selection == S_FALSE)
+    std::erase_if(pendingDrops, [&](PendingDrop &pending) {
+        bool finished = [&]() {
+            std::error_code ec;
+            bool ready = std::filesystem::exists(pending.result, ec);
+            if (!ready &&
+                (!pending.process || WaitForSingleObject(pending.process.get(), 0) != WAIT_OBJECT_0))
                 return false;
-            Log(L"粘贴结果选中 tab=" + std::to_wstring(pending.tab) + L" result=" +
-                std::to_wstring((unsigned long)selection));
-        } catch (...) {
-            Log(L"粘贴结果或可选明细不可用，跳过自动选中");
-        }
-        return true;
+            if (!ready)
+                ready = std::filesystem::exists(pending.result, ec);
+            bool cancelled = false;
+            if (ready) {
+                try {
+                    auto result = ReadTaskResult(pending.result);
+                    cancelled = TaskCancelled(result.invoked) ||
+                                (SUCCEEDED(result.invoked) && result.effect == DROPEFFECT_NONE);
+                } catch (...) {
+                    Log(L"拖放结果不可用，不猜测完成状态");
+                }
+            } else
+                Log(L"拖放操作进程退出但没有结果");
+            // 用户已经继续交互时，不用迟到结果覆盖其分组选择。
+            if (cancelled && pending.generation == dropGeneration) {
+                for (const auto &state : pending.expanded)
+                    model.RestoreGroups(state);
+                Changed();
+                SyncViews();
+            }
+            return true;
+        }();
+        if (finished)
+            retiredTasks.push_back({pending.result, pending.process});
+        return finished;
+    });
+    std::erase_if(pendingPastes, [&](PendingPaste &pending) {
+        bool finished = [&]() {
+            std::error_code ec;
+            if (!std::filesystem::exists(pending.result, ec)) {
+                if (pending.process && WaitForSingleObject(pending.process.get(), 0) == WAIT_OBJECT_0) {
+                    // 进程退出可能早于本次 exists；重新检查，避免丢弃刚写完的结果。
+                    if (std::filesystem::exists(pending.result, ec))
+                        return false;
+                    Log(L"操作进程已退出但没有结果，保留剪贴板和选择 " + pending.result.wstring());
+                    return true;
+                }
+                return false;
+            }
+            try {
+                if (!pending.read) {
+                    auto result = ReadTaskResult(pending.result);
+                    if (FAILED(result.invoked))
+                        return true;
+                    // 复制也跟踪反馈，但仅剪切完成后清理仍对应本次操作的剪贴板。
+                    if (pending.move && result.moveCompleted &&
+                        GetClipboardSequenceNumber() == pending.clipboardSequence)
+                        OleSetClipboard(nullptr);
+                    if (!pending.tab)
+                        return true;
+                    auto detailPath = pending.result;
+                    detailPath += L".items";
+                    // Shell 命令未提供实际结果明细时，不猜测冲突改名后的文件名称。
+                    if (!std::filesystem::exists(detailPath, ec))
+                        return true;
+                    auto details = ReadTaskItems(pending.result);
+                    if (details.destination != pending.destination || details.created.empty())
+                        return true;
+                    pending.created = std::move(details.created);
+                    pending.read = true;
+                    pending.deadline = GetTickCount64() + 5000;
+                }
+                if (!PasteFeedbackCurrent(pending, GetForegroundWindow(), GetFocus()))
+                    return true;
+                auto it = views.find(pending.tab);
+                HRESULT selection = it->second->SelectPasteResults(pending.created);
+                if (selection == S_FALSE)
+                    return false;
+                Log(L"粘贴结果选中 tab=" + std::to_wstring(pending.tab) + L" result=" +
+                    std::to_wstring((unsigned long)selection));
+            } catch (...) {
+                Log(L"粘贴结果或可选明细不可用，跳过自动选中");
+            }
+            return true;
+        }();
+        if (finished)
+            retiredTasks.push_back({pending.result, pending.process});
+        return finished;
     });
 }
 void App::Paste(ShellView &v, IShellItem *destination) {
@@ -1346,9 +1719,12 @@ void App::Paste(ShellView &v, IShellItem *destination) {
 void App::DeleteSelection(ShellView &v, bool permanent) {
     auto data = v.SelectedData();
     std::vector<std::wstring> paths;
-    if (SnapshotFiles(data.Get(), paths))
-        LaunchTask(window, {Operation::Delete, L"", paths, permanent});
-    else
+    if (SnapshotFiles(data.Get(), paths)) {
+        RetiredTask pending;
+        if (LaunchTask(window, {Operation::Delete, L"", paths, permanent}, {}, &pending.result,
+                       &pending.process))
+            retiredTasks.push_back(std::move(pending));
+    } else
         Report(window, L"此项目尚不能独立删除，操作未开始。", E_NOTIMPL);
 }
 
@@ -1548,6 +1924,63 @@ bool App::Key(MSG &msg) {
     bool win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
     bool plainCtrl = ctrl && !alt && !shift && !win;
     HWND focus = GetFocus();
+    int caption = GetDlgCtrlID(focus) - (int)CaptionBase;
+    bool captionFocus = caption >= 0 && caption < 3 && GetParent(focus) == window;
+    if (!alt && !ctrl && !win && (focus == toolbar || captionFocus) && msg.wParam == VK_TAB) {
+        if (focus == toolbar)
+            SetFocus(GetDlgItem(window, CaptionBase + (shift ? 2 : 0)));
+        else {
+            int next = caption + (shift ? -1 : 1);
+            if (next < 0 || next >= 3) {
+                SetFocus(toolbar);
+                SendMessageW(toolbar, TB_SETHOTITEM, 0, 0);
+            } else
+                SetFocus(GetDlgItem(window, CaptionBase + next));
+        }
+        return true;
+    }
+    if (captionFocus && !alt && !ctrl && !win) {
+        if (msg.wParam == VK_RETURN) {
+            Command(CaptionBase + caption);
+            return true;
+        }
+        if (msg.wParam == VK_ESCAPE) {
+            if (IsWindow(menuReturnFocus))
+                SetFocus(menuReturnFocus);
+            else
+                Activate(model.active, 0, true);
+            return true;
+        }
+        // 空格和按钮按压反馈继续由原生 BUTTON 处理。
+        if (msg.wParam == VK_SPACE)
+            return false;
+    }
+    if (msg.wParam == VK_F10 && !ctrl && !alt && !shift && !win) {
+        SendMessageW(window, WM_SYSCOMMAND, SC_KEYMENU, 0);
+        return true;
+    }
+    if (alt && !ctrl && !shift && !win && (msg.wParam == 'F' || msg.wParam == 'V' || msg.wParam == 'H')) {
+        ShowMainMenu(msg.wParam == 'F' ? 0 : msg.wParam == 'V' ? 1 : 2);
+        return true;
+    }
+    if (toolbar && focus == toolbar && !alt && !ctrl && !win) {
+        int hot = (int)SendMessageW(toolbar, TB_GETHOTITEM, 0, 0);
+        hot = hot < 0 || hot > 2 ? 0 : hot;
+        if (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT) {
+            SendMessageW(toolbar, TB_SETHOTITEM, (hot + (msg.wParam == VK_LEFT ? 2 : 1)) % 3, 0);
+            return true;
+        }
+        if (msg.wParam == VK_DOWN || msg.wParam == VK_RETURN || msg.wParam == VK_SPACE) {
+            ShowMainMenu(hot);
+            return true;
+        }
+        if (msg.wParam == VK_ESCAPE) {
+            if (IsWindow(menuReturnFocus))
+                SetFocus(menuReturnFocus);
+            SendMessageW(toolbar, TB_SETHOTITEM, (WPARAM)-1, 0);
+            return true;
+        }
+    }
     // 文件快捷键以真实焦点所属的可见视图为准，防止旧活动栏状态误投递。
     for (int pane = 0; pane < 2; ++pane) {
         auto it = views.find(model.panes[pane].selected);

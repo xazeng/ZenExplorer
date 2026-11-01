@@ -17,6 +17,7 @@ static ComPtr<IDataObject> originalClipboard;
 static int stage = 0;
 static Id openedFrom = 0;
 static std::filesystem::path feedbackResult;
+static TaskItems feedbackItems;
 static bool awaitingRename = false;
 static ULONGLONG since;
 static UINT FindNew(ShellMenu &menu, HMENU h, bool folder) {
@@ -111,9 +112,10 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
     busy = true;
     auto id = app->model.panes[stage < 4 ? stage / 2 : 0].selected;
     auto it = app->views.find(id);
-    if (GetTickCount64() - since > 15000)
+    if (GetTickCount64() - since > 15000) {
+        std::cerr << "timeout stage=" << stage << "\n";
         Fail("command test timeout");
-    else if (it != app->views.end() && it->second->shell && !it->second->navigating) {
+    } else if (it != app->views.end() && it->second->shell && !it->second->navigating) {
         auto &view = *it->second;
         if (probeCode) {
             if (probeFolder &&
@@ -229,7 +231,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 }
             }
         } else if (stage == 6) {
-            bool done = false;
+            bool done = app->pendingPastes.empty();
             auto tasks = DataDir() / L"tasks";
             if (std::filesystem::exists(tasks))
                 for (auto &entry : std::filesystem::directory_iterator(tasks)) {
@@ -534,9 +536,10 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 since = GetTickCount64();
             }
         } else if (stage == 18 && std::filesystem::exists(feedbackResult)) {
+            feedbackItems = ReadTaskItems(feedbackResult);
             app->PollPastes();
             if (app->pendingPastes.empty()) {
-                auto detail = ReadTaskItems(feedbackResult);
+                auto detail = feedbackItems;
                 // 隐藏宿主不冒充前台：直接验证真实副本明细到系统选择接口的链路。
                 if (view.SelectPasteResults(detail.created) == S_FALSE) {
                     busy = false;
@@ -550,7 +553,14 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 since = GetTickCount64();
             }
         } else if (stage == 19) {
-            auto detail = ReadTaskItems(feedbackResult);
+            auto detail = feedbackItems;
+            // 使用独立测试回执，真实任务的回执可能已被正常清理。
+            feedbackResult = base / L"stale-feedback.result";
+            Writer completedResult;
+            completedResult.Pod<HRESULT>(S_OK);
+            completedResult.Pod<bool>(false);
+            completedResult.Pod<DWORD>(DROPEFFECT_COPY);
+            WriteEnvelope(feedbackResult, TaskMagic, completedResult.bytes, false);
             auto source = (base / L"files" / L"clipboard-source.txt").wstring();
             if (view.SelectPasteResults({source, detail.created[0]}) != S_OK || view.Selected().size() != 2)
                 Fail("batch result selection failed");
@@ -605,6 +615,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
     busy = false;
 }
 int wmain(int argc, wchar_t **argv) {
+    std::cout << std::unitbuf;
     if (FAILED(OleInitialize(nullptr)))
         return 1;
     if (argc == 3 && std::wstring(argv[1]) == L"--task") {

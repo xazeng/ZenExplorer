@@ -135,6 +135,20 @@ int wmain(int argc, wchar_t **argv) {
         Require(std::filesystem::file_size(copied / source.filename()) == 32 * 1024 * 1024,
                 "copy again after deletion");
         Require(!std::filesystem::exists(ConfigDir() / L"session.dat"), "worker must not write main session");
+        auto cleanup = DataDir() / L"tasks" / L"cleanup.task.result";
+        auto detail = cleanup;
+        detail += L".items";
+        auto outside = base / L"keep.task.result";
+        {
+            std::ofstream(cleanup) << "done";
+            std::ofstream(detail) << "items";
+            std::ofstream(outside) << "keep";
+        }
+        Require(!CleanupTaskResult(outside) && std::filesystem::exists(outside),
+                "cleanup escaped task directory");
+        Require(CleanupTaskResult(cleanup) && !std::filesystem::exists(cleanup) &&
+                    !std::filesystem::exists(detail),
+                "consumed result cleanup");
         CloseHandle(mainMutex);
         std::cout << "independent copy/move, submitter exit, task results and data integrity passed\n";
         OleUninitialize();

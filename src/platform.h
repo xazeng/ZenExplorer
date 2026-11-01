@@ -25,6 +25,17 @@ std::filesystem::path ConfigDir();
 std::filesystem::path LogDir();
 std::filesystem::path ExeDir();
 void Log(const std::wstring &message);
+// 仅在显式启用文件日志时采样；不记录右键菜单停留时间为扩展执行耗时。
+class ResourceTrace {
+    std::wstring phase;
+    ULONGLONG start = 0;
+    DWORD handles = 0, gdi = 0, user = 0;
+    bool enabled = false;
+
+  public:
+    explicit ResourceTrace(std::wstring phase);
+    ~ResourceTrace();
+};
 std::wstring ErrorText(HRESULT hr);
 std::wstring ItemName(IShellItem *item, SIGDN type = SIGDN_DESKTOPABSOLUTEPARSING);
 ComPtr<IShellItem> ParseItem(const std::wstring &path);

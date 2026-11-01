@@ -93,6 +93,8 @@ static void CheckSingleExpandedGroups() {
     m.RestoreGroups(snapshot);
     CHECK(m.panes[0].selected == a && !m.FindGroup(0, ga)->collapsed && m.FindGroup(0, gb)->collapsed);
     m.SetSingleExpandedGroup(false);
+    CHECK(!m.groupDoubleClick);
+    m.groupDoubleClick = true;
     m.SetGroupCollapsed(0, gb, false);
     CHECK(!m.FindGroup(0, ga)->collapsed && !m.FindGroup(0, gb)->collapsed);
     m.panes[0].selected = a;
@@ -120,7 +122,11 @@ static void CheckSingleExpandedGroups() {
     Model loaded;
     bool recovered = false, future = false;
     CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
-    auto bytes = ReadEnvelope(file, 0x434E455A, 4);
+    CHECK(loaded.groupDoubleClick);
+    auto bytes = ReadEnvelope(file, 0x434E455A, 5);
+    bytes.resize(bytes.size() - sizeof(bool));
+    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 4));
+    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.groupDoubleClick);
     bytes.resize(bytes.size() - sizeof(UINT));
     CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 3));
     CHECK(LoadModel(loaded, file, recovered, future) && loaded.windowDpi == 0);
@@ -386,7 +392,7 @@ int main() {
         CHECK(!LoadModel(legacy, fixture, recovered, future) && !future && !recovered);
 
         // 历史丢失时必须恢复同一代配置和历史，不能与其他快照混用。
-        auto configBytes = ReadEnvelope(file, 0x434E455A, 4);
+        auto configBytes = ReadEnvelope(file, 0x434E455A, 5);
         Reader configReader{configBytes};
         auto generation = configReader.Pod<GUID>();
         wchar_t generationName[40]{};
@@ -415,7 +421,7 @@ int main() {
         CHECK(h != INVALID_HANDLE_VALUE);
         SetFilePointer(h, 4, nullptr, FILE_BEGIN);
         DWORD written = 0;
-        uint32_t version = 5;
+        uint32_t version = 6;
         CHECK(WriteFile(h, &version, sizeof(version), &written, nullptr) && written == sizeof(version));
         CloseHandle(h);
         CHECK(!LoadModel(loaded, file, recovered, future) && future && !recovered);

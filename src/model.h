@@ -61,6 +61,7 @@ struct Model {
     double split = .5;
     bool wrap = true;
     bool singleExpandedGroup = true;
+    bool groupDoubleClick = false;
     RECT window{100, 100, 1380, 900};
     UINT windowDpi = 96;
     bool maximized = false;

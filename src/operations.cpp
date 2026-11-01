@@ -30,6 +30,24 @@ TaskItems ReadTaskItems(const std::filesystem::path &result) {
         throw std::runtime_error("无效粘贴结果明细");
     return items;
 }
+bool CleanupTaskResult(const std::filesystem::path &result) {
+    std::error_code ec;
+    auto root = std::filesystem::weakly_canonical(DataDir() / L"tasks", ec);
+    if (ec || result.empty() || result.filename().wstring().find(L".task.result") == std::wstring::npos)
+        return false;
+    auto parent = std::filesystem::weakly_canonical(result.parent_path(), ec);
+    if (ec || parent != root || !result.filename().wstring().ends_with(L".task.result"))
+        return false;
+    auto items = result;
+    items += L".items";
+    std::filesystem::remove(items, ec);
+    if (ec)
+        return false;
+    std::filesystem::remove(result, ec);
+    if (ec)
+        return false;
+    return true;
+}
 FileTask ReadTask(const std::filesystem::path &file) {
     auto bytes = ReadEnvelope(file, TaskMagic);
     Reader r{bytes};

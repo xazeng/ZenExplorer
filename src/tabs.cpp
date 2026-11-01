@@ -3,6 +3,25 @@
 #include <set>
 #include <gdiplus.h>
 namespace zen {
+namespace {
+// 轮廓从行底线起，绕过选中标签后回到底线；底部保持开口，与内容区域连接。
+void SelectedOutline(Gdiplus::GraphicsPath &path, const RECT &rect, float scale) {
+    float left = (float)rect.left, right = (float)rect.right;
+    float bottom = rect.bottom - scale, top = rect.top + 3 * scale;
+    float foot = std::min(4 * scale, (right - left) / 6);
+    float radius = std::min(7 * scale, (right - left) / 6);
+    path.AddBezier(left, bottom, left + foot, bottom, left + foot, bottom, left + foot, bottom - foot);
+    path.AddLine(left + foot, bottom - foot, left + foot, top + radius);
+    path.AddArc(left + foot, top, radius * 2, radius * 2, 180, 90);
+    path.AddLine(left + foot + radius, top, right - foot - radius, top);
+    path.AddArc(right - foot - radius * 2, top, radius * 2, radius * 2, 270, 90);
+    path.AddLine(right - foot, top + radius, right - foot, bottom - foot);
+    path.AddBezier(right - foot, bottom - foot, right - foot, bottom, right - foot, bottom, right, bottom);
+}
+Gdiplus::Color PaintColor(COLORREF color) {
+    return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+} // namespace
 TabStrip::TabStrip(App &a, int p) : app(a), pane(p) {}
 void TabStrip::RefreshDragFont(HFONT font) {
     if (tooltip)
@@ -64,7 +83,7 @@ int TabStrip::Arrange(int width) {
         SIZE s{};
         GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &s);
         int w = h.plus              ? app.S(32)
-                : !h.tab && h.group ? std::max(app.S(32), (int)s.cx + app.S(24))
+                : !h.tab && h.group ? std::max(app.S(40), (int)s.cx + app.S(36))
                                     : std::clamp((int)s.cx + app.S(extra), app.S(58), app.S(210));
         w = std::min(w, std::max(1, width));
         if (app.model.wrap && x && x + w > width) {
@@ -173,7 +192,7 @@ void TabStrip::Paint() {
     for (auto &h : hits) {
         if (h.rect.bottom < 0 || h.rect.top >= rc.bottom || h.rect.right < 0 || h.rect.left >= rc.right)
             continue;
-        bool selected = h.tab == app.model.panes[pane].selected;
+        bool selected = h.tab && h.tab == app.model.panes[pane].selected;
         auto *g = h.group ? app.model.FindGroup(pane, h.group) : nullptr;
         bool over = PtInRect(&h.rect, mouse);
         RECT r = h.rect;
@@ -188,9 +207,22 @@ void TabStrip::Paint() {
                     strip->source.tab ? h.tab == strip->source.tab : h.group == strip->source.group;
         if (placeholder)
             color = GetSysColor(COLOR_BTNFACE);
-        HBRUSH bg = CreateSolidBrush(color);
-        FillRect(dc, &r, bg);
-        DeleteObject(bg);
+        if (selected && !placeholder) {
+            Gdiplus::Graphics graphics(dc);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::GraphicsPath outline;
+            SelectedOutline(outline, h.rect, app.dpi / 96.0f);
+            Gdiplus::SolidBrush brush(PaintColor(color));
+            graphics.FillPath(&brush, &outline);
+            // 补齐轮廓基线下方的背景，使选中标签与地址栏白底连续。
+            float scale = app.dpi / 96.0f;
+            graphics.FillRectangle(&brush, (float)h.rect.left, h.rect.bottom - scale,
+                                   (float)(h.rect.right - h.rect.left), scale);
+        } else if (h.tab || h.plus) {
+            HBRUSH bg = CreateSolidBrush(color);
+            FillRect(dc, &r, bg);
+            DeleteObject(bg);
+        }
         if (placeholder)
             continue;
         SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
@@ -221,6 +253,12 @@ void TabStrip::Paint() {
                 // 渐变末端在按钮左缘达到全不透明，按钮下方不残留文字。
                 int fadeLeft = std::max((int)r.left, (int)cross.left - app.S(6));
                 Gdiplus::Graphics graphics(dc);
+                if (selected) {
+                    Gdiplus::GraphicsPath clip;
+                    SelectedOutline(clip, h.rect, app.dpi / 96.0f);
+                    clip.CloseFigure();
+                    graphics.SetClip(&clip);
+                }
                 Gdiplus::Color transparent(0, GetRValue(color), GetGValue(color), GetBValue(color));
                 Gdiplus::Color opaque(255, GetRValue(color), GetGValue(color), GetBValue(color));
                 if (cross.left > fadeLeft) {
@@ -252,7 +290,7 @@ void TabStrip::Paint() {
             }
         } else if (g) {
             RECT chip = h.rect;
-            InflateRect(&chip, -app.S(3), -app.S(5));
+            InflateRect(&chip, -app.S(9), -app.S(6));
             {
                 Gdiplus::Graphics graphics(dc);
                 graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -263,15 +301,8 @@ void TabStrip::Paint() {
                 if (diameter > 0) {
                     path.AddArc(x, y, diameter, diameter, 180, 90);
                     path.AddArc(x + w - diameter, y, diameter, diameter, 270, 90);
-                    if (g->collapsed) {
-                        path.AddArc(x + w - diameter, y + hh - diameter, diameter, diameter, 0, 90);
-                        path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
-                    } else {
-                        // 展开时向下接到底线；文字仍用原 chip，保持位置与点击区域不变。
-                        path.AddLine(x + w, y + diameter / 2, x + w, (float)h.rect.bottom);
-                        path.AddLine(x + w, (float)h.rect.bottom, x, (float)h.rect.bottom);
-                        path.AddLine(x, (float)h.rect.bottom, x, y + diameter / 2);
-                    }
+                    path.AddArc(x + w - diameter, y + hh - diameter, diameter, diameter, 0, 90);
+                    path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
                     path.CloseFigure();
                     Gdiplus::SolidBrush brush(
                         Gdiplus::Color(255, GetRValue(g->color), GetGValue(g->color), GetBValue(g->color)));
@@ -284,15 +315,24 @@ void TabStrip::Paint() {
                       DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
-    // 底线最后绘制并覆盖元素间距：展开组同一行连续，换行后自然分段。
+    // 同行组线在选中标签处绕过顶部；跨行自然分段，不穿过选中标签底部。
     for (const auto &h : hits) {
         auto *group = h.group ? app.model.FindGroup(pane, h.group) : nullptr;
+        bool selected = h.tab && h.tab == app.model.panes[pane].selected;
         if (!group || group->collapsed)
             continue;
-        RECT line{h.rect.left, h.rect.bottom - app.S(3), h.rect.right, h.rect.bottom};
-        auto brush = CreateSolidBrush(group->color);
-        FillRect(dc, &line, brush);
-        DeleteObject(brush);
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        float scale = app.dpi / 96.0f;
+        Gdiplus::Pen pen(PaintColor(group->color), scale * 2.0f);
+        if (selected) {
+            Gdiplus::GraphicsPath outline;
+            SelectedOutline(outline, h.rect, scale);
+            graphics.DrawPath(&pen, &outline);
+        } else {
+            float baseline = h.rect.bottom - scale;
+            graphics.DrawLine(&pen, (float)h.rect.left, baseline, (float)h.rect.right, baseline);
+        }
     }
     // 仅在同一行相邻的两个普通状态标签之间绘制分隔线。
     for (size_t i = 1; i < hits.size(); ++i) {
@@ -552,6 +592,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
     case WM_ERASEBKGND:
         return 1;
     case WM_LBUTTONDOWN:
+        ignoreButtonUp = false;
         source = Hit(pt);
         down = pt;
         {
@@ -621,6 +662,14 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         }
         return 0;
     case WM_LBUTTONUP: {
+        if (ignoreButtonUp) {
+            ignoreButtonUp = false;
+            source = {};
+            closePressed = false;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+            return 0;
+        }
         bool was = dragging;
         dragging = false;
         ReleaseCapture();
@@ -646,20 +695,38 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             else
                 app.Activate(pane, hit.tab, true);
         } else if (hit.group) {
-            auto *g = app.model.FindGroup(pane, hit.group);
-            if (g) {
-                app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
-                app.Changed();
-                app.SyncViews();
-                app.strips[pane]->EnsureVisible(app.model.panes[pane].selected);
-            }
+            if (!app.model.groupDoubleClick)
+                if (auto *g = app.model.FindGroup(pane, hit.group)) {
+                    app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
+                    app.Changed();
+                    app.SyncViews();
+                    EnsureVisible(app.model.panes[pane].selected);
+                }
+            app.Activate(pane);
         }
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
         auto hit = Hit(pt);
-        if (auto *t = app.model.Find(hit.tab); t && !t->name.empty())
-            app.Navigate(hit.tab, t->home);
+        // 第二次按下对应双击消息，随后仍有一次松开；不得再执行单击或关闭操作。
+        ignoreButtonUp = true;
+        bool same = hit.tab == source.tab && hit.group == source.group && hit.plus == source.plus;
+        if (same && !closePressed && !dragging) {
+            if (!hit.tab && hit.group && app.model.groupDoubleClick) {
+                if (auto *g = app.model.FindGroup(pane, hit.group)) {
+                    app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
+                    app.Changed();
+                    app.SyncViews();
+                    EnsureVisible(app.model.panes[pane].selected);
+                }
+            } else if (auto *t = app.model.Find(hit.tab); t && !t->name.empty()) {
+                auto close = CloseRect(hit);
+                if (!PtInRect(&close, pt))
+                    app.Navigate(hit.tab, t->home);
+            }
+        }
+        source = {};
+        closePressed = false;
         return 0;
     }
     case WM_RBUTTONUP: {

@@ -1,12 +1,18 @@
 #include "shell_menu.h"
 namespace zen {
 ShellMenu::~ShellMenu() {
+    ResourceTrace trace(L"释放 Shell 菜单");
     if (menu)
         DestroyMenu(menu);
     if (attachedSite)
         attachedSite->SetSite(nullptr);
+    attachedSite.Reset();
+    menu3.Reset();
+    menu2.Reset();
+    context.Reset();
 }
 HRESULT ShellMenu::Create(IShellView *view, bool background, HWND window, UINT flags) {
+    ResourceTrace trace(L"创建 Shell 菜单");
     if (!view || !IsWindow(window) || menu || context)
         return E_INVALIDARG;
     owner = window;
@@ -52,6 +58,7 @@ HRESULT ShellMenu::Create(IShellView *view, bool background, HWND window, UINT f
     context.As(&menu3);
     if (!background)
         flags |= CMF_CANRENAME;
+    ResourceTrace query(L"填充 Shell 菜单 QueryContextMenu");
     return context->QueryContextMenu(menu, 0, 1, 0x6fff, flags);
 }
 std::wstring ShellMenu::Verb(UINT command) const {
@@ -82,6 +89,7 @@ UINT ShellMenu::Find(const std::wstring &verb) const {
     return menu ? find(menu) : 0;
 }
 HRESULT ShellMenu::Invoke(UINT command, POINT point, std::optional<DWORD> modifiers) {
+    ResourceTrace trace(L"执行 Shell 菜单 command=" + std::to_wstring(command));
     if (!context || !menu || command < 1 || command > 0x6fff)
         return E_INVALIDARG;
     CMINVOKECOMMANDINFOEX info{sizeof(info)};

@@ -61,7 +61,7 @@ static std::filesystem::path HistoryPath(const GUID &generation) {
     return DataDir() / L"history" / (std::wstring(name) + L".dat");
 }
 static std::filesystem::path ReferencedHistory(const std::filesystem::path &config) {
-    auto bytes = ReadEnvelope(config, Magic, 4);
+    auto bytes = ReadEnvelope(config, Magic, 5);
     Reader r{bytes};
     return HistoryPath(r.Pod<GUID>());
 }
@@ -122,6 +122,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
         for (const auto &g : pane.groups)
             w.Pod(g.lastSelected);
     w.Pod(m.windowDpi);
+    w.Pod(m.groupDoubleClick);
     const auto historyPath = HistoryPath(generation);
     auto backup = p;
     backup += L".bak";
@@ -132,7 +133,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     }
     if (!WriteEnvelope(historyPath, HistoryMagic, history.bytes, false))
         return false;
-    if (!WriteEnvelope(p, Magic, w.bytes, true, 4)) {
+    if (!WriteEnvelope(p, Magic, w.bytes, true, 5)) {
         std::error_code ec;
         std::filesystem::remove(historyPath, ec);
         return false;
@@ -206,6 +207,7 @@ static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
             for (auto &g : pane.groups)
                 g.lastSelected = r.Pod<Id>();
     m.windowDpi = version >= 4 ? r.Pod<UINT>() : 0;
+    m.groupDoubleClick = version >= 5 ? r.Pod<bool>() : false;
     if (m.windowDpi && (m.windowDpi < 48 || m.windowDpi > 960))
         throw std::runtime_error("窗口 DPI 无效");
     if (r.pos != b.size() || history.pos != historyBytes.size() ||
@@ -219,7 +221,7 @@ bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &
     recovered = future = false;
     try {
         uint32_t version = 0;
-        auto bytes = ReadEnvelope(p, Magic, 4, &version);
+        auto bytes = ReadEnvelope(p, Magic, 5, &version);
         m = Decode(bytes, version);
         return true;
     } catch (const std::domain_error &) {
@@ -231,7 +233,7 @@ bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &
     bak += L".bak";
     try {
         uint32_t version = 0;
-        auto bytes = ReadEnvelope(bak, Magic, 4, &version);
+        auto bytes = ReadEnvelope(bak, Magic, 5, &version);
         m = Decode(bytes, version);
         recovered = true;
         return true;
