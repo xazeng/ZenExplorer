@@ -419,6 +419,62 @@ ComPtr<IDataObject> ShellView::SelectedData() {
         shell->GetItemObject(SVGIO_SELECTION, IID_PPV_ARGS(&d));
     return d;
 }
+HRESULT ShellView::DeletePaths(std::vector<std::wstring> &paths) {
+    paths.clear();
+    if (!shell)
+        return E_UNEXPECTED;
+    ComPtr<IFolderView2> folder;
+    HRESULT hr = shell.As(&folder);
+    if (FAILED(hr))
+        return hr;
+    int selected = 0;
+    hr = folder->ItemCount(SVGIO_SELECTION, &selected);
+    if (FAILED(hr))
+        return hr;
+    if (!selected)
+        return S_FALSE;
+    ComPtr<IShellItemArray> items;
+    hr = folder->Items(SVGIO_SELECTION | SVGIO_FLAG_VIEWORDER, IID_PPV_ARGS(&items));
+    if (FAILED(hr)) {
+        // Shell 刷新可能在读取期间清空选择；只在确认无选择时忽略。
+        if (SUCCEEDED(folder->ItemCount(SVGIO_SELECTION, &selected)) && !selected)
+            return S_FALSE;
+        return hr;
+    }
+    if (!items)
+        return E_UNEXPECTED;
+    DWORD count = 0;
+    hr = items->GetCount(&count);
+    if (FAILED(hr))
+        return hr;
+    if (!count)
+        return S_FALSE;
+    if (count > 100000)
+        return E_INVALIDARG;
+    std::vector<std::wstring> snapshot;
+    for (DWORD i = 0; i < count; ++i) {
+        ComPtr<IShellItem> item;
+        hr = items->GetItemAt(i, &item);
+        SFGAOF attributes = 0;
+        if (SUCCEEDED(hr))
+            hr = item->GetAttributes(SFGAO_FILESYSTEM, &attributes);
+        if (FAILED(hr))
+            return hr;
+        if (!(attributes & SFGAO_FILESYSTEM))
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        PWSTR path = nullptr;
+        hr = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+        if (SUCCEEDED(hr) && path && *path)
+            snapshot.emplace_back(path);
+        else if (SUCCEEDED(hr))
+            hr = HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME);
+        CoTaskMemFree(path);
+        if (FAILED(hr))
+            return hr;
+    }
+    paths = std::move(snapshot);
+    return S_OK;
+}
 void ShellView::Capture() {
     auto *t = app.model.Find(id);
     if (!t || !shell || navigating)

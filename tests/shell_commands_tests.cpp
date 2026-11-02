@@ -311,6 +311,14 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             stage = 9;
             since = GetTickCount64();
         } else if (stage == 9) {
+            const auto last = (base / L"empty-after-delete" / L"last.txt").wstring();
+            if (view.SelectPasteResults({last}) != S_OK) {
+                busy = false;
+                return;
+            }
+            std::vector<std::wstring> paths;
+            if (view.DeletePaths(paths) != S_OK || paths != std::vector<std::wstring>{last})
+                Fail("delete snapshot did not preserve selected file path");
             std::filesystem::remove(base / L"empty-after-delete" / L"last.txt");
             view.Refresh();
             stage = 10;
@@ -348,6 +356,18 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 HWND focus = GetFocus();
                 if (app->model.active != 0 || (focus != view.host && !IsChild(view.host, focus)))
                     Fail("empty folder click did not activate and focus left pane");
+                std::vector<std::wstring> paths{L"stale path"};
+                if (view.DeletePaths(paths) != S_FALSE || !paths.empty())
+                    Fail("empty delete selection was not a no-op");
+                const auto tasks = app->retiredTasks.size();
+                MSG deletion{};
+                deletion.message = WM_KEYDOWN;
+                deletion.wParam = VK_DELETE;
+                if (!app->Key(deletion))
+                    Fail("empty delete key was not consumed");
+                deletion.lParam = 1LL << 30; // 长按产生的重复按键同样不应报错或创建任务。
+                if (!app->Key(deletion) || app->retiredTasks.size() != tasks)
+                    Fail("repeated empty delete created a task");
                 DestroyWindow(empty);
                 // 真实焦点可纠正过时的活动栏状态，不能把文件快捷键投给另一栏。
                 app->model.active = 1;

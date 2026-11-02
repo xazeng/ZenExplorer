@@ -298,6 +298,9 @@ App::~App() {
     for (auto &[id, icon] : icons)
         if (icon)
             DestroyIcon(icon);
+    for (auto &[id, icon] : homeIcons)
+        if (icon)
+            DestroyIcon(icon);
     for (auto icon : {folderIcon, computerIcon, missingIcon, windowLargeIcon, windowSmallIcon})
         if (icon)
             DestroyIcon(icon);
@@ -858,6 +861,17 @@ void App::RefreshDpiResources() {
             owned = icon;
         }
     }
+    for (auto &[id, owned] : homeIcons) {
+        auto index = homeIconIndices.find(id);
+        HICON icon = index != homeIconIndices.end() ? SystemImageIcon(index->second, S(16)) : nullptr;
+        if (!icon)
+            icon = CopyIcon(homeIconPaths[id] == Home ? computerIcon : folderIcon);
+        if (icon) {
+            if (owned)
+                DestroyIcon(owned);
+            owned = icon;
+        }
+    }
     Log(L"更新 DPI 资源 dpi=" + std::to_wstring(dpi));
 }
 void App::Layout(bool updateStatus) {
@@ -1044,6 +1058,16 @@ void App::SyncViews() {
         return true;
     });
     std::erase_if(iconIndices, [&](auto &pair) { return !model.Find(pair.first); });
+    std::erase_if(homeIcons, [&](auto &pair) {
+        auto *tab = model.Find(pair.first);
+        if (tab && !tab->name.empty())
+            return false;
+        if (pair.second)
+            DestroyIcon(pair.second);
+        homeIconIndices.erase(pair.first);
+        homeIconPaths.erase(pair.first);
+        return true;
+    });
     for (int p = 0; p < 2; ++p)
         EnsureView(model.panes[p].selected);
     Layout();
@@ -1070,6 +1094,57 @@ HICON App::Icon(Id id) const {
         return it->second;
     auto *t = model.Find(id);
     return t && t->path == Home ? computerIcon : folderIcon;
+}
+HICON App::TabIcon(Id id) const {
+    auto *tab = model.Find(id);
+    if (!tab || tab->name.empty())
+        return Icon(id);
+    auto it = homeIcons.find(id);
+    if (it != homeIcons.end() && it->second)
+        return it->second;
+    return tab->home == Home ? computerIcon : folderIcon;
+}
+void App::RefreshHomeIcon(Id id) {
+    auto *tab = model.Find(id);
+    if (!tab || tab->name.empty())
+        return;
+    const auto &path = tab->home;
+    // 主目录不变时保留图标，导航元数据仅更新地址栏使用的当前目录图标。
+    if (homeIconPaths.contains(id) && homeIconPaths[id] == path && homeIcons[id])
+        return;
+    HICON icon = nullptr;
+    int index = -1;
+    if (path == tab->path && icons.contains(id)) {
+        icon = CopyIcon(Icon(id));
+        if (iconIndices.contains(id))
+            index = iconIndices[id];
+    } else if (path == Home) {
+        SHSTOCKICONINFO info{sizeof(info)};
+        if (SUCCEEDED(SHGetStockIconInfo(SIID_DESKTOPPC, SHGSI_SYSICONINDEX, &info)))
+            index = info.iSysImageIndex;
+    } else {
+        const auto state = InspectLocalPath(path);
+        if (state == LocalPathState::Exists) {
+            SHFILEINFOW info{};
+            if (SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_SYSICONINDEX))
+                index = info.iIcon;
+        } else if (state == LocalPathState::Missing) {
+            SHSTOCKICONINFO info{sizeof(info)};
+            if (SUCCEEDED(SHGetStockIconInfo(SIID_ERROR, SHGSI_SYSICONINDEX, &info)))
+                index = info.iSysImageIndex;
+        }
+    }
+    if (!icon && index >= 0)
+        icon = SystemImageIcon(index, S(16));
+    if (!icon)
+        icon = CopyIcon(path == Home ? computerIcon : folderIcon);
+    if (homeIcons[id])
+        DestroyIcon(homeIcons[id]);
+    homeIcons[id] = icon;
+    homeIconPaths[id] = path;
+    homeIconIndices.erase(id);
+    if (index >= 0)
+        homeIconIndices[id] = index;
 }
 void App::RefreshLocalIcon(Id id) {
     auto *t = model.Find(id);
@@ -1105,6 +1180,7 @@ void App::RefreshLocalIcon(Id id) {
     if (auto it = icons.find(id); it != icons.end() && it->second)
         DestroyIcon(it->second);
     icons[id] = icon;
+    RefreshHomeIcon(id);
 }
 void App::RefreshMetadata(Id id, IShellItem *item) {
     auto title = ItemName(item, SIGDN_NORMALDISPLAY);
@@ -1124,6 +1200,11 @@ void App::RefreshMetadata(Id id, IShellItem *item) {
             }
         }
         CoTaskMemFree(pidl);
+    }
+    // 延迟加载的主目录取得系统图标后补齐缓存，不让其他目录覆盖它。
+    if (auto *tab = model.Find(id); tab && !tab->name.empty() && tab->home == tab->path) {
+        homeIconPaths.erase(id);
+        RefreshHomeIcon(id);
     }
 }
 void App::ShowError(Id id, HRESULT hr) {
@@ -1186,7 +1267,8 @@ void App::BuildMenu() {
     HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近访问目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
-        AppendMenuW(file, MF_STRING, RecentBase + i, model.recent[i].c_str());
+        AppendMenuW(file, MF_STRING, RecentBase + i,
+                    model.recent[i] == Home ? L"此电脑" : model.recent[i].c_str());
     if (model.recent.empty())
         AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
@@ -1410,11 +1492,11 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             return;
         }
         if (cmd == 1) {
-            auto value = Input(
-                window, t->name.empty() ? L"设为常用标签" : L"修改常用标签名称", Title(*t),
-                t->name.empty()
-                    ? L"设置标签名称，并以当前目录为主目录。浏览其他目录时名称不变，双击标签返回主目录。"
-                    : L"修改名称不会改变主目录；清空名称或使用右键菜单可取消常用标签。");
+            auto value =
+                Input(window, t->name.empty() ? L"设为常用标签" : L"修改常用标签名称", Title(*t),
+                      t->name.empty() ? L"设置标签名称，并以当前目录为主目录。浏览其他目录时名称和图标不变，"
+                                        L"双击标签返回主目录。"
+                                      : L"修改名称不会改变主目录；清空名称或使用右键菜单可取消常用标签。");
             if (value)
                 model.Rename(tab, *value);
         } else if (cmd == 2) {
@@ -1435,6 +1517,7 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             Id target = model.panes[p].groups[cmd - 100].id;
             model.AssignGroup(tab, target);
         }
+        RefreshHomeIcon(tab);
     } else if (auto *g = model.FindGroup(p, group)) {
         if (cmd == 15 || cmd == 16) {
             // 使用菜单显示时的明确意图，避免菜单打开期间状态变化后反向切换。
@@ -1717,15 +1800,23 @@ void App::Paste(ShellView &v, IShellItem *destination) {
     }
 }
 void App::DeleteSelection(ShellView &v, bool permanent) {
-    auto data = v.SelectedData();
     std::vector<std::wstring> paths;
-    if (SnapshotFiles(data.Get(), paths)) {
+    HRESULT hr = v.DeletePaths(paths);
+    if (hr == S_FALSE)
+        return;
+    if (SUCCEEDED(hr)) {
         RetiredTask pending;
         if (LaunchTask(window, {Operation::Delete, L"", paths, permanent}, {}, &pending.result,
                        &pending.process))
             retiredTasks.push_back(std::move(pending));
-    } else
-        Report(window, L"此项目尚不能独立删除，操作未开始。", E_NOTIMPL);
+    } else {
+        Log(L"删除项目快照失败 tab=" + std::to_wstring(v.id) + L" " + ErrorText(hr));
+        Report(window,
+               hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+                   ? L"所选项目不是普通文件或文件夹，暂不支持独立删除。"
+                   : L"无法读取待删除项目，操作未开始。",
+               hr);
+    }
 }
 
 void App::FileDrop(ShellView &v, IDataObject *data, DWORD key, POINTL point, DWORD *effect) {

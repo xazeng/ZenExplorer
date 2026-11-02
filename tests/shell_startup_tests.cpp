@@ -84,6 +84,44 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         };
         if (state->stage == 0) {
             checkMode(FVM_ICON);
+            // 常用标签图标与当前目录图标分离，导航不能覆盖主目录图标。
+            Id favorite = app.model.Add(0, Home, 0, -1, false);
+            app.model.Rename(favorite, L"常用测试");
+            app.RefreshLocalIcon(favorite);
+            HICON homeIcon = app.TabIcon(favorite);
+            app.model.Navigate(favorite, DataDir().wstring());
+            app.RefreshLocalIcon(favorite);
+            auto current = ParseItem(DataDir().wstring());
+            app.RefreshMetadata(favorite, current.Get());
+            if (!homeIcon || app.TabIcon(favorite) != homeIcon ||
+                app.TabIcon(favorite) == app.Icon(favorite) ||
+                app.Title(*app.model.Find(favorite)) != L"常用测试")
+                state->failed = true;
+            app.model.Find(favorite)->home = DataDir().wstring();
+            app.RefreshHomeIcon(favorite);
+            if (app.homeIconPaths[favorite] != DataDir().wstring())
+                state->failed = true;
+            app.model.Rename(favorite, L"");
+            app.SyncViews();
+            if (app.TabIcon(favorite) != app.Icon(favorite) || app.homeIcons.contains(favorite) ||
+                app.homeIconIndices.contains(favorite) || app.homeIconPaths.contains(favorite))
+                state->failed = true;
+            app.model.Rename(favorite, L"关闭缓存测试");
+            app.RefreshHomeIcon(favorite);
+            app.model.Remove(0, {favorite}, false);
+            app.SyncViews();
+            if (app.homeIcons.contains(favorite) || app.homeIconIndices.contains(favorite) ||
+                app.homeIconPaths.contains(favorite))
+                state->failed = true;
+            auto recent = app.model.recent;
+            app.model.recent = {Home};
+            app.BuildMenu();
+            wchar_t recentLabel[128]{};
+            GetMenuStringW(GetSubMenu(app.mainMenu, 0), 1, recentLabel, 128, MF_BYPOSITION);
+            if (std::wstring(recentLabel) != L"此电脑" || app.model.recent.front() != Home)
+                state->failed = true;
+            app.model.recent = std::move(recent);
+            app.BuildMenu();
             // 菜单和快捷工具共享一行；原生菜单句柄不再占据窗口非客户区。
             RECT menuBounds{}, backBounds{}, tabBounds{};
             GetWindowRect(app.toolbar, &menuBounds);

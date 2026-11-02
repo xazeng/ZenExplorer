@@ -236,7 +236,7 @@ void TabStrip::Paint() {
             auto *t = app.model.Find(h.tab);
             if (!t)
                 continue;
-            HICON icon = app.Icon(h.tab);
+            HICON icon = app.TabIcon(h.tab);
             if (icon)
                 DrawIconEx(dc, r.left, r.top + app.S(5), icon, app.S(16), app.S(16), 0, nullptr, DI_NORMAL);
             if (!t->name.empty()) {
@@ -305,12 +305,17 @@ void TabStrip::Paint() {
                     path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
                     path.CloseFigure();
                     Gdiplus::SolidBrush brush(
-                        Gdiplus::Color(255, GetRValue(g->color), GetGValue(g->color), GetBValue(g->color)));
+                        PaintColor(g->collapsed ? GetSysColor(COLOR_BTNFACE) : g->color));
                     graphics.FillPath(&brush, &path);
+                    if (g->collapsed) {
+                        Gdiplus::Pen border(PaintColor(g->color), app.dpi / 96.0f);
+                        border.SetAlignment(Gdiplus::PenAlignmentInset);
+                        graphics.DrawPath(&border, &path);
+                    }
                 }
             }
             InflateRect(&chip, -app.S(9), 0);
-            SetTextColor(dc, RGB(255, 255, 255));
+            SetTextColor(dc, g->collapsed ? g->color : RGB(255, 255, 255));
             DrawTextW(dc, g->name.c_str(), -1, &chip,
                       DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }

@@ -52,6 +52,8 @@ class ShellView : public IExplorerBrowserEvents,
     std::vector<std::pair<std::wstring, std::wstring>> AddressParts() const;
     std::vector<ComPtr<IShellItem>> Selected();
     ComPtr<IDataObject> SelectedData();
+    // 删除只快照文件系统路径；S_FALSE 表示没有选中项，失败时不返回部分项目。
+    HRESULT DeletePaths(std::vector<std::wstring> &paths);
     ComPtr<IShellItem> Current();
     ComPtr<IShellItem> DropItem(POINTL point);
     static LRESULT CALLBACK Subclass(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);

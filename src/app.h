@@ -40,6 +40,9 @@ class App {
     ComPtr<IContextMenu2> menu2;
     ComPtr<IContextMenu3> menu3;
     std::unordered_map<Id, HICON> icons;
+    std::unordered_map<Id, HICON> homeIcons;
+    std::unordered_map<Id, int> homeIconIndices;
+    std::unordered_map<Id, std::wstring> homeIconPaths;
     std::unordered_map<Id, int> iconIndices;
     App();
     ~App();
@@ -113,6 +116,8 @@ class App {
     void ShowError(Id id, HRESULT hr);
     std::wstring Title(const Tab &) const;
     HICON Icon(Id id) const;
+    HICON TabIcon(Id id) const;
+    void RefreshHomeIcon(Id id);
     void RefreshLocalIcon(Id id);
     void RefreshMetadata(Id id, IShellItem *item);
 };
