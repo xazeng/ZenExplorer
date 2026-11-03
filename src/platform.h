@@ -51,6 +51,8 @@ LocalPathState InspectLocalPath(const std::wstring &path);
 void DrawSystemGlyph(HDC dc, RECT rect, wchar_t glyph, UINT dpi, COLORREF color);
 HICON SystemImageIcon(int index, int size);
 std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstring &path);
+// 按需枚举 Shell 直属子目录；失败不返回部分列表，不读取文件内容。
+HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstring, std::wstring>> &out);
 bool Confirm(HWND owner, const std::wstring &text);
 std::optional<std::wstring> Input(HWND owner, const std::wstring &title, const std::wstring &value,
                                   const std::wstring &hint = L"");

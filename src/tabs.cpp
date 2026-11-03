@@ -307,6 +307,13 @@ void TabStrip::Paint() {
                     Gdiplus::SolidBrush brush(
                         PaintColor(g->collapsed ? GetSysColor(COLOR_BTNFACE) : g->color));
                     graphics.FillPath(&brush, &path);
+                    if (over && !dragging) {
+                        bool pressed = GetCapture() == hwnd && !source.tab && source.group == h.group;
+                        COLORREF tint = g->collapsed ? g->color : RGB(0, 0, 0);
+                        Gdiplus::SolidBrush feedback(Gdiplus::Color(pressed ? 46 : 24, GetRValue(tint),
+                                                                    GetGValue(tint), GetBValue(tint)));
+                        graphics.FillPath(&feedback, &path);
+                    }
                     if (g->collapsed) {
                         Gdiplus::Pen border(PaintColor(g->color), app.dpi / 96.0f);
                         border.SetAlignment(Gdiplus::PenAlignmentInset);
@@ -605,6 +612,8 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             closePressed = source.tab && PtInRect(&r, pt);
         }
         SetCapture(hwnd);
+        mouse = pt;
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_MOUSEMOVE: {
         mouse = pt;
@@ -748,6 +757,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         app.Layout();
         return 0;
     case WM_CAPTURECHANGED:
+        InvalidateRect(hwnd, nullptr, FALSE);
         if (dragging) {
             EndDrag();
             source = {};

@@ -4,6 +4,7 @@
 #include "shell_menu.h"
 #include <gdiplus.h>
 #include <iostream>
+#include <fstream>
 using namespace zen;
 struct CheckState {
     App *app;
@@ -122,17 +123,48 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 state->failed = true;
             app.model.recent = std::move(recent);
             app.BuildMenu();
-            // 菜单和快捷工具共享一行；原生菜单句柄不再占据窗口非客户区。
-            RECT menuBounds{}, backBounds{}, tabBounds{};
+            // 菜单留在标题行，导航分别位于两栏地址区。
+            RECT menuBounds{}, tabBounds{};
             GetWindowRect(app.toolbar, &menuBounds);
-            GetWindowRect(GetDlgItem(app.window, 101), &backBounds);
             GetWindowRect(app.strips[0]->hwnd, &tabBounds);
             if (GetMenu(app.window) || !IsMenu(app.mainMenu) || GetMenuItemCount(app.mainMenu) != 3 ||
-                SendMessageW(app.toolbar, TB_BUTTONCOUNT, 0, 0) != 3 || menuBounds.top != backBounds.top ||
-                menuBounds.right > backBounds.left || menuBounds.bottom > tabBounds.top) {
+                SendMessageW(app.toolbar, TB_BUTTONCOUNT, 0, 0) != 3 || menuBounds.bottom > tabBounds.top) {
                 std::cerr << "combined menu and navigation layout mismatch\n";
                 state->failed = true;
             }
+            int previousPane = app.model.active;
+            HWND navigationFocus = GetFocus();
+            for (int p = 0; p < 2; ++p) {
+                RECT back{}, up{}, address{}, refresh{};
+                GetWindowRect(GetDlgItem(app.window, 130 + p * 4), &back);
+                GetWindowRect(GetDlgItem(app.window, 132 + p * 4), &up);
+                GetWindowRect(app.crumb[p], &address);
+                GetWindowRect(GetDlgItem(app.window, 133 + p * 4), &refresh);
+                if (back.top != address.top || refresh.top != address.top || up.right != address.left ||
+                    address.right != refresh.left || IsWindowEnabled(GetDlgItem(app.window, 132 + p * 4))) {
+                    std::cerr << "pane navigation layout/state mismatch pane=" << p << "\n";
+                    state->failed = true;
+                }
+                app.Activate(1 - p);
+                // 以按钮通知验证路由；此电脑的上一级无导航副作用。
+                SendMessageW(app.window, WM_COMMAND, MAKEWPARAM(132 + p * 4, BN_CLICKED),
+                             (LPARAM)GetDlgItem(app.window, 132 + p * 4));
+                if (app.model.active != p) {
+                    std::cerr << "pane navigation routing mismatch\n";
+                    state->failed = true;
+                }
+                app.EditAddress(p);
+                RECT editor{};
+                GetWindowRect(app.address[p], &editor);
+                if (editor.right > refresh.left ||
+                    !(GetWindowLongPtrW(GetDlgItem(app.window, 133 + p * 4), GWL_STYLE) & WS_VISIBLE)) {
+                    std::cerr << "address editor overlapped or hid refresh\n";
+                    state->failed = true;
+                }
+                SendMessageW(app.address[p], WM_KEYDOWN, VK_ESCAPE, 0);
+            }
+            SetFocus(navigationFocus);
+            app.Activate(previousPane);
             if (app.customFrame) {
                 auto hit = [&](int x, int y) {
                     POINT point{x, y};
@@ -173,6 +205,13 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             for (int i = 0; i < 3; ++i) {
                 HWND button = GetDlgItem(app.window, 123 + i);
                 if (!app.Key(menuKey) || GetFocus() != button || WindowText(button) != captionNames[i])
+                    state->failed = true;
+                if (SendMessageW(button, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)
+                    state->failed = true;
+                // 只按下后取消，不执行最小化、最大化或关闭命令。
+                SendMessageW(button, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(4, 4));
+                SendMessageW(button, WM_CANCELMODE, 0, 0);
+                if (!(SendMessageW(button, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS))
                     state->failed = true;
                 RECT bounds{};
                 GetWindowRect(button, &bounds);
@@ -356,6 +395,21 @@ int main() {
         return 1;
     // 使用系统枚举器确认本地目录可提供补全候选。
     std::filesystem::create_directories(dir / L"candidate-folder");
+    auto childrenRoot = dir / L"breadcrumb-children";
+    std::filesystem::create_directories(childrenRoot / L"folder10");
+    std::filesystem::create_directories(childrenRoot / L"folder2");
+    std::ofstream(childrenRoot / L"file.txt") << "not a folder";
+    std::vector<std::pair<std::wstring, std::wstring>> children;
+    if (FAILED(ChildFolders(childrenRoot.wstring(), children)) || children.size() != 2 ||
+        children[0].first != L"folder2" || children[1].first != L"folder10" ||
+        children[0].second != (childrenRoot / L"folder2").wstring())
+        return 1;
+    if (FAILED(ChildFolders((childrenRoot / L"folder2").wstring(), children)) || !children.empty())
+        return 1;
+    if (SUCCEEDED(ChildFolders((childrenRoot / L"missing").wstring(), children)) || !children.empty())
+        return 1;
+    if (FAILED(ChildFolders(Home, children)) || children.empty())
+        return 1;
     ComPtr<IACList2> candidates;
     ComPtr<IEnumString> strings;
     bool foundCandidate = false;

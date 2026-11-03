@@ -28,6 +28,7 @@ class App {
     HICON folderIcon{}, computerIcon{}, missingIcon{}, windowLargeIcon{}, windowSmallIcon{};
     UINT dpi = 96;
     bool customFrame = false;
+    bool windowActive = false;
     int TitleOffset() const;
     int TitleHeight() const;
     void UpdateFrame();

@@ -44,7 +44,24 @@ static LRESULT CALLBACK MenuFilter(int code, WPARAM w, LPARAM l) {
 }
 static constexpr UINT Back = 101, Forward = 102, Up = 103, Refresh = 104, Exit = 110, ClearRecent = 111,
                       Wrap = 112, About = 113, SingleGroup = 114, GroupSingleClick = 115,
-                      GroupDoubleClick = 116, ViewBase = 200, RecentBase = 300;
+                      GroupDoubleClick = 116, NavigationBase = 130, ViewBase = 200, RecentBase = 300;
+// 各子控件绘制同一条整栏底线的可见部分，避免按钮重绘覆盖高亮。
+static void PaintNavigationBorder(HDC dc, HWND child, App &app, int pane) {
+    RECT first{}, last{};
+    GetWindowRect(GetDlgItem(app.window, NavigationBase + pane * 4), &first);
+    GetWindowRect(GetDlgItem(app.window, NavigationBase + pane * 4 + 3), &last);
+    POINT corners[]{{first.left, first.top}, {last.right, last.bottom}};
+    MapWindowPoints(nullptr, child, corners, 2);
+    HPEN pen =
+        CreatePen(PS_SOLID, app.S(app.model.active == pane ? 2 : 1),
+                  app.model.active == pane ? (app.windowActive ? RGB(55, 125, 220) : RGB(143, 165, 194))
+                                           : RGB(190, 190, 190));
+    auto old = SelectObject(dc, pen);
+    POINT border[]{{corners[0].x, corners[1].y - 1}, {corners[1].x, corners[1].y - 1}};
+    Polyline(dc, border, ARRAYSIZE(border));
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
 static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR index, DWORD_PTR ptr) {
     auto *app = (App *)ptr;
     int p = (int)index;
@@ -101,8 +118,43 @@ struct CrumbData {
     App *app;
     int pane;
     POINT hover{-1, -1};
-    std::vector<std::pair<RECT, std::wstring>> links;
+    struct Link {
+        RECT rect, arrow;
+        std::wstring path;
+    };
+    std::vector<Link> links;
 };
+static void ShowCrumbFolders(HWND owner, App &app, int pane, Id tab, const CrumbData::Link &link) {
+    std::vector<std::pair<std::wstring, std::wstring>> folders;
+    HRESULT hr = ChildFolders(link.path, folders);
+    if (FAILED(hr)) {
+        Report(app.window, L"无法读取子文件夹。", hr);
+        return;
+    }
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+    for (size_t i = 0; i < folders.size(); ++i) {
+        std::wstring label;
+        for (wchar_t c : folders[i].first) {
+            label += c;
+            if (c == L'&')
+                label += c;
+        }
+        AppendMenuW(menu, MF_STRING, i + 1, label.c_str());
+    }
+    if (folders.empty())
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"无子文件夹");
+    POINT point{link.rect.left, link.rect.bottom};
+    ClientToScreen(owner, &point);
+    UINT chosen = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, point.x,
+                                   point.y, app.window, nullptr);
+    DestroyMenu(menu);
+    if (chosen && chosen <= folders.size() && app.model.panes[pane].selected == tab && app.model.Find(tab)) {
+        app.Activate(pane);
+        app.Navigate(tab, folders[chosen - 1].second);
+    }
+}
 static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     auto *d = (CrumbData *)GetWindowLongPtrW(w, GWLP_USERDATA);
     if (m == WM_NCCREATE) {
@@ -134,39 +186,40 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
             DrawIconEx(dc, x, (rc.bottom - app.S(16)) / 2, app.Icon(t->id), app.S(16), app.S(16), 0, nullptr,
                        DI_NORMAL);
             x += app.S(26);
-            std::vector<std::pair<RECT, std::wstring>> labels;
             for (auto &[label, path2] : parts) {
                 SIZE size{};
                 GetTextExtentPoint32W(dc, label.c_str(), (int)label.size(), &size);
-                int width = std::min((int)size.cx + app.S(24), app.S(220));
+                const int arrowWidth = app.S(18), padding = app.S(6);
+                int width = std::min((int)size.cx + padding * 2, app.S(220)) + arrowWidth;
                 RECT r{x, app.S(3), std::min(x + width, (int)rc.right - app.S(5)), rc.bottom - app.S(3)};
-                if (r.right <= r.left)
+                if (r.right - r.left < arrowWidth + padding * 2)
                     break;
-                // 只移动响应背景，不改变文本布局、层级步长或截断位置。
-                RECT hit = r;
-                OffsetRect(&hit, -app.S(6), 0);
-                if (PtInRect(&hit, d->hover)) {
+                RECT arrow{r.right - arrowWidth, r.top, r.right, r.bottom};
+                if (PtInRect(&r, d->hover)) {
                     auto brush = CreateSolidBrush(RGB(232, 240, 250));
-                    FillRect(dc, &hit, brush);
+                    FillRect(dc, &r, brush);
+                    DeleteObject(brush);
+                    RECT separator{arrow.left, r.top + app.S(3), arrow.left + app.S(1), r.bottom - app.S(3)};
+                    brush = CreateSolidBrush(RGB(190, 207, 225));
+                    FillRect(dc, &separator, brush);
                     DeleteObject(brush);
                 }
-                labels.push_back({r, label + L" ›"});
-                d->links.push_back({hit, path2});
+                RECT name{r.left + padding, r.top, arrow.left - padding, r.bottom};
+                DrawTextW(dc, label.c_str(), -1, &name,
+                          DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                DrawUiIcon(dc, arrow, UiIcon::ChevronRight, app.dpi);
+                d->links.push_back({r, arrow, path2});
                 x += width;
             }
-            // 统一在背景之后绘制，避免相邻背景盖住长名称末尾的省略号。
-            for (auto &[rect, text] : labels)
-                DrawTextW(dc, text.c_str(), -1, &rect,
-                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
-        HPEN pen = CreatePen(PS_SOLID, app.S(app.model.active == p ? 2 : 1),
-                             app.model.active == p ? RGB(55, 125, 220) : RGB(190, 190, 190));
-        auto op = SelectObject(dc, pen);
-        // 两栏均不绘制顶边，焦点仅改变左右边及底边的颜色和粗细。
-        POINT border[]{{0, 0}, {0, rc.bottom - 1}, {rc.right - 1, rc.bottom - 1}, {rc.right - 1, 0}};
-        Polyline(dc, border, ARRAYSIZE(border));
-        SelectObject(dc, op);
-        DeleteObject(pen);
+        PaintNavigationBorder(dc, w, app, p);
+        // 分隔导航按钮与地址内容；编辑框留在两条分隔线内侧。
+        HBRUSH divider = CreateSolidBrush(RGB(205, 205, 205));
+        RECT leftDivider{0, app.S(8), app.S(1), rc.bottom - app.S(8)};
+        RECT rightDivider{rc.right - app.S(1), app.S(8), rc.right, rc.bottom - app.S(8)};
+        FillRect(dc, &leftDivider, divider);
+        FillRect(dc, &rightDivider, divider);
+        DeleteObject(divider);
         SelectObject(dc, old);
         EndPaint(w, &ps);
         return 0;
@@ -174,7 +227,7 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m == WM_MOUSEMOVE) {
         POINT next{GET_X_LPARAM(b), GET_Y_LPARAM(b)};
         bool changed = false;
-        for (const auto &[rect, path] : d->links)
+        for (const auto &[rect, arrow, path] : d->links)
             if (PtInRect(&rect, d->hover) != PtInRect(&rect, next))
                 changed = true;
         d->hover = next;
@@ -193,9 +246,15 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     if (m == WM_LBUTTONDOWN) {
         app.Activate(p);
         POINT pt{GET_X_LPARAM(b), GET_Y_LPARAM(b)};
-        for (auto &[r, path] : d->links)
-            if (PtInRect(&r, pt)) {
-                app.Navigate(app.model.panes[p].selected, path);
+        for (const auto &entry : d->links)
+            if (PtInRect(&entry.rect, pt)) {
+                // 弹出菜单会重入绘制，先复制命中信息，避免持有 links 内部引用。
+                auto link = entry;
+                Id tab = app.model.panes[p].selected;
+                if (PtInRect(&link.arrow, pt))
+                    ShowCrumbFolders(w, app, p, tab, link);
+                else
+                    app.Navigate(tab, link.path);
                 return 0;
             }
         app.EditAddress(p);
@@ -207,7 +266,9 @@ static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
     }
     return DefWindowProcW(w, m, a, b);
 }
-static LRESULT CALLBACK CaptionButtonProc(HWND hwnd, UINT message, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+static LRESULT CALLBACK ButtonHoverProc(HWND hwnd, UINT message, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK)
+        SendMessageW(hwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
     if (message == WM_MOUSEMOVE) {
         TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&track);
@@ -232,7 +293,9 @@ static void PaintCaptionButton(App &app, const DRAWITEMSTRUCT &item) {
     HBRUSH brush = CreateSolidBrush(bg);
     FillRect(item.hDC, &r, brush);
     HPEN pen = CreatePen(PS_SOLID, app.S(1),
-                         close && (hot || pressed) ? RGB(255, 255, 255) : GetSysColor(COLOR_WINDOWTEXT));
+                         close && (hot || pressed)            ? RGB(255, 255, 255)
+                         : app.windowActive || hot || pressed ? GetSysColor(COLOR_WINDOWTEXT)
+                                                              : RGB(128, 128, 128));
     auto oldPen = SelectObject(item.hDC, pen);
     auto oldBrush = SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
     int x = (r.left + r.right) / 2 - app.S(5), y = (r.top + r.bottom) / 2 - app.S(5);
@@ -256,7 +319,8 @@ static void PaintCaptionButton(App &app, const DRAWITEMSTRUCT &item) {
     SelectObject(item.hDC, oldPen);
     DeleteObject(pen);
     DeleteObject(brush);
-    if (item.itemState & ODS_FOCUS) {
+    if ((item.itemState & ODS_FOCUS) &&
+        !(SendMessageW(item.hwndItem, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
         InflateRect(&r, -app.S(4), -app.S(4));
         DrawFocusRect(item.hDC, &r);
     }
@@ -285,9 +349,15 @@ void App::UpdateFrame() {
     InvalidateRect(window, &title, TRUE);
     if (toolbar)
         RedrawWindow(toolbar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
-    for (int i = 0; i < 4; ++i)
-        if (HWND button = GetDlgItem(window, Back + i))
+    for (int i = 0; i < 8; ++i)
+        if (HWND button = GetDlgItem(window, NavigationBase + i))
             InvalidateRect(button, nullptr, TRUE);
+    for (int i = 0; i < 3; ++i)
+        if (HWND button = GetDlgItem(window, CaptionBase + i))
+            InvalidateRect(button, nullptr, FALSE);
+    for (HWND child : crumb)
+        if (child)
+            InvalidateRect(child, nullptr, FALSE);
 }
 App::~App() {
     if (mainMenu)
@@ -431,6 +501,16 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
     switch (m) {
     case WM_NOTIFY: {
         auto *header = reinterpret_cast<NMHDR *>(b);
+        if (header && header->hwndFrom == toolbar && header->code == NM_CUSTOMDRAW) {
+            auto *draw = reinterpret_cast<NMTBCUSTOMDRAW *>(b);
+            if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
+                return CDRF_NOTIFYITEMDRAW;
+            if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                bool hot = (draw->nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED)) != 0;
+                draw->clrText = windowActive || hot ? GetSysColor(COLOR_BTNTEXT) : RGB(128, 128, 128);
+                return TBCDRF_USECDCOLORS;
+            }
+        }
         if (header && header->idFrom >= CaptionBase && header->idFrom < CaptionBase + 3 &&
             header->code == NM_CUSTOMDRAW) {
             auto *draw = reinterpret_cast<NMCUSTOMDRAW *>(b);
@@ -501,6 +581,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         return 0;
     }
     case WM_ACTIVATE:
+        windowActive = LOWORD(a) != WA_INACTIVE;
         UpdateFrame();
         break;
     case WM_PAINT: {
@@ -541,7 +622,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             PaintCaptionButton(*this, *d);
             return TRUE;
         }
-        if (d->CtlType != ODT_BUTTON || d->CtlID < Back || d->CtlID > Refresh)
+        if (d->CtlType != ODT_BUTTON || d->CtlID < NavigationBase || d->CtlID >= NavigationBase + 8)
             break;
         RECT r = d->rcItem;
         bool disabled = (d->itemState & ODS_DISABLED) != 0;
@@ -550,15 +631,16 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         ScreenToClient(d->hwndItem, &cursor);
         COLORREF bg = (d->itemState & ODS_SELECTED)       ? RGB(210, 220, 233)
                       : PtInRect(&r, cursor) && !disabled ? RGB(228, 234, 242)
-                                                          : GetSysColor(COLOR_BTNFACE);
+                                                          : GetSysColor(COLOR_WINDOW);
         auto brush = CreateSolidBrush(bg);
         FillRect(d->hDC, &r, brush);
         DeleteObject(brush);
-        DrawUiIcon(d->hDC, r, static_cast<UiIcon>(d->CtlID - Back), dpi, disabled);
+        DrawUiIcon(d->hDC, r, static_cast<UiIcon>((d->CtlID - NavigationBase) % 4), dpi, disabled);
         if (d->itemState & ODS_FOCUS) {
             InflateRect(&r, -S(3), -S(3));
             DrawFocusRect(d->hDC, &r);
         }
+        PaintNavigationBorder(d->hDC, d->hwndItem, *this, (d->CtlID - NavigationBase) / 4);
         return TRUE;
     }
     case WM_CREATE: {
@@ -581,28 +663,30 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             button.iString = (INT_PTR)menus[i];
             SendMessageW(toolbar, TB_ADDBUTTONSW, 1, (LPARAM)&button);
         }
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 8; ++i) {
             const wchar_t *labels[] = {L"后退", L"前进", L"上一级", L"刷新"};
-            HWND btn = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 1, 1,
-                                     window, (HMENU)(INT_PTR)(Back + i), instance, nullptr);
+            HWND btn = CreateWindowW(L"BUTTON", labels[i % 4], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 1,
+                                     1, window, (HMENU)(INT_PTR)(NavigationBase + i), instance, nullptr);
             SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
+            SetWindowSubclass(btn, ButtonHoverProc, 1, 0);
         }
         const wchar_t *captionNames[] = {L"最小化", L"最大化", L"关闭"};
         for (int i = 0; i < 3; ++i) {
             HWND button =
                 CreateWindowW(L"BUTTON", captionNames[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                               0, 0, 1, 1, window, (HMENU)(INT_PTR)(CaptionBase + i), instance, nullptr);
-            SetWindowSubclass(button, CaptionButtonProc, 1, 0);
+            SetWindowSubclass(button, ButtonHoverProc, 1, 0);
+            SendMessageW(button, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
         }
         HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP, 0, 0,
                                     0, 0, window, nullptr, instance, nullptr);
         const wchar_t *help[] = {L"后退（Alt+←）", L"前进（Alt+→）", L"上一级（Alt+↑）", L"刷新（F5）"};
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 8; ++i) {
             TOOLINFOW ti{sizeof(ti)};
             ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
             ti.hwnd = window;
-            ti.uId = (UINT_PTR)GetDlgItem(window, Back + i);
-            ti.lpszText = const_cast<wchar_t *>(help[i]);
+            ti.uId = (UINT_PTR)GetDlgItem(window, NavigationBase + i);
+            ti.lpszText = const_cast<wchar_t *>(help[i % 4]);
             SendMessageW(tips, TTM_ADDTOOLW, 0, (LPARAM)&ti);
         }
         WNDCLASSW wc{};
@@ -691,7 +775,11 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(a) == 500 || LOWORD(a) == 501) {
+        if (LOWORD(a) >= NavigationBase && LOWORD(a) < NavigationBase + 8) {
+            const int offset = LOWORD(a) - NavigationBase;
+            Activate(offset / 4);
+            Command(Back + offset % 4);
+        } else if (LOWORD(a) == 500 || LOWORD(a) == 501) {
             int p = LOWORD(a) - 500;
             auto *t = model.Find(model.panes[p].selected);
             if (t)
@@ -827,8 +915,8 @@ void App::RefreshDpiResources() {
         for (HWND child : {address[0], address[1], error[0], error[1], status, toolbar})
             if (child)
                 SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
-        for (int i = 0; i < 4; ++i)
-            if (HWND button = GetDlgItem(window, Back + i))
+        for (int i = 0; i < 8; ++i)
+            if (HWND button = GetDlgItem(window, NavigationBase + i))
                 SendMessageW(button, WM_SETFONT, (WPARAM)next, TRUE);
         for (auto &strip : strips)
             if (strip)
@@ -887,12 +975,13 @@ void App::Layout(bool updateStatus) {
     int titleX = customFrame ? S(32) : 0;
     SendMessageW(toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(S(48), S(32)));
     MoveWindow(toolbar, titleX + S(4), titleY, S(144), S(32), TRUE);
-    for (int i = 0; i < 4; ++i)
-        MoveWindow(GetDlgItem(window, Back + i), titleX + S(160 + i * 36), titleY, S(32), S(32), TRUE);
     for (int i = 0; i < 3; ++i)
         MoveWindow(GetDlgItem(window, CaptionBase + i), rc.right - S((3 - i) * 46), TitleOffset(), S(46),
                    S(36), TRUE);
     int middle = (int)(rc.right * model.split);
+    // 窄窗口保留两侧导航按钮及地址输入的基本空间，保存的分栏比例不变。
+    const int minimumPane = std::min(S(180), (int)rc.right / 2);
+    middle = std::clamp(middle, minimumPane, (int)rc.right - minimumPane);
     for (int p = 0; p < 2; ++p) {
         int left = p ? middle + S(3) : 0, width = p ? rc.right - left : middle - S(3);
         width = std::max(width, 1);
@@ -902,9 +991,17 @@ void App::Layout(bool updateStatus) {
             InvalidateRect(strips[p]->hwnd, nullptr, FALSE);
         }
         int y = top + tabHeight;
-        MoveWindow(crumb[p], left, y, width, S(32), TRUE);
-        MoveWindow(address[p], left + S(34), y + S(6), std::max(1, width - S(40)), S(20), TRUE);
+        const int buttonWidth = S(28), addressLeft = left + buttonWidth * 3;
+        const int addressWidth = std::max(1, width - buttonWidth * 4);
+        for (int i = 0; i < 4; ++i)
+            MoveWindow(GetDlgItem(window, NavigationBase + p * 4 + i),
+                       i == 3 ? left + width - buttonWidth : left + i * buttonWidth, y, buttonWidth, S(32),
+                       TRUE);
+        MoveWindow(crumb[p], addressLeft, y, addressWidth, S(32), TRUE);
+        MoveWindow(address[p], addressLeft + S(34), y + S(6), std::max(1, addressWidth - S(40)), S(20), TRUE);
         InvalidateRect(crumb[p], nullptr, TRUE);
+        for (int i = 0; i < 4; ++i)
+            InvalidateRect(GetDlgItem(window, NavigationBase + p * 4 + i), nullptr, FALSE);
         RECT view{left, y + S(34), left + width, std::max(y + S(35), bottom)};
         viewBounds[p] = view;
         MoveWindow(error[p], left + S(12), view.top + S(15), std::max(width - S(24), 1), S(90), TRUE);
@@ -1226,10 +1323,17 @@ void App::UpdateStatus() {
     auto *t = model.Find(model.panes[model.active].selected);
     if (!t)
         return;
-    EnableWindow(GetDlgItem(window, Back), t->historyIndex > 0);
-    EnableWindow(GetDlgItem(window, Forward), t->historyIndex + 1 < (int)t->history.size());
+    for (int p = 0; p < 2; ++p) {
+        auto *tab = model.Find(model.panes[p].selected);
+        auto view = tab ? views.find(tab->id) : views.end();
+        EnableWindow(GetDlgItem(window, NavigationBase + p * 4), tab && tab->historyIndex > 0);
+        EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 1),
+                     tab && tab->historyIndex + 1 < (int)tab->history.size());
+        EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 2),
+                     view != views.end() && view->second->CanUp());
+        EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 3), view != views.end());
+    }
     auto it = views.find(t->id);
-    EnableWindow(GetDlgItem(window, Up), it != views.end() && it->second->CanUp());
     int total = 0, selected = 0;
     uint64_t bytes = 0;
     bool unknown = false;
@@ -1265,14 +1369,14 @@ void App::BuildMenu() {
     if (menuOpen)
         return;
     HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近访问目录");
+    AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近关闭目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
         AppendMenuW(file, MF_STRING, RecentBase + i,
                     model.recent[i] == Home ? L"此电脑" : model.recent[i].c_str());
     if (model.recent.empty())
         AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(file, MF_STRING | (model.recent.empty() ? MF_GRAYED : 0), ClearRecent, L"清空最近访问记录");
+    AppendMenuW(file, MF_STRING | (model.recent.empty() ? MF_GRAYED : 0), ClearRecent, L"清空最近关闭记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, Exit, L"退出");
     const wchar_t *modes[] = {L"详细信息", L"列表", L"小图标", L"中等图标", L"大图标", L"超大图标"};
@@ -1379,7 +1483,7 @@ void App::Command(UINT id) {
         BuildMenu();
         SyncViews();
     } else if (id == ClearRecent) {
-        if (Confirm(window, L"是否清空最近访问目录？")) {
+        if (Confirm(window, L"是否清空最近关闭记录？")) {
             model.recent.clear();
             Changed();
             BuildMenu();
@@ -2018,6 +2122,7 @@ bool App::Key(MSG &msg) {
     int caption = GetDlgCtrlID(focus) - (int)CaptionBase;
     bool captionFocus = caption >= 0 && caption < 3 && GetParent(focus) == window;
     if (!alt && !ctrl && !win && (focus == toolbar || captionFocus) && msg.wParam == VK_TAB) {
+        SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
         if (focus == toolbar)
             SetFocus(GetDlgItem(window, CaptionBase + (shift ? 2 : 0)));
         else {

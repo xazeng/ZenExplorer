@@ -36,12 +36,19 @@ void DrawUiIcon(HDC dc, RECT bounds, UiIcon icon, UINT dpi, bool disabled) {
     graphics.TranslateTransform((bounds.left + bounds.right) * 0.5f, (bounds.top + bounds.bottom) * 0.5f);
     graphics.ScaleTransform(dpi / 96.0f, dpi / 96.0f);
     graphics.TranslateTransform(-8.0f, -8.0f);
-    COLORREF ink = GetSysColor(disabled ? COLOR_GRAYTEXT : COLOR_BTNTEXT);
+    COLORREF ink = icon == UiIcon::Add ? GetSysColor(disabled ? COLOR_GRAYTEXT : COLOR_BTNTEXT)
+                                     : (disabled ? RGB(210, 210, 210) : RGB(128, 128, 128));
     Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)), 1.6f);
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
     pen.SetLineJoin(Gdiplus::LineJoinRound);
     switch (icon) {
+    case UiIcon::ChevronRight: {
+        pen.SetWidth(1.4f);
+        const Gdiplus::PointF points[] = {{6.5f, 5.0f}, {9.5f, 8.0f}, {6.5f, 11.0f}};
+        graphics.DrawLines(&pen, points, 3);
+        break;
+    }
     case UiIcon::Back:
     case UiIcon::Forward: {
         float sign = icon == UiIcon::Back ? -1.0f : 1.0f;

@@ -210,6 +210,47 @@ std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstrin
     }
     return out;
 }
+HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstring, std::wstring>> &out) {
+    out.clear();
+    ComPtr<IShellItem> item;
+    HRESULT hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item));
+    ComPtr<IShellFolder> folder;
+    if (SUCCEEDED(hr))
+        hr = item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder));
+    ComPtr<IEnumIDList> entries;
+    if (SUCCEEDED(hr))
+        hr = folder->EnumObjects(nullptr, SHCONTF_FOLDERS, &entries);
+    if (FAILED(hr))
+        return hr;
+    if (!entries)
+        return S_OK;
+    std::vector<std::pair<std::wstring, std::wstring>> result;
+    for (;;) {
+        PITEMID_CHILD child = nullptr;
+        hr = entries->Next(1, &child, nullptr);
+        if (hr != S_OK) {
+            CoTaskMemFree(child);
+            break;
+        }
+        ComPtr<IShellItem> entry;
+        hr = SHCreateItemWithParent(nullptr, folder.Get(), child, IID_PPV_ARGS(&entry));
+        CoTaskMemFree(child);
+        if (FAILED(hr))
+            return hr;
+        auto name = ItemName(entry.Get(), SIGDN_NORMALDISPLAY);
+        auto target = ItemName(entry.Get());
+        if (name.empty() || target.empty())
+            return E_FAIL;
+        result.emplace_back(std::move(name), std::move(target));
+    }
+    if (FAILED(hr))
+        return hr;
+    std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
+        return StrCmpLogicalW(a.first.c_str(), b.first.c_str()) < 0;
+    });
+    out = std::move(result);
+    return S_OK;
+}
 bool Confirm(HWND w, const std::wstring &text) {
     TASKDIALOG_BUTTON buttons[] = {{IDOK, L"确认"}, {IDCANCEL, L"取消"}};
     TASKDIALOGCONFIG c{sizeof(c)};

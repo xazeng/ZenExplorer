@@ -356,7 +356,9 @@ void ShellView::UpdateNavigation(IShellItem *item) {
         auto path = ItemName(current.Get());
         if (path.empty() || !seen.insert(path).second)
             break;
-        auto label = ItemName(current.Get(), SIGDN_PARENTRELATIVEFORADDRESSBAR);
+        const bool driveRoot = path.size() == 3 && path[1] == L':' && path[2] == L'\\';
+        auto label =
+            ItemName(current.Get(), driveRoot ? SIGDN_NORMALDISPLAY : SIGDN_PARENTRELATIVEFORADDRESSBAR);
         if (label.empty())
             label = ItemName(current.Get(), SIGDN_NORMALDISPLAY);
         if (label.empty())
