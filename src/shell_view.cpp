@@ -192,6 +192,8 @@ HRESULT ShellView::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
 }
 HRESULT ShellView::OnViewCreated(IShellView *v) {
     shell = v;
+    // 新 Shell 子视图需要一次实际尺寸同步，即使宿主矩形没有变化。
+    browserSized = false;
     Trace(L"OnViewCreated");
     Apply();
     PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 0);
@@ -256,16 +258,24 @@ HRESULT ShellView::OnStateChange(IShellView *, ULONG change) {
     return S_OK;
 }
 void ShellView::Resize(RECT r) {
-    MoveWindow(host, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
+    RECT current{};
+    GetWindowRect(host, &current);
+    MapWindowPoints(nullptr, GetParent(host), (POINT *)&current, 2);
+    if (!EqualRect(&current, &r))
+        MoveWindow(host, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
     RECT inner{0, 0, r.right - r.left, r.bottom - r.top};
-    if (browser) {
+    if (browser && (!browserSized || !EqualRect(&browserBounds, &inner))) {
+        browserBounds = inner;
+        browserSized = true;
         HRESULT hr = browser->SetRect(nullptr, inner);
-        if (FAILED(hr))
+        if (FAILED(hr)) {
+            browserSized = false;
             Trace(L"SetRect failed", hr);
+        }
     }
 }
 void ShellView::Show(bool show) {
-    if (host)
+    if (host && ((GetWindowLongPtrW(host, GWL_STYLE) & WS_VISIBLE) != 0) != show)
         ShowWindow(host, show ? SW_SHOW : SW_HIDE);
 }
 void ShellView::Refresh() {

@@ -21,7 +21,25 @@ void SelectedOutline(Gdiplus::GraphicsPath &path, const RECT &rect, float scale)
 Gdiplus::Color PaintColor(COLORREF color) {
     return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
 }
+COLORREF BlendColor(COLORREF from, COLORREF to, float amount) {
+    auto channel = [amount](int a, int b) { return (int)(a + (b - a) * amount + 0.5f); };
+    return RGB(channel(GetRValue(from), GetRValue(to)), channel(GetGValue(from), GetGValue(to)),
+               channel(GetBValue(from), GetBValue(to)));
+}
 } // namespace
+float TabStrip::GroupExpansion(Id group) const {
+    auto it = groupMotions.find(group);
+    if (it != groupMotions.end())
+        return it->second.value;
+    auto *g = app.model.FindGroup(pane, group);
+    return g && !g->collapsed ? 1.0f : 0.0f;
+}
+void TabStrip::FinishAnimation() {
+    for (auto &[id, motion] : groupMotions)
+        motion.value = motion.from = motion.target;
+    animating = false;
+    KillTimer(hwnd, 2);
+}
 TabStrip::TabStrip(App &a, int p) : app(a), pane(p) {}
 void TabStrip::RefreshDragFont(HFONT font) {
     if (tooltip)
@@ -30,6 +48,11 @@ void TabStrip::RefreshDragFont(HFONT font) {
         SendMessageW(ghost, WM_SETFONT, (WPARAM)font, TRUE);
 }
 TabStrip::~TabStrip() {
+    if (paintDC) {
+        SelectObject(paintDC, paintOriginal);
+        DeleteObject(paintBitmap);
+        DeleteDC(paintDC);
+    }
     if (ghost)
         DestroyWindow(ghost);
     if (IsWindow(hwnd)) {
@@ -61,10 +84,58 @@ void TabStrip::Create() {
     SetTimer(hwnd, 1, 32, nullptr);
 }
 int TabStrip::Arrange(int width) {
+    const bool timerRunning = animating;
+    if (!animationFrame)
+        measuredText.clear();
+    const ULONGLONG now = GetTickCount64();
+    bool interrupted = motionWidth != width || motionDpi != app.dpi || motionWrap != app.model.wrap;
+    for (auto &strip : app.strips)
+        interrupted |= strip && (strip->dragging || strip->external);
+    const bool wasMultiline = app.model.wrap && height > app.S(32);
+    motionWidth = width;
+    motionDpi = app.dpi;
+    motionWrap = app.model.wrap;
+    std::erase_if(groupMotions, [&](auto &entry) { return !app.model.FindGroup(pane, entry.first); });
+    animating = false;
+    for (const auto &group : app.model.panes[pane].groups) {
+        float target = group.collapsed ? 0.0f : 1.0f;
+        auto [it, inserted] = groupMotions.try_emplace(group.id, GroupMotion{target, target, target, now});
+        auto &motion = it->second;
+        float elapsed = std::min(1.0f, (now - motion.started) / 200.0f);
+        float remaining = 1.0f - elapsed;
+        motion.value =
+            motion.from + (motion.target - motion.from) * (1.0f - remaining * remaining * remaining);
+        if (motion.target != target) {
+            motion.from = motion.value;
+            motion.target = target;
+            motion.started = now;
+        }
+        animating |= motion.value != motion.target;
+    }
+    if (interrupted || wasMultiline)
+        FinishAnimation();
     hits.clear();
     int row = app.S(32), x = 0, y = 0;
+    int targetX = 0, targetY = 0;
+    uint64_t signature = 1469598103934665603ULL;
     HDC dc = GetDC(hwnd);
     auto old = SelectObject(dc, app.font);
+    auto textWidth = [&](const std::wstring &text) {
+        auto it = measuredText.find(text);
+        if (it != measuredText.end())
+            return it->second;
+        SIZE size{};
+        GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &size);
+        return measuredText.emplace(text, (int)size.cx).first->second;
+    };
+    auto tabWidth = [&](const Tab &tab) {
+        return std::min(std::clamp(textWidth(app.Title(tab)) + app.S(47), app.S(58), app.S(210)),
+                        std::max(1, width));
+    };
+    std::unordered_map<Id, int> groupWidths, groupOffsets;
+    for (const auto &tab : app.model.panes[pane].tabs)
+        if (tab.group)
+            groupWidths[tab.group] += tabWidth(tab);
     auto add = [&](TabHit h, const std::wstring &text, int extra) {
         // 源标签从预览流中移除，余下标签自然补位；Model 仍保持原顺序。
         for (auto &strip : app.strips) {
@@ -80,12 +151,31 @@ int TabStrip::Arrange(int width) {
             } else if (h.group && h.group == strip->source.group)
                 return;
         }
-        SIZE s{};
-        GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &s);
         int w = h.plus              ? app.S(32)
-                : !h.tab && h.group ? std::max(app.S(40), (int)s.cx + app.S(36))
-                                    : std::clamp((int)s.cx + app.S(extra), app.S(58), app.S(210));
+                : !h.tab && h.group ? std::max(app.S(40), textWidth(text) + app.S(36))
+                                    : std::clamp(textWidth(text) + app.S(extra), app.S(58), app.S(210));
         w = std::min(w, std::max(1, width));
+        h.naturalWidth = w;
+        // 折叠不影响结构签名；增删、重排、改名导致宽度变化时结束旧动画。
+        for (uint64_t value : {h.tab, h.group, (uint64_t)w, (uint64_t)h.plus})
+            signature = (signature ^ value) * 1099511628211ULL;
+        auto *group = h.group ? app.model.FindGroup(pane, h.group) : nullptr;
+        if (!h.tab || !group || !group->collapsed) {
+            if (app.model.wrap && targetX && targetX + w > width) {
+                targetX = 0;
+                targetY += row;
+            }
+            targetX += w;
+        }
+        if (h.tab && group) {
+            // 保持标签原宽，从组的右侧逐渐裁剪；后续标签按可见总宽度移动。
+            int visible = (int)(groupWidths[h.group] * GroupExpansion(h.group) + 0.5f);
+            int offset = groupOffsets[h.group];
+            groupOffsets[h.group] += w;
+            w = std::clamp(visible - offset, 0, w);
+        }
+        if (!w)
+            return;
         if (app.model.wrap && x && x + w > width) {
             x = 0;
             y += row;
@@ -104,14 +194,21 @@ int TabStrip::Arrange(int width) {
                     add({{}, 0, last, false}, g->name, 28);
             }
         }
-        auto *g = t.group ? app.model.FindGroup(pane, t.group) : nullptr;
-        if (g && g->collapsed)
-            continue;
         add({{}, t.id, t.group, false}, app.Title(t), 47);
     }
     add({{}, 0, 0, true}, L"+", 0);
     SelectObject(dc, old);
     ReleaseDC(hwnd, dc);
+    if (animating && ((layoutSignature && layoutSignature != signature) || y || targetY)) {
+        layoutSignature = signature;
+        FinishAnimation();
+        return Arrange(width);
+    }
+    layoutSignature = signature;
+    if (animating && !timerRunning)
+        SetTimer(hwnd, 2, 16, nullptr);
+    else if (!animating)
+        KillTimer(hwnd, 2);
     total = app.model.wrap ? y + row : x;
     height = app.model.wrap ? std::min(total, row * 3) : row;
     scroll = std::clamp(scroll, 0, std::max(0, total - (app.model.wrap ? height : width)));
@@ -154,9 +251,14 @@ int TabStrip::Arrange(int width) {
     return height;
 }
 TabHit TabStrip::Hit(POINT p) const {
-    for (auto &h : hits)
+    for (auto &h : hits) {
+        // 正在收拢的图像不代表仍可激活的标签，业务状态始终以模型为准。
+        auto *group = h.tab && h.group ? app.model.FindGroup(pane, h.group) : nullptr;
+        if (group && group->collapsed)
+            continue;
         if (PtInRect(&h.rect, p))
             return h;
+    }
     return {};
 }
 void TabStrip::EnsureVisible(Id id) {
@@ -165,6 +267,7 @@ void TabStrip::EnsureVisible(Id id) {
         return;
     RECT rc{};
     GetClientRect(hwnd, &rc);
+    int previousScroll = scroll;
     for (auto &h : hits)
         if (h.tab == id || (!h.tab && h.group == t->group && app.model.FindGroup(pane, h.group)->collapsed)) {
             int a = app.model.wrap ? h.rect.top : h.rect.left;
@@ -176,25 +279,55 @@ void TabStrip::EnsureVisible(Id id) {
                 scroll += b - limit;
             break;
         }
-    app.Layout();
+    if (scroll != previousScroll)
+        app.Layout(false, pane);
 }
 void TabStrip::Paint() {
     PAINTSTRUCT ps;
     HDC out = BeginPaint(hwnd, &ps);
     RECT rc;
     GetClientRect(hwnd, &rc);
-    HDC dc = CreateCompatibleDC(out);
-    HBITMAP bmp = CreateCompatibleBitmap(out, std::max(1L, rc.right), std::max(1L, rc.bottom));
-    auto oldBmp = SelectObject(dc, bmp);
+    // 复用双缓冲，动画帧不重复创建和销毁整栏位图。
+    if (!paintDC)
+        paintDC = CreateCompatibleDC(out);
+    if (paintWidth != std::max(1L, rc.right) || paintHeight != std::max(1L, rc.bottom)) {
+        HBITMAP bitmap = CreateCompatibleBitmap(out, std::max(1L, rc.right), std::max(1L, rc.bottom));
+        if (!bitmap || !paintDC) {
+            if (bitmap)
+                DeleteObject(bitmap);
+            EndPaint(hwnd, &ps);
+            return;
+        }
+        auto previous = (HBITMAP)SelectObject(paintDC, bitmap);
+        if (paintBitmap)
+            DeleteObject(paintBitmap);
+        else
+            paintOriginal = previous;
+        paintBitmap = bitmap;
+        paintWidth = std::max(1L, rc.right);
+        paintHeight = std::max(1L, rc.bottom);
+    }
+    HDC dc = paintDC;
     FillRect(dc, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
     auto oldFont = SelectObject(dc, app.font);
     SetBkMode(dc, TRANSPARENT);
-    for (auto &h : hits) {
+    for (auto h : hits) {
         if (h.rect.bottom < 0 || h.rect.top >= rc.bottom || h.rect.right < 0 || h.rect.left >= rc.right)
             continue;
+        const RECT visible = h.rect;
+        struct ClipScope {
+            HDC dc;
+            int saved;
+            ~ClipScope() {
+                RestoreDC(dc, saved);
+            }
+        } clipScope{dc, SaveDC(dc)};
+        IntersectClipRect(dc, visible.left, visible.top, visible.right, visible.bottom);
+        if (h.tab && h.naturalWidth)
+            h.rect.right = h.rect.left + h.naturalWidth;
         bool selected = h.tab && h.tab == app.model.panes[pane].selected;
         auto *g = h.group ? app.model.FindGroup(pane, h.group) : nullptr;
-        bool over = PtInRect(&h.rect, mouse);
+        bool over = PtInRect(&visible, mouse);
         RECT r = h.rect;
         InflateRect(&r, -app.S(2), -app.S(2));
         COLORREF color = selected ? GetSysColor(COLOR_WINDOW)
@@ -209,6 +342,8 @@ void TabStrip::Paint() {
             color = GetSysColor(COLOR_BTNFACE);
         if (selected && !placeholder) {
             Gdiplus::Graphics graphics(dc);
+            graphics.SetClip(Gdiplus::Rect(visible.left, visible.top, visible.right - visible.left,
+                                           visible.bottom - visible.top));
             graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             Gdiplus::GraphicsPath outline;
             SelectedOutline(outline, h.rect, app.dpi / 96.0f);
@@ -236,6 +371,8 @@ void TabStrip::Paint() {
             auto *t = app.model.Find(h.tab);
             if (!t)
                 continue;
+            int saved = SaveDC(dc);
+            IntersectClipRect(dc, h.rect.left, h.rect.top, h.rect.right, h.rect.bottom);
             HICON icon = app.TabIcon(h.tab);
             if (icon)
                 DrawIconEx(dc, r.left, r.top + app.S(5), icon, app.S(16), app.S(16), 0, nullptr, DI_NORMAL);
@@ -247,17 +384,19 @@ void TabStrip::Paint() {
             r.left += app.S(23);
             auto text = app.Title(*t);
             DrawTextW(dc, text.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-            if (over) {
+            if (over && (!g || !g->collapsed) && h.rect.right - h.rect.left >= app.S(40)) {
                 RECT cross = CloseRect(h);
                 // 先覆盖文字，后绘制按钮；不调整文本矩形或标签宽度。
                 // 渐变末端在按钮左缘达到全不透明，按钮下方不残留文字。
                 int fadeLeft = std::max((int)r.left, (int)cross.left - app.S(6));
                 Gdiplus::Graphics graphics(dc);
+                graphics.SetClip(Gdiplus::Rect(visible.left, visible.top, visible.right - visible.left,
+                                               visible.bottom - visible.top));
                 if (selected) {
                     Gdiplus::GraphicsPath clip;
                     SelectedOutline(clip, h.rect, app.dpi / 96.0f);
                     clip.CloseFigure();
-                    graphics.SetClip(&clip);
+                    graphics.SetClip(&clip, Gdiplus::CombineModeIntersect);
                 }
                 Gdiplus::Color transparent(0, GetRValue(color), GetGValue(color), GetBValue(color));
                 Gdiplus::Color opaque(255, GetRValue(color), GetGValue(color), GetBValue(color));
@@ -288,7 +427,9 @@ void TabStrip::Paint() {
                 graphics.DrawLine(&pen, cx - arm, cy - arm, cx + arm, cy + arm);
                 graphics.DrawLine(&pen, cx - arm, cy + arm, cx + arm, cy - arm);
             }
+            RestoreDC(dc, saved);
         } else if (g) {
+            const float expansion = GroupExpansion(g->id);
             RECT chip = h.rect;
             InflateRect(&chip, -app.S(9), -app.S(6));
             {
@@ -305,7 +446,7 @@ void TabStrip::Paint() {
                     path.AddArc(x, y + hh - diameter, diameter, diameter, 90, 90);
                     path.CloseFigure();
                     Gdiplus::SolidBrush brush(
-                        PaintColor(g->collapsed ? GetSysColor(COLOR_BTNFACE) : g->color));
+                        PaintColor(BlendColor(GetSysColor(COLOR_BTNFACE), g->color, expansion)));
                     graphics.FillPath(&brush, &path);
                     if (over && !dragging) {
                         bool pressed = GetCapture() == hwnd && !source.tab && source.group == h.group;
@@ -314,7 +455,7 @@ void TabStrip::Paint() {
                                                                     GetGValue(tint), GetBValue(tint)));
                         graphics.FillPath(&feedback, &path);
                     }
-                    if (g->collapsed) {
+                    if (expansion < 1.0f) {
                         Gdiplus::Pen border(PaintColor(g->color), app.dpi / 96.0f);
                         border.SetAlignment(Gdiplus::PenAlignmentInset);
                         graphics.DrawPath(&border, &path);
@@ -322,7 +463,7 @@ void TabStrip::Paint() {
                 }
             }
             InflateRect(&chip, -app.S(9), 0);
-            SetTextColor(dc, g->collapsed ? g->color : RGB(255, 255, 255));
+            SetTextColor(dc, BlendColor(g->color, RGB(255, 255, 255), expansion));
             DrawTextW(dc, g->name.c_str(), -1, &chip,
                       DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
@@ -331,15 +472,22 @@ void TabStrip::Paint() {
     for (const auto &h : hits) {
         auto *group = h.group ? app.model.FindGroup(pane, h.group) : nullptr;
         bool selected = h.tab && h.tab == app.model.panes[pane].selected;
-        if (!group || group->collapsed)
+        if (!group || GroupExpansion(group->id) <= 0.0f)
             continue;
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         float scale = app.dpi / 96.0f;
-        Gdiplus::Pen pen(PaintColor(group->color), scale * 2.0f);
+        Gdiplus::Pen pen(Gdiplus::Color((BYTE)(255 * GroupExpansion(group->id)), GetRValue(group->color),
+                                        GetGValue(group->color), GetBValue(group->color)),
+                         scale * 2.0f);
         if (selected) {
             Gdiplus::GraphicsPath outline;
-            SelectedOutline(outline, h.rect, scale);
+            RECT full = h.rect;
+            if (h.naturalWidth)
+                full.right = full.left + h.naturalWidth;
+            graphics.SetClip(Gdiplus::Rect(h.rect.left, h.rect.top, h.rect.right - h.rect.left,
+                                           h.rect.bottom - h.rect.top));
+            SelectedOutline(outline, full, scale);
             graphics.DrawPath(&pen, &outline);
         } else {
             float baseline = h.rect.bottom - scale;
@@ -377,9 +525,6 @@ void TabStrip::Paint() {
         }
     BitBlt(out, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, oldFont);
-    SelectObject(dc, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(dc);
     EndPaint(hwnd, &ps);
 }
 void TabStrip::RestoreExpanded() {
@@ -493,7 +638,8 @@ void TabStrip::ResolveDrop(POINT screen, int &target, int &index, Id &group) {
 }
 RECT TabStrip::CloseRect(const TabHit &h) const {
     int cy = (h.rect.top + h.rect.bottom) / 2;
-    return {h.rect.right - app.S(23), cy - app.S(9), h.rect.right - app.S(5), cy + app.S(9)};
+    int right = h.naturalWidth ? h.rect.left + h.naturalWidth : h.rect.right;
+    return {right - app.S(23), cy - app.S(9), right - app.S(5), cy + app.S(9)};
 }
 
 void TabStrip::UpdateDrag(POINT screen) {
@@ -624,6 +770,10 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             (abs(pt.x - down.x) > GetSystemMetricsForDpi(SM_CXDRAG, app.dpi) ||
              abs(pt.y - down.y) > GetSystemMetricsForDpi(SM_CYDRAG, app.dpi))) {
             dragging = true;
+            for (auto &strip : app.strips)
+                if (strip)
+                    strip->FinishAnimation();
+            app.Layout();
             SendMessageW(tooltip, TTM_ACTIVATE, FALSE, 0);
         }
         if (dragging) {
@@ -638,6 +788,17 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_TIMER:
+        if (a == 2) {
+            if (animating) {
+                animationFrame = true;
+                Arrange(motionWidth);
+                animationFrame = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                if (!animating)
+                    EnsureVisible(app.model.panes[pane].selected);
+            }
+            return 0;
+        }
         if (dragging || external) {
             POINT screen;
             GetCursorPos(&screen);
@@ -713,7 +874,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
                 if (auto *g = app.model.FindGroup(pane, hit.group)) {
                     app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
                     app.Changed();
-                    app.SyncViews();
+                    app.SyncViews(pane);
                     EnsureVisible(app.model.panes[pane].selected);
                 }
             app.Activate(pane);
@@ -730,7 +891,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
                 if (auto *g = app.model.FindGroup(pane, hit.group)) {
                     app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
                     app.Changed();
-                    app.SyncViews();
+                    app.SyncViews(pane);
                     EnsureVisible(app.model.panes[pane].selected);
                 }
             } else if (auto *t = app.model.Find(hit.tab); t && !t->name.empty()) {
@@ -752,6 +913,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         return 0;
     }
     case WM_MOUSEWHEEL:
+        FinishAnimation();
         scroll -= GET_WHEEL_DELTA_WPARAM(a) / WHEEL_DELTA * app.S(32);
         scroll = std::max(0, scroll);
         app.Layout();
@@ -782,6 +944,10 @@ HRESULT TabStrip::DragEnter(IDataObject *data, DWORD, POINTL p, DWORD *e) {
     externalData = data;
     releasedAt = 0;
     external = true;
+    for (auto &strip : app.strips)
+        if (strip)
+            strip->FinishAnimation();
+    app.Layout();
     hoverTime = GetTickCount64();
     return DragOver(0, p, e);
 }

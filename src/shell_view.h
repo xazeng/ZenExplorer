@@ -18,6 +18,8 @@ class ShellView : public IExplorerBrowserEvents,
     std::wstring dragHitName;
     ComPtr<IShellItem> dragHitItem;
     bool destroyed = false;
+    bool browserSized = false;
+    RECT browserBounds{};
     std::vector<BYTE> requestedPidl;
     std::wstring navigationPath, parentPath;
     std::vector<std::pair<std::wstring, std::wstring>> breadcrumbs;

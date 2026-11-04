@@ -257,28 +257,19 @@ void Model::SetGroupCollapsed(int p, Id group, bool collapsed) {
             if (auto *tab = Find(panes[p].selected); tab && tab->group == item.id)
                 item.lastSelected = tab->id;
     };
-    bool expanding = g->collapsed && !collapsed;
     if (collapsed)
         remember(*g);
-    g->collapsed = collapsed;
     if (!collapsed && singleExpandedGroup) {
         for (auto &other : panes[p].groups)
             if (other.id != group) {
                 remember(other);
                 other.collapsed = true;
             }
+        // 目标组仍保持原状态，先完成收起其他组后的补选，不能借新展开的标签补选。
+        EnsureVisibleSelection(p);
     }
-    if (expanding || !Visible(p, panes[p].selected)) {
-        auto *saved = Find(g->lastSelected);
-        if (!collapsed && saved && saved->group == group && PaneOf(saved->id) == p)
-            panes[p].selected = saved->id;
-        else if (!collapsed)
-            for (const auto &tab : panes[p].tabs)
-                if (tab.group == group) {
-                    panes[p].selected = tab.id;
-                    break;
-                }
-    }
+    g->collapsed = collapsed;
+    // 展开仅改变可见性；只有原选中项被自动折叠隐藏时才按通用规则补选。
     EnsureVisibleSelection(p);
     Log(L"分组展开状态 pane=" + std::to_wstring(p) + L" group=" + std::to_wstring(group) + L" collapsed=" +
         std::to_wstring(collapsed));

@@ -14,6 +14,12 @@ struct CheckState {
     bool failed = false, busy = false;
 };
 static CheckState *state;
+static LRESULT CALLBACK CountLayoutMessages(HWND window, UINT message, WPARAM w, LPARAM l, UINT_PTR,
+                                            DWORD_PTR data) {
+    if (message == WM_WINDOWPOSCHANGED || message == WM_SIZE || message == WM_SHOWWINDOW)
+        ++*reinterpret_cast<int *>(data);
+    return DefSubclassProc(window, message, w, l);
+}
 static bool Ready(Id id) {
     auto &app = *state->app;
     auto it = app.views.find(id);
@@ -165,6 +171,32 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             }
             SetFocus(navigationFocus);
             app.Activate(previousPane);
+            // 右栏分组切换及动画结束，不应重新移动或显示左栏 Shell 宿主。
+            Id probeTab = app.model.Add(1, Home, 0, -1, false);
+            Id probeGroup = app.model.MakeGroup(1, probeTab);
+            app.SyncViews(1);
+            auto &leftView = *app.views.at(app.model.panes[0].selected);
+            int leftLayoutMessages = 0;
+            SetWindowSubclass(leftView.host, CountLayoutMessages, 99, (DWORD_PTR)&leftLayoutMessages);
+            ValidateRect(app.strips[0]->hwnd, nullptr);
+            for (bool collapse : {true, false}) {
+                app.model.SetGroupCollapsed(1, probeGroup, collapse);
+                app.SyncViews(1);
+                app.Activate(1);
+                Sleep(230);
+                SendMessageW(app.strips[1]->hwnd, WM_TIMER, 2, 0);
+            }
+            leftView.Resize(app.viewBounds[0]);
+            leftView.Show(true);
+            if (leftLayoutMessages || GetUpdateRect(app.strips[0]->hwnd, nullptr, FALSE)) {
+                std::cerr << "right group operation relaid out left pane\n";
+                state->failed = true;
+            }
+            RemoveWindowSubclass(leftView.host, CountLayoutMessages, 99);
+            app.model.Remove(1, {probeTab}, false);
+            app.SyncViews(1);
+            SetFocus(navigationFocus);
+            app.Activate(previousPane);
             if (app.customFrame) {
                 auto hit = [&](int x, int y) {
                     POINT point{x, y};
@@ -272,7 +304,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 state->failed = true;
             checkMode(FVM_DETAILS);
             setIcons();
-            // 完整鼠标消息序列：组单击不切换，双击只切换一次，展开恢复组内选择。
+            // 完整鼠标消息序列：组单击不切换，双击只切换一次，展开保留当前选择。
             Id leftBefore = app.model.panes[0].selected;
             bool previousTrigger = app.model.groupDoubleClick;
             app.Command(116);
@@ -312,8 +344,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             if (!app.model.FindGroup(0, groupId)->collapsed)
                 state->failed = true;
             clickGroup(true);
-            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != grouped) {
-                std::cerr << "group double click did not restore remembered selection\n";
+            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != leftBefore) {
+                std::cerr << "group expansion changed current selection\n";
                 state->failed = true;
             }
             app.Command(115);
@@ -323,9 +355,54 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 state->failed = true;
             }
             clickGroup(false);
-            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != grouped)
+            if (app.model.FindGroup(0, groupId)->collapsed || app.model.panes[0].selected != leftBefore)
                 state->failed = true;
             app.Command(previousTrigger ? 116 : 115);
+            // 真实标签布局：折叠立即改变选择，残留动画图像不可命中；反向从当前宽度继续。
+            auto &strip = *app.strips[0];
+            RECT stripBounds{};
+            GetClientRect(strip.hwnd, &stripBounds);
+            Sleep(230);
+            strip.Arrange(stripBounds.right);
+            auto widthOf = [&] {
+                for (const auto &hit : strip.hits)
+                    if (hit.tab == grouped)
+                        return hit.rect.right - hit.rect.left;
+                return 0L;
+            };
+            LONG fullWidth = widthOf();
+            app.Activate(0, grouped);
+            app.model.SetGroupCollapsed(0, groupId, true);
+            app.Layout();
+            if (!strip.IsAnimating() || app.model.panes[0].selected == grouped)
+                state->failed = true;
+            for (const auto &hit : strip.hits)
+                if (hit.tab == grouped && strip.Hit({hit.rect.left + 1, hit.rect.top + 1}).tab == grouped)
+                    state->failed = true;
+            Sleep(45);
+            SendMessageW(strip.hwnd, WM_TIMER, 2, 0);
+            LONG shrinkingWidth = widthOf();
+            if (shrinkingWidth <= 0 || shrinkingWidth >= fullWidth)
+                state->failed = true;
+            for (const auto &hit : strip.hits)
+                if (hit.tab == grouped && hit.naturalWidth != fullWidth)
+                    state->failed = true;
+            app.model.SetGroupCollapsed(0, groupId, false);
+            app.Layout();
+            if (!strip.IsAnimating() || widthOf() > shrinkingWidth ||
+                app.model.panes[0].selected != leftBefore)
+                state->failed = true;
+            Sleep(230);
+            SendMessageW(strip.hwnd, WM_TIMER, 2, 0);
+            if (strip.IsAnimating() || widthOf() != fullWidth)
+                state->failed = true;
+            app.model.SetGroupCollapsed(0, groupId, true);
+            app.Layout();
+            strip.Arrange(stripBounds.right - 1);
+            if (strip.IsAnimating() || widthOf())
+                state->failed = true;
+            app.model.SetGroupCollapsed(0, groupId, false);
+            app.Layout();
             app.CloseTabs(0, {grouped}, true);
             app.Activate(0, leftBefore);
             app.Activate(activeBefore);

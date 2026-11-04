@@ -55,7 +55,8 @@ class App {
     }
     void RefreshWindowIcons();
     void RefreshDpiResources();
-    void Layout(bool updateStatus = true);
+    void Layout(bool updateStatus = true, int pane = -1);
+    void RedrawPaneFocus();
     void Activate(int p, Id id = 0, bool focus = false);
     void EnsureView(Id id);
     void Changed();
@@ -68,7 +69,7 @@ class App {
     void Travel(int delta);
     void NewTab(int pane, const std::wstring &path = Home, Id group = 0, int index = -1, Id opener = 0);
     void CloseTabs(int p, const std::vector<Id> &ids, bool group = false);
-    void SyncViews();
+    void SyncViews(int pane = -1);
     void TabMenu(int p, Id tab, Id group, POINT pt);
     void FileMenu(ShellView &, POINT, bool background);
     struct PendingPaste {

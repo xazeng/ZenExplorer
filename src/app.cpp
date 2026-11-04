@@ -768,9 +768,10 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
                 ShowError((Id)a, it->second->error);
         }
         Changed();
-        if (b != 3) {
-            Layout();
-        }
+        if (b == 2)
+            RedrawPaneFocus();
+        else if (b != 3 && model.PaneOf((Id)a) >= 0)
+            Layout(false, model.PaneOf((Id)a));
         UpdateStatus();
         return 0;
     }
@@ -962,49 +963,71 @@ void App::RefreshDpiResources() {
     }
     Log(L"更新 DPI 资源 dpi=" + std::to_wstring(dpi));
 }
-void App::Layout(bool updateStatus) {
+static void MoveIfChanged(HWND child, int x, int y, int width, int height, BOOL repaint) {
+    RECT current{};
+    if (!child || !GetWindowRect(child, &current))
+        return;
+    MapWindowPoints(nullptr, GetParent(child), (POINT *)&current, 2);
+    RECT target{x, y, x + width, y + height};
+    if (!EqualRect(&current, &target))
+        MoveWindow(child, x, y, width, height, repaint);
+}
+void App::RedrawPaneFocus() {
+    for (int p = 0; p < 2; ++p) {
+        InvalidateRect(crumb[p], nullptr, FALSE);
+        for (int i = 0; i < 4; ++i)
+            InvalidateRect(GetDlgItem(window, NavigationBase + p * 4 + i), nullptr, FALSE);
+    }
+}
+void App::Layout(bool updateStatus, int pane) {
     if (!status)
         return;
     RECT rc;
     GetClientRect(window, &rc);
-    SendMessageW(status, WM_SIZE, 0, 0);
+    if (pane < 0)
+        SendMessageW(status, WM_SIZE, 0, 0);
     RECT sr;
     GetWindowRect(status, &sr);
     int bottom = rc.bottom - (sr.bottom - sr.top), top = TitleHeight();
     int titleY = TitleOffset() + (customFrame ? S(2) : 0);
     int titleX = customFrame ? S(32) : 0;
-    SendMessageW(toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(S(48), S(32)));
-    MoveWindow(toolbar, titleX + S(4), titleY, S(144), S(32), TRUE);
-    for (int i = 0; i < 3; ++i)
-        MoveWindow(GetDlgItem(window, CaptionBase + i), rc.right - S((3 - i) * 46), TitleOffset(), S(46),
-                   S(36), TRUE);
+    if (pane < 0) {
+        SendMessageW(toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(S(48), S(32)));
+        MoveIfChanged(toolbar, titleX + S(4), titleY, S(144), S(32), TRUE);
+        for (int i = 0; i < 3; ++i)
+            MoveIfChanged(GetDlgItem(window, CaptionBase + i), rc.right - S((3 - i) * 46), TitleOffset(),
+                          S(46), S(36), TRUE);
+    }
     int middle = (int)(rc.right * model.split);
     // 窄窗口保留两侧导航按钮及地址输入的基本空间，保存的分栏比例不变。
     const int minimumPane = std::min(S(180), (int)rc.right / 2);
     middle = std::clamp(middle, minimumPane, (int)rc.right - minimumPane);
     for (int p = 0; p < 2; ++p) {
+        if (pane >= 0 && pane != p)
+            continue;
         int left = p ? middle + S(3) : 0, width = p ? rc.right - left : middle - S(3);
         width = std::max(width, 1);
         int tabHeight = strips[p] ? strips[p]->Arrange(width) : S(32);
         if (strips[p]) {
-            MoveWindow(strips[p]->hwnd, left, top, width, tabHeight, TRUE);
+            MoveIfChanged(strips[p]->hwnd, left, top, width, tabHeight, TRUE);
             InvalidateRect(strips[p]->hwnd, nullptr, FALSE);
         }
         int y = top + tabHeight;
         const int buttonWidth = S(28), addressLeft = left + buttonWidth * 3;
         const int addressWidth = std::max(1, width - buttonWidth * 4);
         for (int i = 0; i < 4; ++i)
-            MoveWindow(GetDlgItem(window, NavigationBase + p * 4 + i),
-                       i == 3 ? left + width - buttonWidth : left + i * buttonWidth, y, buttonWidth, S(32),
-                       TRUE);
-        MoveWindow(crumb[p], addressLeft, y, addressWidth, S(32), TRUE);
-        MoveWindow(address[p], addressLeft + S(34), y + S(6), std::max(1, addressWidth - S(40)), S(20), TRUE);
+            MoveIfChanged(GetDlgItem(window, NavigationBase + p * 4 + i),
+                          i == 3 ? left + width - buttonWidth : left + i * buttonWidth, y, buttonWidth, S(32),
+                          TRUE);
+        MoveIfChanged(crumb[p], addressLeft, y, addressWidth, S(32), TRUE);
+        MoveIfChanged(address[p], addressLeft + S(34), y + S(6), std::max(1, addressWidth - S(40)), S(20),
+                      TRUE);
         InvalidateRect(crumb[p], nullptr, TRUE);
         for (int i = 0; i < 4; ++i)
             InvalidateRect(GetDlgItem(window, NavigationBase + p * 4 + i), nullptr, FALSE);
         RECT view{left, y + S(34), left + width, std::max(y + S(35), bottom)};
         viewBounds[p] = view;
-        MoveWindow(error[p], left + S(12), view.top + S(15), std::max(width - S(24), 1), S(90), TRUE);
+        MoveIfChanged(error[p], left + S(12), view.top + S(15), std::max(width - S(24), 1), S(90), TRUE);
         bool failed = false;
         for (auto &[id, v] : views)
             if (model.PaneOf(id) == p) {
@@ -1015,7 +1038,8 @@ void App::Layout(bool updateStatus) {
                     failed = FAILED(v->error);
                 }
             }
-        ShowWindow(error[p], failed ? SW_SHOW : SW_HIDE);
+        if (((GetWindowLongPtrW(error[p], GWL_STYLE) & WS_VISIBLE) != 0) != failed)
+            ShowWindow(error[p], failed ? SW_SHOW : SW_HIDE);
         UpdateAddress(p);
     }
     if (updateStatus)
@@ -1024,7 +1048,7 @@ void App::Layout(bool updateStatus) {
 void App::EnsureView(Id id) {
     if (!model.Find(id) || views.contains(id))
         return;
-    Layout(false);
+    Layout(false, model.PaneOf(id));
     RefreshLocalIcon(id);
     auto v = std::make_unique<ShellView>(*this, id);
     auto *ptr = v.get();
@@ -1034,7 +1058,7 @@ void App::EnsureView(Id id) {
         ShowError(id, hr);
         return;
     }
-    Layout(false);
+    Layout(false, model.PaneOf(id));
     ptr->Browse(model.Find(id)->path, false);
 }
 void App::Activate(int p, Id id, bool focus) {
@@ -1042,12 +1066,15 @@ void App::Activate(int p, Id id, bool focus) {
         return;
     if (model.active != p || (id && model.panes[p].selected != id))
         ++pasteGeneration;
+    bool paneChanged = model.active != p;
     model.active = p;
     if (id && model.PaneOf(id) == p)
         model.panes[p].selected = id;
     model.EnsureVisibleSelection(p);
     EnsureView(model.panes[p].selected);
-    Layout();
+    Layout(true, p);
+    if (paneChanged)
+        RedrawPaneFocus();
     Changed();
     if (focus) {
         auto it = views.find(model.panes[p].selected);
@@ -1144,7 +1171,7 @@ void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener
     strips[p]->EnsureVisible(id);
     BuildMenu();
 }
-void App::SyncViews() {
+void App::SyncViews(int pane) {
     ResourceTrace trace(L"清理标签资源");
     std::erase_if(views, [&](auto &pair) { return !model.Find(pair.first); });
     std::erase_if(icons, [&](auto &pair) {
@@ -1167,7 +1194,7 @@ void App::SyncViews() {
     });
     for (int p = 0; p < 2; ++p)
         EnsureView(model.panes[p].selected);
-    Layout();
+    Layout(true, pane);
 }
 void App::CloseTabs(int p, const std::vector<Id> &ids, bool group) {
     bool named = false;
@@ -1628,7 +1655,7 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             model.SetGroupCollapsed(p, group, cmd == 16);
             Activate(p);
             Changed();
-            SyncViews();
+            SyncViews(p);
             strips[p]->EnsureVisible(model.panes[p].selected);
             return;
         } else if (cmd == 10) {

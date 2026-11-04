@@ -5,6 +5,7 @@ struct TabHit {
     RECT rect{};
     Id tab = 0, group = 0;
     bool plus = false;
+    int naturalWidth = 0;
 };
 class TabStrip : public IDropTarget {
     LONG refs = 1;
@@ -26,6 +27,22 @@ class TabStrip : public IDropTarget {
     std::vector<GroupExpansionState> expanded;
     ComPtr<IDataObject> externalData;
     ULONGLONG releasedAt = 0;
+    struct GroupMotion {
+        float from = 0, value = 0, target = 0;
+        ULONGLONG started = 0;
+    };
+    std::unordered_map<Id, GroupMotion> groupMotions;
+    int motionWidth = 0;
+    UINT motionDpi = 0;
+    bool motionWrap = false, animating = false;
+    uint64_t layoutSignature = 0;
+    bool animationFrame = false;
+    std::unordered_map<std::wstring, int> measuredText;
+    HDC paintDC{};
+    HBITMAP paintBitmap{}, paintOriginal{};
+    int paintWidth = 0, paintHeight = 0;
+    void FinishAnimation();
+    float GroupExpansion(Id group) const;
 
   public:
     App &app;
@@ -41,6 +58,9 @@ class TabStrip : public IDropTarget {
     void Create();
     int Arrange(int width);
     void Paint();
+    bool IsAnimating() const {
+        return animating;
+    }
     void RefreshDragFont(HFONT font);
     TabHit Hit(POINT) const;
     void EnsureVisible(Id);
