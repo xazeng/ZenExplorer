@@ -1,5 +1,6 @@
 #include "storage.h"
 #include <fstream>
+#include <set>
 namespace zen {
 static uint32_t Hash(const std::vector<uint8_t> &b) {
     uint32_t h = 2166136261u;
@@ -55,13 +56,18 @@ std::vector<uint8_t> ReadEnvelope(const std::filesystem::path &p, uint32_t magic
 // 新的拆分格式，不读取旧版混合会话。历史先落盘，配置再引用同代快照。
 static constexpr uint32_t Magic = 0x434E455A;
 static constexpr uint32_t HistoryMagic = 0x484E455A;
+static constexpr uint32_t SessionVersion = 6, HistoryVersion = 2;
+struct ObsoleteSession {};
 static std::filesystem::path HistoryPath(const GUID &generation) {
     wchar_t name[40]{};
     StringFromGUID2(generation, name, 40);
     return DataDir() / L"history" / (std::wstring(name) + L".dat");
 }
 static std::filesystem::path ReferencedHistory(const std::filesystem::path &config) {
-    auto bytes = ReadEnvelope(config, Magic, 5);
+    uint32_t version = 0;
+    auto bytes = ReadEnvelope(config, Magic, SessionVersion, &version);
+    if (version != SessionVersion)
+        throw ObsoleteSession{};
     Reader r{bytes};
     return HistoryPath(r.Pod<GUID>());
 }
@@ -75,6 +81,30 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
         return false;
     Writer w, history;
     w.Pod(generation);
+    // 四类位置只保存引用；同代历史文件中的位置表统一保存身份和显示信息。
+    std::set<std::wstring> keys(m.recent.begin(), m.recent.end());
+    for (const auto &pane : m.panes)
+        for (const auto &tab : pane.tabs) {
+            keys.insert(tab.path);
+            if (!tab.home.empty())
+                keys.insert(tab.home);
+            keys.insert(tab.history.begin(), tab.history.end());
+        }
+    history.Pod((uint32_t)keys.size());
+    for (const auto &key : keys) {
+        ShellLocation fallback{key.starts_with(L"zen-shell:") ? L"" : key, LocationName(key), {}};
+        auto found = m.locations.find(key);
+        const auto &location = found == m.locations.end() ? fallback : found->second;
+        if (key.size() > 32768 || location.parsingName.size() > 32768 ||
+            location.displayName.size() > 32768 || (!location.pidl.empty() && !ValidPidl(location.pidl)) ||
+            (location.pidl.empty() && location.parsingName.empty()))
+            return false;
+        history.Text(key);
+        history.Text(location.parsingName);
+        history.Text(location.displayName);
+        history.Pod((uint32_t)location.pidl.size());
+        history.bytes.insert(history.bytes.end(), location.pidl.begin(), location.pidl.end());
+    }
     history.Pod((uint32_t)m.recent.size());
     for (const auto &s : m.recent)
         history.Text(s);
@@ -131,9 +161,11 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
         obsoleteHistory = ReferencedHistory(backup);
     } catch (...) {
     }
-    if (!WriteEnvelope(historyPath, HistoryMagic, history.bytes, false))
+    if (history.bytes.size() > 32 * 1024 * 1024 || w.bytes.size() > 32 * 1024 * 1024)
         return false;
-    if (!WriteEnvelope(p, Magic, w.bytes, true, 5)) {
+    if (!WriteEnvelope(historyPath, HistoryMagic, history.bytes, false, HistoryVersion))
+        return false;
+    if (!WriteEnvelope(p, Magic, w.bytes, true, SessionVersion)) {
         std::error_code ec;
         std::filesystem::remove(historyPath, ec);
         return false;
@@ -151,10 +183,31 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     return true;
 }
 static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
+    if (version != SessionVersion)
+        throw ObsoleteSession{};
     Reader r{b};
-    auto historyBytes = ReadEnvelope(HistoryPath(r.Pod<GUID>()), HistoryMagic);
+    uint32_t historyVersion = 0;
+    auto historyBytes =
+        ReadEnvelope(HistoryPath(r.Pod<GUID>()), HistoryMagic, HistoryVersion, &historyVersion);
+    if (historyVersion != HistoryVersion)
+        throw std::runtime_error("位置历史格式不匹配");
     Reader history{historyBytes};
     Model m;
+    for (auto count = history.Count(1048576); count--;) {
+        auto key = history.Text();
+        ShellLocation location;
+        location.parsingName = history.Text();
+        location.displayName = history.Text();
+        auto size = history.Count(1024 * 1024);
+        if (size > history.bytes.size() - history.pos)
+            throw std::runtime_error("位置标识截断");
+        location.pidl.assign(history.bytes.begin() + history.pos, history.bytes.begin() + history.pos + size);
+        history.pos += size;
+        if (key.empty() || (!location.pidl.empty() && !ValidPidl(location.pidl)) ||
+            (location.pidl.empty() && location.parsingName.empty()) ||
+            !m.locations.emplace(key, std::move(location)).second)
+            throw std::runtime_error("位置数据无效");
+    }
     m.nextId = r.Pod<Id>();
     m.active = r.Pod<int>();
     m.split = r.Pod<double>();
@@ -200,30 +253,45 @@ static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
             p.tabs.push_back(t);
         }
     }
-    if (version >= 2)
-        m.singleExpandedGroup = r.Pod<bool>();
-    if (version >= 3)
-        for (auto &pane : m.panes)
-            for (auto &g : pane.groups)
-                g.lastSelected = r.Pod<Id>();
-    m.windowDpi = version >= 4 ? r.Pod<UINT>() : 0;
-    m.groupDoubleClick = version >= 5 ? r.Pod<bool>() : false;
+    m.singleExpandedGroup = r.Pod<bool>();
+    for (auto &pane : m.panes)
+        for (auto &g : pane.groups)
+            g.lastSelected = r.Pod<Id>();
+    m.windowDpi = r.Pod<UINT>();
+    m.groupDoubleClick = r.Pod<bool>();
     if (m.windowDpi && (m.windowDpi < 48 || m.windowDpi > 960))
         throw std::runtime_error("窗口 DPI 无效");
     if (r.pos != b.size() || history.pos != historyBytes.size() ||
         historyCount != m.panes[0].tabs.size() + m.panes[1].tabs.size() || !m.Valid())
         throw std::runtime_error("状态不合法");
+    for (const auto &key : m.recent)
+        if (!m.locations.contains(key))
+            throw std::runtime_error("最近关闭位置缺失");
+    for (const auto &pane : m.panes)
+        for (const auto &tab : pane.tabs) {
+            if (!m.locations.contains(tab.path) || (!tab.home.empty() && !m.locations.contains(tab.home)))
+                throw std::runtime_error("标签位置缺失");
+            for (const auto &key : tab.history)
+                if (!m.locations.contains(key))
+                    throw std::runtime_error("历史位置缺失");
+        }
     for (int p = 0; p < 2; ++p)
         m.NormalizeGroups(p);
     return m;
 }
-bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &future) {
+bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &future, bool *obsolete) {
     recovered = future = false;
+    if (obsolete)
+        *obsolete = false;
     try {
         uint32_t version = 0;
-        auto bytes = ReadEnvelope(p, Magic, 5, &version);
+        auto bytes = ReadEnvelope(p, Magic, SessionVersion, &version);
         m = Decode(bytes, version);
         return true;
+    } catch (const ObsoleteSession &) {
+        if (obsolete)
+            *obsolete = true;
+        return false;
     } catch (const std::domain_error &) {
         future = true;
         return false;
@@ -233,10 +301,14 @@ bool LoadModel(Model &m, const std::filesystem::path &p, bool &recovered, bool &
     bak += L".bak";
     try {
         uint32_t version = 0;
-        auto bytes = ReadEnvelope(bak, Magic, 5, &version);
+        auto bytes = ReadEnvelope(bak, Magic, SessionVersion, &version);
         m = Decode(bytes, version);
         recovered = true;
         return true;
+    } catch (const ObsoleteSession &) {
+        if (obsolete)
+            *obsolete = true;
+        return false;
     } catch (const std::domain_error &) {
         future = true;
         return false;

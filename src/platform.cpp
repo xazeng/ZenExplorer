@@ -210,13 +210,77 @@ std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstrin
     }
     return out;
 }
+bool ValidPidl(const std::vector<BYTE> &bytes) {
+    if (bytes.size() < sizeof(USHORT) || bytes.size() > 1024 * 1024)
+        return false;
+    size_t offset = 0;
+    while (offset + sizeof(USHORT) <= bytes.size()) {
+        USHORT size = 0;
+        memcpy(&size, bytes.data() + offset, sizeof(size));
+        if (!size)
+            return offset + sizeof(size) == bytes.size();
+        if (size < sizeof(size) || size > bytes.size() - offset)
+            return false;
+        offset += size;
+    }
+    return false;
+}
+HRESULT ShellHierarchy(IShellItem *item, std::vector<ComPtr<IShellItem>> &out) {
+    out.clear();
+    if (!item)
+        return E_INVALIDARG;
+    struct Ids {
+        PIDLIST_ABSOLUTE chain = nullptr, root = nullptr;
+        ~Ids() {
+            CoTaskMemFree(chain);
+            CoTaskMemFree(root);
+        }
+    } ids;
+    HRESULT hr = SHGetIDListFromObject(item, &ids.chain);
+    if (FAILED(hr) || !ids.chain)
+        return FAILED(hr) ? hr : E_FAIL;
+    SHGetKnownFolderIDList(FOLDERID_ComputerFolder, 0, nullptr, &ids.root);
+    ComPtr<IShellItem> current = item;
+    for (size_t depth = 0; depth < 256; ++depth) {
+        out.push_back(current);
+        if (ILIsEmpty(ids.chain) || (ids.root && ILIsEqual(ids.chain, ids.root)))
+            return S_OK;
+        if (!ILRemoveLastID(ids.chain))
+            return E_FAIL;
+        current.Reset();
+        hr = SHCreateItemFromIDList(ids.chain, IID_PPV_ARGS(&current));
+        if (FAILED(hr))
+            return hr;
+    }
+    return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+}
 HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstring, std::wstring>> &out) {
     out.clear();
     ComPtr<IShellItem> item;
     HRESULT hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item));
+    if (FAILED(hr))
+        return hr;
+    std::vector<ComPtr<IShellItem>> children;
+    hr = ChildFolderItems(item.Get(), children);
+    if (FAILED(hr))
+        return hr;
+    for (const auto &child : children) {
+        auto name = ItemName(child.Get(), SIGDN_NORMALDISPLAY);
+        auto target = ItemName(child.Get());
+        if (name.empty() || target.empty()) {
+            out.clear();
+            return E_FAIL;
+        }
+        out.emplace_back(std::move(name), std::move(target));
+    }
+    return S_OK;
+}
+HRESULT ChildFolderItems(IShellItem *item, std::vector<ComPtr<IShellItem>> &out) {
+    out.clear();
+    if (!item)
+        return E_INVALIDARG;
     ComPtr<IShellFolder> folder;
-    if (SUCCEEDED(hr))
-        hr = item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder));
+    HRESULT hr = item->BindToHandler(nullptr, BHID_SFObject, IID_PPV_ARGS(&folder));
     ComPtr<IEnumIDList> entries;
     if (SUCCEEDED(hr))
         hr = folder->EnumObjects(nullptr, SHCONTF_FOLDERS, &entries);
@@ -224,7 +288,7 @@ HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstrin
         return hr;
     if (!entries)
         return S_OK;
-    std::vector<std::pair<std::wstring, std::wstring>> result;
+    std::vector<std::pair<std::wstring, ComPtr<IShellItem>>> result;
     for (;;) {
         PITEMID_CHILD child = nullptr;
         hr = entries->Next(1, &child, nullptr);
@@ -238,17 +302,17 @@ HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstrin
         if (FAILED(hr))
             return hr;
         auto name = ItemName(entry.Get(), SIGDN_NORMALDISPLAY);
-        auto target = ItemName(entry.Get());
-        if (name.empty() || target.empty())
+        if (name.empty())
             return E_FAIL;
-        result.emplace_back(std::move(name), std::move(target));
+        result.emplace_back(std::move(name), std::move(entry));
     }
     if (FAILED(hr))
         return hr;
     std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
         return StrCmpLogicalW(a.first.c_str(), b.first.c_str()) < 0;
     });
-    out = std::move(result);
+    for (auto &[name, child] : result)
+        out.push_back(std::move(child));
     return S_OK;
 }
 bool Confirm(HWND w, const std::wstring &text) {

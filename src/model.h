@@ -1,7 +1,14 @@
 #pragma once
 #include "platform.h"
+#include <unordered_map>
 namespace zen {
 using Id = uint64_t;
+// 标签、历史和最近关闭记录以键引用同一位置，显示名称不承担导航身份。
+struct ShellLocation {
+    std::wstring parsingName, displayName;
+    std::vector<BYTE> pidl;
+    bool usable = true; // 仅本次运行的失效状态，重启后允许重新尝试持久化标识。
+};
 struct GroupColorPreset {
     const wchar_t *name;
     COLORREF color;
@@ -56,6 +63,7 @@ struct GroupExpansionState {
     std::vector<Entry> groups;
 };
 struct Model {
+    std::unordered_map<std::wstring, ShellLocation> locations;
     Pane panes[2];
     int active = 0;
     double split = .5;

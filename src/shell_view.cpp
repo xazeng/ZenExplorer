@@ -158,7 +158,7 @@ void ShellView::Destroy() {
         DestroyWindow(host);
     host = nullptr;
 }
-HRESULT ShellView::Browse(const std::wstring &path, bool append) {
+HRESULT ShellView::Browse(const std::wstring &path, bool append, int historyIndex) {
     if (!browser || path.empty())
         return E_INVALIDARG;
     // 调用者在修改地址前捕获旧视图；此处不能覆盖已重置的模式。
@@ -166,26 +166,62 @@ HRESULT ShellView::Browse(const std::wstring &path, bool append) {
     requestedPidl.clear();
     expected = path;
     appendHistory = append;
+    pendingHistoryIndex = historyIndex;
     navigating = true;
     error = S_OK;
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    HRESULT hr = SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr);
+    std::vector<BYTE> identity;
+    HRESULT hr = app.ResolveLocation(path, identity, usingSavedIdentity);
     if (SUCCEEDED(hr)) {
-        requestedPidl.assign((BYTE *)pidl, (BYTE *)pidl + ILGetSize(pidl));
-        hr = browser->BrowseToIDList(pidl, SBSP_ABSOLUTE);
-        CoTaskMemFree(pidl);
+        requestedPidl = identity;
+        hr = browser->BrowseToIDList(reinterpret_cast<PCIDLIST_ABSOLUTE>(identity.data()), SBSP_ABSOLUTE);
     }
-    if (FAILED(hr)) {
-        navigating = false;
-        error = hr;
-        app.ShowError(id, hr);
-    }
+    if (FAILED(hr) && navigating)
+        NavigationFailed(hr);
     return hr;
+}
+void ShellView::NavigationFailed(HRESULT result) {
+    bool fallback = usingSavedIdentity && result != E_ABORT && result != HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    usingSavedIdentity = false;
+    requestedPidl.clear();
+    navigating = false;
+    error = result;
+    // 取消不是设备失效；真正失败时不再重复复用旧标识。
+    if (result != E_ABORT && result != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        app.InvalidateLocation(expected);
+    auto location = app.model.locations.find(expected);
+    if (fallback && location != app.model.locations.end() && !location->second.parsingName.empty()) {
+        auto destination = expected;
+        Log(L"Shell 标识导航失败，改用同一位置的系统解析名称重试");
+        Browse(destination, appendHistory, pendingHistoryIndex);
+        return;
+    }
+    Trace(L"NavigationFailed", result);
+    app.ShowError(id, result);
+}
+void ShellView::Retry() {
+    auto *tab = app.model.Find(id);
+    if (!tab)
+        return;
+    auto destination = expected.empty() ? tab->path : expected;
+    auto location = app.model.locations.find(destination);
+    // 没有解析名称的提供程序只能在用户明确重试时再次尝试原标识，不能自动循环。
+    if (location != app.model.locations.end() && location->second.parsingName.empty())
+        location->second.usable = true;
+    app.Navigate(id, destination, appendHistory, pendingHistoryIndex);
 }
 HRESULT ShellView::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     ++app.pasteGeneration;
     if (!requestedPidl.empty() && !ILIsEqual((PCIDLIST_ABSOLUTE)requestedPidl.data(), pidl))
         return E_ABORT;
+    if (!navigating) {
+        usingSavedIdentity = false;
+        pendingHistoryIndex = -1;
+        appendHistory = true;
+        requestedPidl.assign((const BYTE *)pidl, (const BYTE *)pidl + ILGetSize(pidl));
+        ComPtr<IShellItem> item;
+        if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item))))
+            expected = app.RememberLocation(item.Get());
+    }
     Capture();
     navigating = true;
     return S_OK;
@@ -200,14 +236,41 @@ HRESULT ShellView::OnViewCreated(IShellView *v) {
     return S_OK;
 }
 HRESULT ShellView::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
-    if (destroyed || (!requestedPidl.empty() && !ILIsEqual((PCIDLIST_ABSOLUTE)requestedPidl.data(), pidl)))
+    if (destroyed || !navigating || !pidl ||
+        (!requestedPidl.empty() && !ILIsEqual((PCIDLIST_ABSOLUTE)requestedPidl.data(), pidl)))
         return S_OK;
     requestedPidl.clear();
     ComPtr<IShellItem> item;
-    SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item));
-    auto path = ItemName(item.Get());
+    HRESULT result = SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item));
+    if (FAILED(result)) {
+        NavigationFailed(result);
+        return S_OK;
+    }
+    auto path = app.RememberLocation(item.Get());
+    if (path.empty()) {
+        NavigationFailed(E_FAIL);
+        return S_OK;
+    }
     if (!path.empty()) {
+        auto *currentTab = app.model.Find(id);
+        auto previous = currentTab ? app.model.locations.find(currentTab->path) : app.model.locations.end();
+        bool sameLocation =
+            previous != app.model.locations.end() && ValidPidl(previous->second.pidl) &&
+            ILIsEqual(reinterpret_cast<PCIDLIST_ABSOLUTE>(previous->second.pidl.data()), pidl);
+        UINT viewMode = currentTab ? currentTab->viewMode : FVM_DETAILS;
+        int iconSize = currentTab ? currentTab->iconSize : 16;
+        if (auto *tab = app.model.Find(id);
+            tab && pendingHistoryIndex >= 0 && pendingHistoryIndex < (int)tab->history.size())
+            tab->historyIndex = pendingHistoryIndex;
         app.model.Navigate(id, path, appendHistory);
+        // 恢复同一对象时解析名称可能规范化，这不属于切换目录。
+        if (sameLocation && currentTab) {
+            currentTab->viewMode = viewMode;
+            currentTab->iconSize = iconSize;
+        }
+        if (auto *tab = app.model.Find(id);
+            tab && !appendHistory && tab->historyIndex >= 0 && tab->historyIndex < (int)tab->history.size())
+            tab->history[tab->historyIndex] = path;
         app.RefreshMetadata(id, item.Get());
         UpdateNavigation(item.Get());
     }
@@ -215,19 +278,18 @@ HRESULT ShellView::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     error = S_OK;
     expected.clear();
     appendHistory = true;
+    pendingHistoryIndex = -1;
     Trace(L"OnNavigationComplete");
     Apply();
     PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 0);
     return S_OK;
 }
 HRESULT ShellView::OnNavigationFailed(PCIDLIST_ABSOLUTE pidl) {
-    if (!requestedPidl.empty() && pidl && !ILIsEqual((PCIDLIST_ABSOLUTE)requestedPidl.data(), pidl))
+    if (destroyed || !navigating)
         return S_OK;
-    requestedPidl.clear();
-    navigating = false;
-    error = HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
-    Trace(L"OnNavigationFailed", error);
-    PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 1);
+    if (!requestedPidl.empty() && (!pidl || !ILIsEqual((PCIDLIST_ABSOLUTE)requestedPidl.data(), pidl)))
+        return S_OK;
+    NavigationFailed(HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND));
     return S_OK;
 }
 HRESULT ShellView::OnDefaultCommand(IShellView *) {
@@ -237,7 +299,7 @@ HRESULT ShellView::OnDefaultCommand(IShellView *) {
     SFGAOF attr = 0;
     if (items.size() == 1 && SUCCEEDED(items[0]->GetAttributes(SFGAO_FOLDER, &attr)) &&
         (attr & SFGAO_FOLDER)) {
-        auto *r = new NavRequest{id, ItemName(items[0].Get()), false};
+        auto *r = new NavRequest{id, ItemName(items[0].Get()), false, items[0]};
         if (!PostMessageW(app.window, WM_ZEN_NAV, 0, (LPARAM)r))
             delete r;
         return S_OK;
@@ -344,28 +406,33 @@ ComPtr<IShellItem> ShellView::Current() {
     return out;
 }
 void ShellView::UpdateNavigation(IShellItem *item) {
-    navigationPath = ItemName(item);
+    navigationPath = app.RememberLocation(item);
+    addressEditText = navigationPath;
     parentPath.clear();
     breadcrumbs = Breadcrumbs(navigationPath);
     if (!item || navigationPath.empty())
         return;
 
     // 只在导航完成时查询 Shell；重绘和工具栏更新不解析网络路径。
-    ComPtr<IShellItem> parent;
-    if (CanNavigateUp(navigationPath) && SUCCEEDED(item->GetParent(&parent))) {
-        auto path = ItemName(parent.Get());
-        if (!path.empty() && _wcsicmp(path.c_str(), navigationPath.c_str()) != 0)
-            parentPath = std::move(path);
-    }
+    SFGAOF attributes = 0;
     bool filePath =
-        navigationPath.starts_with(L"\\\\") || (navigationPath.size() >= 3 && navigationPath[1] == L':');
+        SUCCEEDED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) && (attributes & SFGAO_FILESYSTEM);
+    auto filesystemPath = filePath ? ItemName(item, SIGDN_FILESYSPATH) : std::wstring{};
+    if (filePath && !filesystemPath.empty())
+        breadcrumbs = Breadcrumbs(filesystemPath);
+    std::vector<ComPtr<IShellItem>> objects;
+    HRESULT identity = ShellHierarchy(item, objects);
+    if (FAILED(identity))
+        Log(L"地址层级不完整 " + ErrorText(identity));
     std::vector<std::pair<std::wstring, std::wstring>> hierarchy;
-    ComPtr<IShellItem> current = item;
-    std::unordered_set<std::wstring> seen;
-    for (size_t depth = 0; current && depth < 256; ++depth) {
-        auto path = ItemName(current.Get());
-        if (path.empty() || !seen.insert(path).second)
+    std::vector<std::wstring> displayHierarchy;
+    for (size_t depth = 0; depth < objects.size(); ++depth) {
+        const auto &current = objects[depth];
+        auto path = app.RememberLocation(current.Get());
+        if (path.empty())
             break;
+        if (depth == 1)
+            parentPath = path;
         const bool driveRoot = path.size() == 3 && path[1] == L':' && path[2] == L'\\';
         auto label =
             ItemName(current.Get(), driveRoot ? SIGDN_NORMALDISPLAY : SIGDN_PARENTRELATIVEFORADDRESSBAR);
@@ -374,29 +441,48 @@ void ShellView::UpdateNavigation(IShellItem *item) {
         if (label.empty())
             label = LocationName(path);
         hierarchy.push_back({label, path});
+        auto display = ItemName(current.Get(), SIGDN_NORMALDISPLAY);
+        displayHierarchy.push_back(display.empty() ? label : display);
         if (filePath) {
             // 保留既定的此电脑、磁盘或服务器/共享层级，只替换系统显示名。
             for (auto &[name, target] : breadcrumbs)
                 if (_wcsicmp(target.c_str(), path.c_str()) == 0)
                     name = label;
         }
-        if (!CanNavigateUp(path))
-            break;
-        ComPtr<IShellItem> next;
-        if (FAILED(current->GetParent(&next)))
-            break;
-        current = std::move(next);
     }
     if (!filePath && !hierarchy.empty()) {
         std::reverse(hierarchy.begin(), hierarchy.end());
         breadcrumbs = std::move(hierarchy);
     }
+    // 显示路径与导航标识分离，不依赖设备名称或特定命名空间 GUID。
+    if (!filesystemPath.empty())
+        addressEditText = filesystemPath;
+    else {
+        addressEditText.clear();
+        for (auto it = displayHierarchy.rbegin(); it != displayHierarchy.rend(); ++it) {
+            if (!addressEditText.empty())
+                addressEditText += L"\\";
+            addressEditText += *it;
+        }
+        if (addressEditText.empty())
+            addressEditText = ItemName(item, SIGDN_NORMALDISPLAY);
+    }
+}
+std::wstring ShellView::AddressEditText() const {
+    auto *tab = app.model.Find(id);
+    if (!tab || tab->path == Home)
+        return {};
+    return tab->path == navigationPath ? addressEditText : app.LocationText(tab->path);
 }
 std::vector<std::pair<std::wstring, std::wstring>> ShellView::AddressParts() const {
     auto *tab = app.model.Find(id);
     if (!tab)
         return {};
-    return tab->path == navigationPath ? breadcrumbs : Breadcrumbs(tab->path);
+    if (tab->path == navigationPath)
+        return breadcrumbs;
+    if (app.model.locations.contains(tab->path))
+        return {{app.LocationText(tab->path), tab->path}};
+    return Breadcrumbs(tab->path);
 }
 bool ShellView::CanUp() const {
     auto *tab = app.model.Find(id);
@@ -489,7 +575,7 @@ HRESULT ShellView::DeletePaths(std::vector<std::wstring> &paths) {
 }
 void ShellView::Capture() {
     auto *t = app.model.Find(id);
-    if (!t || !shell || navigating)
+    if (!t || !shell || navigating || FAILED(error))
         return;
     ComPtr<IFolderView2> f;
     if (SUCCEEDED(shell.As(&f))) {

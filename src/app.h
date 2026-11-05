@@ -10,6 +10,7 @@ struct NavRequest {
     Id id;
     std::wstring path;
     bool newTab = false;
+    ComPtr<IShellItem> item;
 };
 class App {
   public:
@@ -24,6 +25,11 @@ class App {
     void ShowMainMenu(int index);
     ComPtr<IAutoComplete2> addressComplete[2];
     ComPtr<IAutoCompleteDropDown> addressDropDown[2];
+    struct AddressEditSession {
+        Id tab = 0;
+        std::wstring path, text;
+    };
+    AddressEditSession addressSession[2];
     HFONT font{};
     HICON folderIcon{}, computerIcon{}, missingIcon{}, windowLargeIcon{}, windowSmallIcon{};
     UINT dpi = 96;
@@ -36,6 +42,9 @@ class App {
     Model model;
     std::unique_ptr<TabStrip> strips[2];
     std::unordered_map<Id, std::unique_ptr<ShellView>> views;
+    std::wstring RememberLocation(IShellItem *item);
+    void PruneLocations();
+    void InvalidateLocation(const std::wstring &path);
     bool readOnly = false, dirty = false, closing = false, sizing = false, restoring = false;
     int saveFailures = 0;
     ComPtr<IContextMenu2> menu2;
@@ -63,9 +72,13 @@ class App {
     void Save();
     void UpdateStatus();
     void UpdateAddress(int p);
+    std::wstring AddressText(int p) const;
+    std::wstring LocationText(const std::wstring &key) const;
     void BuildMenu();
     void Command(UINT id);
-    void Navigate(Id id, const std::wstring &path, bool append = true);
+    void Navigate(Id id, const std::wstring &path, bool append = true, int historyIndex = -1);
+    PCIDLIST_ABSOLUTE NavigationPidl(const std::wstring &key) const;
+    HRESULT ResolveLocation(const std::wstring &key, std::vector<BYTE> &pidl, bool &savedIdentity) const;
     void Travel(int delta);
     void NewTab(int pane, const std::wstring &path = Home, Id group = 0, int index = -1, Id opener = 0);
     void CloseTabs(int p, const std::vector<Id> &ids, bool group = false);

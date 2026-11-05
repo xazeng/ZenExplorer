@@ -5,13 +5,55 @@
 #include <gdiplus.h>
 #include <iostream>
 #include <fstream>
+#include <wrl/implements.h>
 using namespace zen;
+// 模拟没有文件系统路径且不实现 GetParent 的设备扩展，仅提供有效对象标识。
+class VirtualHierarchyItem final
+    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+                                          IShellItem, IPersistIDList> {
+  public:
+    ComPtr<IShellItem> actual;
+    int parentCalls = 0;
+    HRESULT STDMETHODCALLTYPE BindToHandler(IBindCtx *, REFGUID, REFIID, void **out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetParent(IShellItem **out) override {
+        ++parentCalls;
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayName(SIGDN kind, PWSTR *out) override {
+        *out = nullptr;
+        if (kind == SIGDN_FILESYSPATH || kind == SIGDN_DESKTOPABSOLUTEPARSING)
+            return E_NOTIMPL;
+        return SHStrDupW(L"同名设备目录", out);
+    }
+    HRESULT STDMETHODCALLTYPE GetAttributes(SFGAOF mask, SFGAOF *out) override {
+        *out = mask & SFGAO_FOLDER;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Compare(IShellItem *, SICHINTF, int *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetClassID(CLSID *out) override {
+        *out = CLSID_NULL;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetIDList(PCIDLIST_ABSOLUTE) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetIDList(PIDLIST_ABSOLUTE *out) override {
+        return SHGetIDListFromObject(actual.Get(), out);
+    }
+};
 struct CheckState {
     App *app;
     Id original, background, cached;
     int stage = 0;
     ULONGLONG since = GetTickCount64();
     bool failed = false, busy = false;
+    Id virtualTab = 0;
 };
 static CheckState *state;
 static LRESULT CALLBACK CountLayoutMessages(HWND window, UINT message, WPARAM w, LPARAM l, UINT_PTR,
@@ -31,13 +73,16 @@ static bool Ready(Id id) {
     HWND hwnd = nullptr;
     RECT bounds{}, hostBounds{};
     GetClientRect(view.host, &hostBounds);
-    return SUCCEEDED(view.shell.As(&folder)) && SUCCEEDED(folder->ItemCount(SVGIO_ALLVIEW, &count)) &&
-           count > 0 && SUCCEEDED(view.shell->GetWindow(&hwnd)) && GetClientRect(hwnd, &bounds) &&
+    bool contentReady = state->stage >= 6 && id == state->virtualTab
+                            ? SUCCEEDED(view.error) && !ItemName(view.Current().Get()).empty()
+                            : SUCCEEDED(view.shell.As(&folder)) &&
+                                  SUCCEEDED(folder->ItemCount(SVGIO_ALLVIEW, &count)) && count > 0;
+    return contentReady && SUCCEEDED(view.shell->GetWindow(&hwnd)) && GetClientRect(hwnd, &bounds) &&
            bounds.right > 10 && bounds.bottom > 10 && bounds.right == hostBounds.right &&
            bounds.bottom == hostBounds.bottom && (GetWindowLongPtrW(view.host, GWL_STYLE) & WS_VISIBLE);
 }
 static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
-    if (!state || state->busy || !state->app->window || state->stage >= 6)
+    if (!state || state->busy || !state->app->window || state->stage >= 11)
         return;
     state->busy = true;
     auto &app = *state->app;
@@ -71,7 +116,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         PostMessageW(app.window, WM_CLOSE, 0, 0);
     } else if (Ready(app.model.panes[0].selected) && Ready(app.model.panes[1].selected)) {
         std::cout << "stage " << state->stage << " both panes populated\n";
-        auto id = state->original;
+        auto id = state->stage >= 6 ? state->virtualTab : state->original;
         auto *tab = app.model.Find(id);
         auto checkMode = [&](FOLDERVIEWMODE expected) {
             ComPtr<IFolderView2> folder;
@@ -287,9 +332,20 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             app.Navigate(id, tab->path, false);
         } else if (state->stage == 3) {
             checkMode(FVM_ICON);
-            app.Navigate(id, DataDir().wstring());
+            // 用不可解析的文字配合真实 PIDL，确认导航没有偷偷退回字符串解析。
+            auto destination = ParseItem(DataDir().wstring());
+            auto key = app.RememberLocation(destination.Get());
+            if (key.empty())
+                state->failed = true;
+            else {
+                auto alias = L"ZenExplorer-test-unparseable-shell-location";
+                app.model.locations[alias] = app.model.locations.at(key);
+                app.Navigate(id, alias);
+            }
             app.Navigate(app.model.panes[0].selected, DataDir().wstring());
         } else if (state->stage == 4) {
+            if (ItemName(app.views.at(id)->Current().Get()) != DataDir().wstring())
+                state->failed = true;
             checkMode(FVM_DETAILS);
             setIcons();
             app.EditAddress(0);
@@ -299,7 +355,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             SendMessageW(app.address[0], WM_KEYDOWN, VK_RETURN, 0);
             app.Activate(1, id);
             app.Travel(-1);
-        } else {
+        } else if (state->stage == 5) {
             if (app.model.Find(app.model.panes[0].selected)->path != Home)
                 state->failed = true;
             checkMode(FVM_DETAILS);
@@ -447,6 +503,135 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             std::cout << "resource cycles=32 user before=" << userBefore
                       << " after=" << GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS)
                       << " refs=" << refsAfter << "\n";
+            // 非手机的系统虚拟位置也必须使用可读编辑文字。
+            app.NewTab(1, L"::{21EC2020-3AEA-1069-A2DD-08002B30309D}");
+            state->virtualTab = app.model.panes[1].selected;
+        } else if (state->stage == 6) {
+            int pane = app.model.PaneOf(id);
+            auto &view = *app.views.at(id);
+            auto before = tab->path;
+            auto history = tab->history;
+            auto text = app.AddressText(pane);
+            auto parts = view.AddressParts();
+            if (parts.size() < 2 || text.find(L'\\') == std::wstring::npos)
+                state->failed = true;
+            for (const auto &[label, path] : parts)
+                if (label.empty() || !app.NavigationPidl(path))
+                    state->failed = true;
+            // 同一解析名称若对应不同对象，不能覆盖原来的层级标识。
+            auto savedIdentity = app.model.locations.at(before);
+            app.model.locations[before] = app.model.locations.at(Home);
+            auto distinct = app.RememberLocation(view.Current().Get());
+            if (distinct == before || !distinct.starts_with(L"zen-shell:"))
+                state->failed = true;
+            app.model.locations[before] = std::move(savedIdentity);
+            app.PruneLocations();
+            if (text.empty() || text == before || text.find(L"::{") != std::wstring::npos)
+                state->failed = true;
+            app.EditAddress(pane);
+            if (WindowText(app.address[pane]) != text)
+                state->failed = true;
+            SendMessageW(app.address[pane], WM_KEYDOWN, VK_RETURN, 0);
+            if (view.navigating || tab->path != before || tab->history != history ||
+                (GetWindowLongPtrW(app.address[pane], GWL_STYLE) & WS_VISIBLE))
+                state->failed = true;
+            app.EditAddress(pane);
+            SetWindowTextW(app.address[pane], L"unsubmitted virtual path");
+            SendMessageW(app.address[pane], WM_KEYDOWN, VK_ESCAPE, 0);
+            if (tab->path != before)
+                state->failed = true;
+            // 历史仅有不可解析别名时，仍必须从运行期缓存找回对象。
+            auto alias = L"ZenExplorer-runtime-history-target";
+            app.model.locations[alias] = app.model.locations.at(before);
+            tab->history[tab->historyIndex] = alias;
+            app.Navigate(id, DataDir().wstring());
+        } else if (state->stage == 7) {
+            if (tab->path != DataDir().wstring() ||
+                !app.NavigationPidl(L"ZenExplorer-runtime-history-target"))
+                state->failed = true;
+            app.Travel(-1);
+        } else if (state->stage == 8) {
+            if (app.AddressText(1).empty() || tab->path == DataDir().wstring() ||
+                app.views.at(id)->error != S_OK)
+                state->failed = true;
+            app.Travel(1);
+        } else if (state->stage == 9) {
+            if (tab->path != DataDir().wstring())
+                state->failed = true;
+            if (!app.NavigationPidl(DataDir().parent_path().wstring()))
+                state->failed = true;
+            auto parts = app.views.at(id)->AddressParts();
+            if (parts.size() < 3 || parts.front().second != Home || parts.back().second != tab->path)
+                state->failed = true;
+            app.views.at(id)->Up();
+        } else {
+            if (tab->path != DataDir().parent_path().wstring())
+                state->failed = true;
+            // 解析失败、历史失败和迟到回调不得改变已提交的目录及历史。
+            auto &view = *app.views.at(id);
+            auto originalHistory = tab->history;
+            int originalIndex = tab->historyIndex;
+            auto originalPath = tab->path;
+            auto missing = (DataDir() / L"missing-navigation-target").wstring();
+            app.Navigate(id, missing);
+            if (SUCCEEDED(view.error) || tab->path != originalPath || tab->history != originalHistory ||
+                tab->historyIndex != originalIndex)
+                state->failed = true;
+            tab->history.insert(tab->history.begin() + tab->historyIndex, missing);
+            ++tab->historyIndex;
+            auto failedHistory = tab->history;
+            int failedIndex = tab->historyIndex;
+            app.Travel(-1);
+            if (SUCCEEDED(view.error) || tab->path != originalPath || tab->history != failedHistory ||
+                tab->historyIndex != failedIndex)
+                state->failed = true;
+            tab->history = originalHistory;
+            tab->historyIndex = originalIndex;
+            auto targetItem = ParseItem(DataDir().wstring());
+            auto targetPath = app.RememberLocation(targetItem.Get());
+            auto identity = app.model.locations.at(targetPath);
+            auto targetId = reinterpret_cast<PCIDLIST_ABSOLUTE>(identity.pidl.data());
+            view.OnNavigationPending(targetId);
+            auto unrelated = app.NavigationPidl(Home);
+            view.OnNavigationFailed(unrelated);
+            if (!view.navigating)
+                state->failed = true;
+            view.OnNavigationFailed(targetId);
+            view.OnNavigationComplete(targetId); // 失败后迟到的成功回调必须被忽略。
+            if (view.navigating || SUCCEEDED(view.error) || tab->path != originalPath ||
+                tab->history != originalHistory || app.NavigationPidl(targetPath))
+                state->failed = true;
+            app.RememberLocation(targetItem.Get());
+            if (!app.NavigationPidl(targetPath))
+                state->failed = true;
+            view.error = S_OK;
+            view.expected.clear();
+            view.pendingHistoryIndex = -1;
+            view.appendHistory = true;
+            // 最近关闭引用保留标识，清空记录后则回收，无需保留 COM 对象。
+            auto recent = app.model.recent;
+            auto alias = L"ZenExplorer-runtime-recent-target";
+            app.model.locations[alias] = app.model.locations.at(tab->path);
+            Id closed = app.model.Add(0, alias, 0, -1, false);
+            app.CloseTabs(0, {closed});
+            if (!app.NavigationPidl(alias))
+                state->failed = true;
+            app.model.recent = recent;
+            app.PruneLocations();
+            if (app.NavigationPidl(alias))
+                state->failed = true;
+            auto home = tab->home;
+            app.model.locations[alias] = app.model.locations.at(tab->path);
+            tab->home = alias;
+            app.PruneLocations();
+            if (!app.NavigationPidl(alias))
+                state->failed = true;
+            tab->home = home;
+            app.PruneLocations();
+            if (app.NavigationPidl(alias))
+                state->failed = true;
+            app.Activate(1, state->original);
+            app.CloseTabs(1, {id});
             PostMessageW(app.window, WM_CLOSE, 0, 0);
         }
         ++state->stage;
@@ -466,10 +651,39 @@ int main() {
     Id background = model.Add(1, Home, 0, -1, false);
     Id cached = model.Add(1, (dir / L"not-present").wstring(), 0, -1, false);
     model.Find(cached)->displayName = L"离线目录显示名称";
-    if (!SaveModel(model, ConfigDir() / L"session.dat"))
-        return 1;
     if (FAILED(OleInitialize(nullptr)))
         return 1;
+    // 模拟没有可解析文字的设备位置：重启恢复必须使用落盘的对象标识。
+    PIDLIST_ABSOLUTE homePidl = nullptr;
+    if (FAILED(SHParseDisplayName(Home, nullptr, &homePidl, 0, nullptr)))
+        return 1;
+    std::wstring restoreKey = L"zen-shell:restore-without-parsing-name";
+    auto &savedLocation = model.locations[restoreKey];
+    savedLocation.displayName = L"此电脑";
+    savedLocation.pidl.assign(reinterpret_cast<BYTE *>(homePidl),
+                              reinterpret_cast<BYTE *>(homePidl) + ILGetSize(homePidl));
+    CoTaskMemFree(homePidl);
+    model.Find(original)->path = restoreKey;
+    model.Find(original)->history = {restoreKey};
+    if (!SaveModel(model, ConfigDir() / L"session.dat"))
+        return 1;
+    {
+        App resolver;
+        bool recovered = false, future = false;
+        if (!LoadModel(resolver.model, ConfigDir() / L"session.dat", recovered, future))
+            return 1;
+        std::vector<BYTE> identity;
+        bool saved = false;
+        if (FAILED(resolver.ResolveLocation(restoreKey, identity, saved)) || !saved)
+            return 1;
+        resolver.InvalidateLocation(restoreKey);
+        if (SUCCEEDED(resolver.ResolveLocation(restoreKey, identity, saved)))
+            return 1;
+        // 标识失效后仅通过保存的系统解析名称回退，不解析内部引用或显示名称。
+        resolver.model.locations.at(restoreKey).parsingName = Home;
+        if (FAILED(resolver.ResolveLocation(restoreKey, identity, saved)) || saved || !ValidPidl(identity))
+            return 1;
+    }
     // 使用系统枚举器确认本地目录可提供补全候选。
     std::filesystem::create_directories(dir / L"candidate-folder");
     auto childrenRoot = dir / L"breadcrumb-children";
@@ -487,6 +701,15 @@ int main() {
         return 1;
     if (FAILED(ChildFolders(Home, children)) || children.empty())
         return 1;
+    auto virtualItem = Microsoft::WRL::Make<VirtualHierarchyItem>();
+    virtualItem->actual = ParseItem((childrenRoot / L"folder2").wstring());
+    std::vector<ComPtr<IShellItem>> hierarchy;
+    if (FAILED(ShellHierarchy(virtualItem.Get(), hierarchy)) || hierarchy.size() < 3 ||
+        virtualItem->parentCalls != 0 || ItemName(hierarchy.back().Get()) != Home ||
+        !ItemName(virtualItem.Get(), SIGDN_FILESYSPATH).empty())
+        return 1;
+    hierarchy.clear();
+    virtualItem.Reset();
     ComPtr<IACList2> candidates;
     ComPtr<IEnumString> strings;
     bool foundCandidate = false;
@@ -520,7 +743,7 @@ int main() {
         app.Run(GetModuleHandleW(nullptr), SW_HIDE, L"");
         KillTimer(nullptr, timer);
         state = nullptr;
-        failed = check.failed || check.stage != 6;
+        failed = check.failed || check.stage != 11;
     }
     Gdiplus::GdiplusShutdown(token);
     OleUninitialize();

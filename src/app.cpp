@@ -91,7 +91,12 @@ static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR
             auto text = WindowText(w);
             ShowWindow(w, SW_HIDE);
             ShowWindow(app->crumb[p], SW_SHOW);
-            app->Navigate(app->model.panes[p].selected, text.empty() ? Home : text);
+            const auto &session = app->addressSession[p];
+            auto *tab = app->model.Find(app->model.panes[p].selected);
+            if (tab && tab->id == session.tab && tab->path == session.path && text == session.text)
+                app->Activate(p, 0, true);
+            else
+                app->Navigate(app->model.panes[p].selected, text.empty() ? Home : text);
             return 0;
         }
         if (a == VK_ESCAPE) {
@@ -105,8 +110,7 @@ static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR
         PostMessageW(w, WM_APP + 101, 0, 0);
     if (m == WM_APP + 101 && GetFocus() != w && !candidatesVisible()) {
         // 延迟到系统候选列表处理失焦后再判断，避免点击候选时提前取消。
-        if (auto *tab = app->model.Find(app->model.panes[p].selected))
-            SetWindowTextW(w, tab->path == Home ? L"" : tab->path.c_str());
+        SetWindowTextW(w, app->AddressText(p).c_str());
         ShowWindow(w, SW_HIDE);
         ShowWindow(app->crumb[p], SW_SHOW);
     }
@@ -125,8 +129,16 @@ struct CrumbData {
     std::vector<Link> links;
 };
 static void ShowCrumbFolders(HWND owner, App &app, int pane, Id tab, const CrumbData::Link &link) {
-    std::vector<std::pair<std::wstring, std::wstring>> folders;
-    HRESULT hr = ChildFolders(link.path, folders);
+    std::vector<ComPtr<IShellItem>> folders;
+    ComPtr<IShellItem> parent;
+    std::vector<BYTE> identity;
+    bool saved = false;
+    HRESULT hr = app.ResolveLocation(link.path, identity, saved);
+    if (SUCCEEDED(hr))
+        hr = SHCreateItemFromIDList(reinterpret_cast<PCIDLIST_ABSOLUTE>(identity.data()),
+                                    IID_PPV_ARGS(&parent));
+    if (SUCCEEDED(hr))
+        hr = ChildFolderItems(parent.Get(), folders);
     if (FAILED(hr)) {
         Report(app.window, L"无法读取子文件夹。", hr);
         return;
@@ -136,7 +148,7 @@ static void ShowCrumbFolders(HWND owner, App &app, int pane, Id tab, const Crumb
         return;
     for (size_t i = 0; i < folders.size(); ++i) {
         std::wstring label;
-        for (wchar_t c : folders[i].first) {
+        for (wchar_t c : ItemName(folders[i].Get(), SIGDN_NORMALDISPLAY)) {
             label += c;
             if (c == L'&')
                 label += c;
@@ -152,7 +164,10 @@ static void ShowCrumbFolders(HWND owner, App &app, int pane, Id tab, const Crumb
     DestroyMenu(menu);
     if (chosen && chosen <= folders.size() && app.model.panes[pane].selected == tab && app.model.Find(tab)) {
         app.Activate(pane);
-        app.Navigate(tab, folders[chosen - 1].second);
+        auto path = app.RememberLocation(folders[chosen - 1].Get());
+        if (!path.empty()) {
+            app.Navigate(tab, path);
+        }
     }
 }
 static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
@@ -381,8 +396,8 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
     instance = h;
     std::error_code ec;
     std::filesystem::create_directories(ConfigDir(), ec);
-    bool recovered = false, future = false;
-    LoadModel(model, ConfigDir() / L"session.dat", recovered, future);
+    bool recovered = false, future = false, obsolete = false;
+    LoadModel(model, ConfigDir() / L"session.dat", recovered, future, &obsolete);
     readOnly = future;
     // 恢复后确保当前标签可见。
     for (int p = 0; p < 2; ++p)
@@ -463,6 +478,9 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
         auto corrupt = ConfigDir() / L"session.corrupt";
         MoveFileExW((ConfigDir() / L"session.dat").c_str(), corrupt.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
+    if (obsolete)
+        MessageBoxW(window, L"会话格式已更新，旧版标签、分组和历史不再读取。本次已重置为默认会话。",
+                    L"ZenExplorer", MB_OK | MB_ICONINFORMATION);
     if (future)
         MessageBoxW(window, L"配置来自较新版本。本次使用默认会话且不会覆盖原配置。", L"ZenExplorer",
                     MB_OK | MB_ICONWARNING);
@@ -751,6 +769,11 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
     case WM_ZEN_NAV: {
         std::unique_ptr<NavRequest> r((NavRequest *)b);
         if (model.Find(r->id)) {
+            if (r->item) {
+                r->path = RememberLocation(r->item.Get());
+                if (r->path.empty())
+                    return 0;
+            }
             if (r->newTab) {
                 int p = model.PaneOf(r->id);
                 auto *t = model.Find(r->id);
@@ -783,8 +806,11 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         } else if (LOWORD(a) == 500 || LOWORD(a) == 501) {
             int p = LOWORD(a) - 500;
             auto *t = model.Find(model.panes[p].selected);
-            if (t)
-                Navigate(t->id, t->path);
+            if (t) {
+                auto view = views.find(t->id);
+                if (view != views.end())
+                    view->second->Retry();
+            }
         } else
             Command(LOWORD(a));
         return 0;
@@ -1086,6 +1112,7 @@ void App::Activate(int p, Id id, bool focus) {
     }
 }
 void App::Changed() {
+    PruneLocations();
     if (!readOnly)
         dirty = true;
 }
@@ -1110,12 +1137,31 @@ void App::Save() {
                         MB_OK | MB_ICONWARNING);
     }
 }
+std::wstring App::AddressText(int p) const {
+    if (p < 0 || p > 1)
+        return {};
+    auto *tab = model.Find(model.panes[p].selected);
+    if (!tab || tab->path == Home)
+        return {};
+    auto view = views.find(tab->id);
+    return view != views.end() ? view->second->AddressEditText() : LocationText(tab->path);
+}
+std::wstring App::LocationText(const std::wstring &key) const {
+    if (key == Home)
+        return L"此电脑";
+    // 已有完整磁盘/UNC 地址保留全路径；尚未加载的虚拟位置使用保存的可读名称。
+    if ((key.size() > 2 && key[1] == L':') || key.starts_with(L"\\\\"))
+        return key;
+    auto found = model.locations.find(key);
+    return found != model.locations.end() && !found->second.displayName.empty() ? found->second.displayName
+                                                                                : LocationName(key);
+}
 void App::UpdateAddress(int p) {
     auto *t = model.Find(model.panes[p].selected);
     if (!t)
         return;
     if (GetFocus() != address[p])
-        SetWindowTextW(address[p], t->path == Home ? L"" : t->path.c_str());
+        SetWindowTextW(address[p], AddressText(p).c_str());
     InvalidateRect(crumb[p], nullptr, FALSE);
 }
 void App::EditAddress(int p) {
@@ -1127,13 +1173,110 @@ void App::EditAddress(int p) {
     }
     Activate(p);
     UpdateAddress(p);
+    // 隐藏的编辑框可能仍保留焦点；开始新编辑会话时始终取当前标签文字。
+    SetWindowTextW(address[p], AddressText(p).c_str());
+    if (auto *tab = model.Find(model.panes[p].selected))
+        addressSession[p] = {tab->id, tab->path, WindowText(address[p])};
     ShowWindow(address[p], SW_SHOW);
     SetWindowPos(address[p], HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     InvalidateRect(crumb[p], nullptr, FALSE);
     SetFocus(address[p]);
     SendMessageW(address[p], EM_SETSEL, 0, -1);
 }
-void App::Navigate(Id id, const std::wstring &path, bool append) {
+std::wstring App::RememberLocation(IShellItem *item) {
+    if (!item)
+        return {};
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    HRESULT hr = SHGetIDListFromObject(item, &pidl);
+    if (FAILED(hr) || !pidl) {
+        Report(window, L"无法获取目录的 Shell 标识", FAILED(hr) ? hr : E_FAIL);
+        return {};
+    }
+    ShellLocation target;
+    target.parsingName = ItemName(item);
+    target.displayName = ItemName(item, SIGDN_NORMALDISPLAY);
+    auto key = target.parsingName;
+    target.pidl.assign((BYTE *)pidl, (BYTE *)pidl + ILGetSize(pidl));
+    CoTaskMemFree(pidl);
+    auto existing = model.locations.find(key);
+    bool collision = existing != model.locations.end() && !existing->second.pidl.empty() &&
+                     existing->second.usable &&
+                     !ILIsEqual(reinterpret_cast<PCIDLIST_ABSOLUTE>(existing->second.pidl.data()),
+                                reinterpret_cast<PCIDLIST_ABSOLUTE>(target.pidl.data()));
+    if (key.empty() || collision) {
+        // 名称缺失或不同对象返回同名时，以真实标识区分，避免父子层级互相覆盖。
+        key = L"zen-shell:";
+        constexpr wchar_t digits[] = L"0123456789abcdef";
+        for (BYTE b : target.pidl) {
+            key += digits[b >> 4];
+            key += digits[b & 15];
+        }
+    }
+    model.locations[key] = std::move(target);
+    return key;
+}
+PCIDLIST_ABSOLUTE App::NavigationPidl(const std::wstring &key) const {
+    auto location = model.locations.find(key);
+    return location != model.locations.end() && location->second.usable && ValidPidl(location->second.pidl)
+               ? reinterpret_cast<PCIDLIST_ABSOLUTE>(location->second.pidl.data())
+               : nullptr;
+}
+HRESULT App::ResolveLocation(const std::wstring &key, std::vector<BYTE> &pidl, bool &savedIdentity) const {
+    pidl.clear();
+    savedIdentity = false;
+    if (key.empty())
+        return E_INVALIDARG;
+    if (auto saved = NavigationPidl(key)) {
+        pidl.assign(reinterpret_cast<const BYTE *>(saved),
+                    reinterpret_cast<const BYTE *>(saved) + ILGetSize(saved));
+        savedIdentity = true;
+        return S_OK;
+    }
+    auto location = model.locations.find(key);
+    auto name = location == model.locations.end() ? key : location->second.parsingName;
+    if (name.empty() || name.starts_with(L"zen-shell:"))
+        return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    PIDLIST_ABSOLUTE parsed = nullptr;
+    HRESULT hr = SHParseDisplayName(name.c_str(), nullptr, &parsed, 0, nullptr);
+    if (SUCCEEDED(hr) && parsed)
+        pidl.assign(reinterpret_cast<const BYTE *>(parsed),
+                    reinterpret_cast<const BYTE *>(parsed) + ILGetSize(parsed));
+    CoTaskMemFree(parsed);
+    return SUCCEEDED(hr) && !ValidPidl(pidl) ? E_FAIL : hr;
+}
+void App::PruneLocations() {
+    std::set<std::wstring> retained(model.recent.begin(), model.recent.end());
+    for (const auto &pane : model.panes)
+        for (const auto &tab : pane.tabs) {
+            retained.insert(tab.path);
+            retained.insert(tab.home);
+            retained.insert(tab.history.begin(), tab.history.end());
+        }
+    for (const auto &[id, view] : views) {
+        retained.insert(view->expected);
+        for (const auto &[label, path] : view->AddressParts())
+            retained.insert(path);
+    }
+    std::erase_if(model.locations, [&](const auto &pair) { return !retained.contains(pair.first); });
+}
+void App::InvalidateLocation(const std::wstring &path) {
+    auto found = model.locations.find(path);
+    if (found == model.locations.end() || !ValidPidl(found->second.pidl))
+        return;
+    auto invalid = found->second.pidl;
+    auto matches = [&](const std::vector<BYTE> &bytes) {
+        if (!ValidPidl(bytes))
+            return false;
+        auto parent = reinterpret_cast<PCIDLIST_ABSOLUTE>(invalid.data());
+        auto child = reinterpret_cast<PCIDLIST_ABSOLUTE>(bytes.data());
+        return ILIsEqual(parent, child) || ILIsParent(parent, child, FALSE);
+    };
+    for (auto &[key, location] : model.locations)
+        if (matches(location.pidl))
+            location.usable = false;
+    Log(L"导航失败，目标及下级标识已标记失效");
+}
+void App::Navigate(Id id, const std::wstring &path, bool append, int historyIndex) {
     ++pasteGeneration;
     auto *t = model.Find(id);
     if (!t || path.empty())
@@ -1141,12 +1284,9 @@ void App::Navigate(Id id, const std::wstring &path, bool append) {
     EnsureView(id);
     auto it = views.find(id);
     if (it != views.end()) {
-        // 先保存旧视图，再应用地址改变时的模式重置，避免旧模式覆盖新状态。
+        // 已提交位置保持不变，直到 Shell 报告导航成功。
         it->second->Capture();
-        model.Navigate(id, path, append);
-        RefreshLocalIcon(id);
-        Changed();
-        it->second->Browse(path, false);
+        it->second->Browse(path, append, historyIndex);
         Layout();
     }
 }
@@ -1156,9 +1296,8 @@ void App::Travel(int delta) {
         return;
     int next = t->historyIndex + delta;
     if (next >= 0 && next < (int)t->history.size()) {
-        t->historyIndex = next;
         auto path = t->history[next];
-        Navigate(t->id, path, false);
+        Navigate(t->id, path, false, next);
     }
 }
 void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener) {
@@ -1174,6 +1313,7 @@ void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener
 void App::SyncViews(int pane) {
     ResourceTrace trace(L"清理标签资源");
     std::erase_if(views, [&](auto &pair) { return !model.Find(pair.first); });
+    PruneLocations();
     std::erase_if(icons, [&](auto &pair) {
         if (model.Find(pair.first))
             return false;
@@ -1398,8 +1538,7 @@ void App::BuildMenu() {
     HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近关闭目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
-        AppendMenuW(file, MF_STRING, RecentBase + i,
-                    model.recent[i] == Home ? L"此电脑" : model.recent[i].c_str());
+        AppendMenuW(file, MF_STRING, RecentBase + i, LocationText(model.recent[i]).c_str());
     if (model.recent.empty())
         AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
@@ -1738,7 +1877,10 @@ void App::OpenSelected(ShellView &v, bool newTab) {
         i->GetAttributes(SFGAO_FOLDER, &attr);
         if (!(attr & SFGAO_FOLDER))
             return;
-        paths.push_back(ItemName(i.Get()));
+        auto key = RememberLocation(i.Get());
+        if (key.empty())
+            return;
+        paths.push_back(std::move(key));
     }
     if (paths.empty())
         return;
@@ -1748,11 +1890,13 @@ void App::OpenSelected(ShellView &v, bool newTab) {
     }
     int p = model.PaneOf(v.id), index = model.Index(p, v.id) + 1;
     Id group = model.Find(v.id)->group, first = 0;
-    for (auto &s : paths) {
-        Id id = model.Add(p, s, group, index++, false, v.id);
+    for (size_t i = 0; i < paths.size(); ++i) {
+        Id id = model.Add(p, paths[i], group, index++, false, v.id);
         if (!first)
             first = id;
     }
+    if (!first)
+        return;
     if (group)
         model.SetGroupCollapsed(p, group, false);
     Activate(p, first);

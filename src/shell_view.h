@@ -21,9 +21,12 @@ class ShellView : public IExplorerBrowserEvents,
     bool browserSized = false;
     RECT browserBounds{};
     std::vector<BYTE> requestedPidl;
+    bool usingSavedIdentity = false;
     std::wstring navigationPath, parentPath;
+    std::wstring addressEditText;
     std::vector<std::pair<std::wstring, std::wstring>> breadcrumbs;
     void UpdateNavigation(IShellItem *item);
+    void NavigationFailed(HRESULT result);
 
   public:
     App &app;
@@ -34,11 +37,13 @@ class ShellView : public IExplorerBrowserEvents,
     bool navigating = false;
     std::wstring expected;
     bool appendHistory = true;
+    int pendingHistoryIndex = -1;
     HRESULT error = S_OK;
     ShellView(App &, Id);
     ~ShellView();
     HRESULT Create(HWND parent, RECT bounds);
-    HRESULT Browse(const std::wstring &, bool append = true);
+    HRESULT Browse(const std::wstring &, bool append = true, int historyIndex = -1);
+    void Retry();
     void Destroy();
     void Capture();
     void Apply();
@@ -52,6 +57,7 @@ class ShellView : public IExplorerBrowserEvents,
     void Up();
     bool CanUp() const;
     std::vector<std::pair<std::wstring, std::wstring>> AddressParts() const;
+    std::wstring AddressEditText() const;
     std::vector<ComPtr<IShellItem>> Selected();
     ComPtr<IDataObject> SelectedData();
     // 删除只快照文件系统路径；S_FALSE 表示没有选中项，失败时不返回部分项目。

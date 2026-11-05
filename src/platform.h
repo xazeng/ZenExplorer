@@ -53,6 +53,10 @@ HICON SystemImageIcon(int index, int size);
 std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstring &path);
 // 按需枚举 Shell 直属子目录；失败不返回部分列表，不读取文件内容。
 HRESULT ChildFolders(const std::wstring &path, std::vector<std::pair<std::wstring, std::wstring>> &out);
+HRESULT ChildFolderItems(IShellItem *parent, std::vector<ComPtr<IShellItem>> &out);
+// 由完整 PIDL 生成当前项到此电脑/桌面的层级，不依赖扩展的 GetParent。
+HRESULT ShellHierarchy(IShellItem *item, std::vector<ComPtr<IShellItem>> &out);
+bool ValidPidl(const std::vector<BYTE> &bytes);
 bool Confirm(HWND owner, const std::wstring &text);
 std::optional<std::wstring> Input(HWND owner, const std::wstring &title, const std::wstring &value,
                                   const std::wstring &hint = L"");

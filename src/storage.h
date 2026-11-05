@@ -54,5 +54,6 @@ std::vector<uint8_t> ReadEnvelope(const std::filesystem::path &, uint32_t magic,
 // 配置写到指定路径，最近关闭和各标签导航历史写到 DataDir()/history。
 // 配置引用同代历史，保存失败不提交配置；读取失败尝试完整备份配对。
 bool SaveModel(const Model &, const std::filesystem::path &);
-bool LoadModel(Model &, const std::filesystem::path &, bool &recovered, bool &future);
+bool LoadModel(Model &, const std::filesystem::path &, bool &recovered, bool &future,
+               bool *obsolete = nullptr);
 } // namespace zen

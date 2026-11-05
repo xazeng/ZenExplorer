@@ -116,7 +116,7 @@ static void CheckSingleExpandedGroups() {
     m.MoveGroup(0, ga, 1, 1);
     CHECK(!m.FindGroup(1, ga)->collapsed && m.FindGroup(1, gr)->collapsed);
 
-    // v2 保存开关；便携 v1 没有开关字段，默认启用并保留当前标签组。
+    // 当前格式保存开关；旧格式明确拒绝，不迁移。
     m.SetSingleExpandedGroup(false);
     m.SetGroupCollapsed(1, gr, false);
     m.panes[1].selected = a;
@@ -126,20 +126,13 @@ static void CheckSingleExpandedGroups() {
     bool recovered = false, future = false;
     CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
     CHECK(loaded.groupDoubleClick);
-    auto bytes = ReadEnvelope(file, 0x434E455A, 5);
-    bytes.resize(bytes.size() - sizeof(bool));
-    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 4));
-    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.groupDoubleClick);
-    bytes.resize(bytes.size() - sizeof(UINT));
-    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 3));
-    CHECK(LoadModel(loaded, file, recovered, future) && loaded.windowDpi == 0);
-    bytes.resize(bytes.size() - (m.panes[0].groups.size() + m.panes[1].groups.size()) * sizeof(Id));
-    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 2));
-    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
-    bytes.resize(bytes.size() - sizeof(bool));
-    CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, 1));
-    CHECK(LoadModel(loaded, file, recovered, future) && loaded.singleExpandedGroup);
-    CHECK(!loaded.FindGroup(1, ga)->collapsed && loaded.FindGroup(1, gr)->collapsed);
+    auto bytes = ReadEnvelope(file, 0x434E455A, 6);
+    for (uint32_t version = 1; version < 6; ++version) {
+        CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, version));
+        bool obsolete = false;
+        CHECK(!LoadModel(loaded, file, recovered, future, &obsolete));
+        CHECK(obsolete && !recovered && !future);
+    }
 }
 static void CheckGroupSelectionMemory() {
     Model m;
@@ -218,6 +211,35 @@ static void CheckGroupColors() {
     CHECK(LoadModel(loaded, file, recovered, future));
     CHECK(loaded.FindGroup(0, groups[2])->color == RGB(1, 2, 3));
     CHECK(loaded.FindGroup(0, available)->color == GroupColors[2].color);
+}
+static void CheckLocationStorage() {
+    Model m;
+    auto id = m.panes[0].selected;
+    std::wstring key = L"zen-shell:device-folder";
+    ShellLocation location{L"", L"内部存储设备", {2, 0, 0, 0}, false};
+    m.locations[key] = location;
+    auto *tab = m.Find(id);
+    tab->path = tab->home = key;
+    tab->name = L"手机";
+    tab->history = {Home, key};
+    tab->historyIndex = 1;
+    m.recent = {key};
+    auto file = ConfigDir() / L"locations.dat";
+    CHECK(SaveModel(m, file));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future));
+    CHECK(loaded.Find(id)->path == key && loaded.Find(id)->home == key);
+    CHECK(loaded.Find(id)->history == tab->history && loaded.recent == m.recent);
+    CHECK(loaded.locations.at(key).pidl == location.pidl);
+    CHECK(loaded.locations.at(key).displayName == location.displayName);
+    CHECK(loaded.locations.at(key).parsingName.empty() && loaded.locations.at(key).usable);
+    CHECK(ValidPidl({0, 0}) && !ValidPidl({0}) && !ValidPidl({1, 0, 0, 0}));
+    CHECK(!ValidPidl({2, 0}) && !ValidPidl({0, 0, 0, 0}));
+    m.locations[key].pidl = {255, 255, 0, 0};
+    CHECK(!SaveModel(m, file));
+    CHECK(LoadModel(loaded, file, recovered, future) && !recovered);
+    CHECK(loaded.locations.at(key).pidl == location.pidl);
 }
 int main() {
     auto portable =
@@ -401,7 +423,7 @@ int main() {
         CHECK(!LoadModel(legacy, fixture, recovered, future) && !future && !recovered);
 
         // 历史丢失时必须恢复同一代配置和历史，不能与其他快照混用。
-        auto configBytes = ReadEnvelope(file, 0x434E455A, 5);
+        auto configBytes = ReadEnvelope(file, 0x434E455A, 6);
         Reader configReader{configBytes};
         auto generation = configReader.Pod<GUID>();
         wchar_t generationName[40]{};
@@ -430,7 +452,7 @@ int main() {
         CHECK(h != INVALID_HANDLE_VALUE);
         SetFilePointer(h, 4, nullptr, FILE_BEGIN);
         DWORD written = 0;
-        uint32_t version = 6;
+        uint32_t version = 7;
         CHECK(WriteFile(h, &version, sizeof(version), &written, nullptr) && written == sizeof(version));
         CloseHandle(h);
         CHECK(!LoadModel(loaded, file, recovered, future) && future && !recovered);
@@ -448,6 +470,7 @@ int main() {
         std::filesystem::remove(file);
         std::filesystem::remove(backup);
         CHECK(m.Find(d) != nullptr);
+        CheckLocationStorage();
         CheckSingleExpandedGroups();
         CheckGroupColors();
         CheckGroupSelectionMemory();

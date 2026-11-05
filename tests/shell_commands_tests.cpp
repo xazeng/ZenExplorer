@@ -16,6 +16,7 @@ static bool probeCode = false, probeFolder = false;
 static ComPtr<IDataObject> originalClipboard;
 static int stage = 0;
 static Id openedFrom = 0;
+static int backHistory = -1;
 static std::filesystem::path feedbackResult;
 static TaskItems feedbackItems;
 static bool awaitingRename = false;
@@ -511,14 +512,18 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             SetFocus(view.host);
             app->model.active = 1; // 真实焦点必须纠正活动栏，不能后退右栏。
             auto rightPath = app->model.Find(app->model.panes[1].selected)->path;
-            if (!app->Key(back) || tab->historyIndex != history - 1 || tab->path != previous ||
+            backHistory = history - 1;
+            if (!app->Key(back) ||
+                (view.navigating ? view.pendingHistoryIndex != backHistory || view.expected != previous
+                                 : tab->historyIndex != backHistory || tab->path != previous) ||
                 app->model.Find(app->model.panes[1].selected)->path != rightPath)
                 Fail("Backspace did not navigate focused pane history");
             SetKeyboardState(original);
             stage = 15;
             since = GetTickCount64();
         } else if (stage == 15) {
-            if (app->model.Find(id)->path != (base / L"files").wstring())
+            if (app->model.Find(id)->path != (base / L"files").wstring() ||
+                app->model.Find(id)->historyIndex != backHistory)
                 Fail("Backspace used parent directory instead of history");
             PIDLIST_ABSOLUTE folder = nullptr;
             if (FAILED(SHParseDisplayName((base / L"files" / L"renamed-folder").c_str(), nullptr, &folder, 0,
