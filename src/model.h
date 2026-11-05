@@ -1,14 +1,8 @@
 #pragma once
-#include "platform.h"
+#include "navigation.h"
 #include <unordered_map>
 namespace zen {
 using Id = uint64_t;
-// 标签、历史和最近关闭记录以键引用同一位置，显示名称不承担导航身份。
-struct ShellLocation {
-    std::wstring parsingName, displayName;
-    std::vector<BYTE> pidl;
-    bool usable = true; // 仅本次运行的失效状态，重启后允许重新尝试持久化标识。
-};
 struct GroupColorPreset {
     const wchar_t *name;
     COLORREF color;
@@ -26,13 +20,14 @@ struct Tab {
     Id id = 0, group = 0;
     // 仅运行期保留的来源标签，不写入会话文件。
     Id opener = 0;
-    std::wstring path = Home, name, home;
+    LocationKey path = Home, home;
+    std::wstring name;
     // 当前路径最后一次成功解析的系统显示名称，独立于用户固定名称。
     std::wstring displayName;
     std::wstring Title() const {
-        return !name.empty() ? name : !displayName.empty() ? displayName : LocationName(path);
+        return !name.empty() ? name : !displayName.empty() ? displayName : LocationName(path.Stored());
     }
-    std::vector<std::wstring> history{Home};
+    std::vector<LocationKey> history{Home};
     int historyIndex = 0;
     UINT viewMode = FVM_DETAILS;
     int iconSize = 16;
@@ -63,7 +58,7 @@ struct GroupExpansionState {
     std::vector<Entry> groups;
 };
 struct Model {
-    std::unordered_map<std::wstring, ShellLocation> locations;
+    LocationStore locations;
     Pane panes[2];
     int active = 0;
     double split = .5;
@@ -73,7 +68,7 @@ struct Model {
     RECT window{100, 100, 1380, 900};
     UINT windowDpi = 96;
     bool maximized = false;
-    std::vector<std::wstring> recent;
+    std::vector<LocationKey> recent;
     Id nextId = 1;
     Model();
     Tab *Find(Id id);
@@ -81,9 +76,10 @@ struct Model {
     Group *FindGroup(int pane, Id id);
     int PaneOf(Id id) const;
     int Index(int pane, Id id) const;
-    Id Add(int pane, const std::wstring &path = Home, Id group = 0, int index = -1, bool activate = true,
+    Id Add(int pane, const LocationKey &path = Home, Id group = 0, int index = -1, bool activate = true,
            Id opener = 0);
-    void Navigate(Id id, const std::wstring &path, bool append = true);
+    bool CommitNavigation(Id id, const LocationKey &location, const NavigationRequest &request,
+                          bool sameLocation = false);
     void Rename(Id id, const std::wstring &name);
     Id MakeGroup(int pane, Id tab);
     void AssignGroup(Id tab, Id group);
@@ -100,7 +96,10 @@ struct Model {
     void Move(Id id, int target, int index, Id group);
     void MoveGroup(int source, Id group, int target, int index);
     void Cleanup(int pane);
-    void Record(const std::vector<std::wstring> &paths);
+    void Record(const std::vector<LocationKey> &paths);
     bool Valid() const;
+
+  private:
+    void Navigate(Id id, const LocationKey &path, bool append);
 };
 } // namespace zen

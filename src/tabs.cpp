@@ -528,12 +528,8 @@ void TabStrip::Paint() {
     EndPaint(hwnd, &ps);
 }
 void TabStrip::RestoreExpanded() {
-    if (!expanded.empty())
-        app.Changed();
-    for (const auto &state : expanded)
-        app.model.RestoreGroups(state);
+    app.RestoreGroups(expanded);
     expanded.clear();
-    app.SyncViews();
 }
 void TabStrip::FinishExternal(bool success) {
     external = false;
@@ -579,9 +575,7 @@ void TabStrip::Hover(POINT screen, bool files) {
                     if (std::none_of(snapshots.begin(), snapshots.end(),
                                      [&](const auto &state) { return state.pane == p; }))
                         snapshots.push_back(app.model.CaptureGroups(p));
-                    app.model.SetGroupCollapsed(p, hoverGroup, false);
-                    app.Changed();
-                    app.SyncViews();
+                    app.SetGroupCollapsed(p, hoverGroup, false, App::GroupInteraction::DragPreview);
                 }
             } else if (files && hoverTab && app.model.panes[p].selected != hoverTab)
                 app.Activate(p, hoverTab);
@@ -693,8 +687,6 @@ void TabStrip::FinishMove(POINT screen) {
                         if (auto *g = app.model.FindGroup(target, group))
                             keepExpanded = !g->collapsed;
     RestoreExpanded();
-    if (keepExpanded)
-        app.model.SetGroupCollapsed(target, group, false);
     if (!source.tab && source.group) {
         if (group == source.group && target == pane) {
             RestoreExpanded();
@@ -707,13 +699,10 @@ void TabStrip::FinishMove(POINT screen) {
                 if (v[i].group == group)
                     index = i + 1;
         }
-        app.model.MoveGroup(pane, source.group, target, index);
+        app.MoveGroup(pane, source.group, target, index);
     } else if (source.tab) {
-        app.model.Move(source.tab, target, index, group);
+        app.MoveTab(source.tab, target, index, group, keepExpanded);
     }
-    app.SyncViews();
-    app.Changed();
-    app.Activate(app.model.active);
 }
 LRESULT CALLBACK TabStrip::Proc(HWND w, UINT m, WPARAM a, LPARAM b) {
     auto *s = (TabStrip *)GetWindowLongPtrW(w, GWLP_USERDATA);
@@ -735,9 +724,9 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             auto hit = Hit(cursor);
             tipText.clear();
             if (auto *t = app.model.Find(hit.tab)) {
-                tipText = app.Title(*t) + L"\n" + t->path;
+                tipText = app.Title(*t) + L"\n" + app.model.locations.Text(t->path);
                 if (!t->name.empty())
-                    tipText += L"\n主目录：" + t->home;
+                    tipText += L"\n主目录：" + app.model.locations.Text(t->home);
             } else if (auto *g = app.model.FindGroup(pane, hit.group))
                 tipText = g->name;
             ((NMTTDISPINFOW *)b)->lpszText = tipText.data();
@@ -871,13 +860,9 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
                 app.Activate(pane, hit.tab, true);
         } else if (hit.group) {
             if (!app.model.groupDoubleClick)
-                if (auto *g = app.model.FindGroup(pane, hit.group)) {
-                    app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
-                    app.Changed();
-                    app.SyncViews(pane);
-                    EnsureVisible(app.model.panes[pane].selected);
-                }
-            app.Activate(pane);
+                app.ToggleGroup(pane, hit.group);
+            else
+                app.Activate(pane);
         }
         return 0;
     }
@@ -888,12 +873,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
         bool same = hit.tab == source.tab && hit.group == source.group && hit.plus == source.plus;
         if (same && !closePressed && !dragging) {
             if (!hit.tab && hit.group && app.model.groupDoubleClick) {
-                if (auto *g = app.model.FindGroup(pane, hit.group)) {
-                    app.model.SetGroupCollapsed(pane, hit.group, !g->collapsed);
-                    app.Changed();
-                    app.SyncViews(pane);
-                    EnsureVisible(app.model.panes[pane].selected);
-                }
+                app.ToggleGroup(pane, hit.group);
             } else if (auto *t = app.model.Find(hit.tab); t && !t->name.empty()) {
                 auto close = CloseRect(hit);
                 if (!PtInRect(&close, pt))

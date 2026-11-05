@@ -82,7 +82,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     Writer w, history;
     w.Pod(generation);
     // 四类位置只保存引用；同代历史文件中的位置表统一保存身份和显示信息。
-    std::set<std::wstring> keys(m.recent.begin(), m.recent.end());
+    std::set<LocationKey> keys(m.recent.begin(), m.recent.end());
     for (const auto &pane : m.panes)
         for (const auto &tab : pane.tabs) {
             keys.insert(tab.path);
@@ -92,14 +92,15 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
         }
     history.Pod((uint32_t)keys.size());
     for (const auto &key : keys) {
-        ShellLocation fallback{key.starts_with(L"zen-shell:") ? L"" : key, LocationName(key), {}};
-        auto found = m.locations.find(key);
-        const auto &location = found == m.locations.end() ? fallback : found->second;
-        if (key.size() > 32768 || location.parsingName.size() > 32768 ||
+        ShellLocation fallback{
+            key.Stored().starts_with(L"zen-shell:") ? L"" : key.Stored(), LocationName(key.Stored()), {}};
+        auto found = m.locations.Find(key);
+        const auto &location = found ? *found : fallback;
+        if (key.Stored().size() > 32768 || location.parsingName.size() > 32768 ||
             location.displayName.size() > 32768 || (!location.pidl.empty() && !ValidPidl(location.pidl)) ||
             (location.pidl.empty() && location.parsingName.empty()))
             return false;
-        history.Text(key);
+        history.Text(key.Stored());
         history.Text(location.parsingName);
         history.Text(location.displayName);
         history.Pod((uint32_t)location.pidl.size());
@@ -107,7 +108,7 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
     }
     history.Pod((uint32_t)m.recent.size());
     for (const auto &s : m.recent)
-        history.Text(s);
+        history.Text(s.Stored());
     history.Pod((uint32_t)(m.panes[0].tabs.size() + m.panes[1].tabs.size()));
     w.Pod(m.nextId);
     w.Pod(m.active);
@@ -128,14 +129,14 @@ bool SaveModel(const Model &m, const std::filesystem::path &p) {
         for (auto &t : pane.tabs) {
             w.Pod(t.id);
             w.Pod(t.group);
-            w.Text(t.path);
+            w.Text(t.path.Stored());
             w.Text(t.name);
-            w.Text(t.home);
+            w.Text(t.home.Stored());
             history.Pod(t.id);
             history.Pod(t.historyIndex);
             history.Pod((uint32_t)t.history.size());
             for (auto &s : t.history)
-                history.Text(s);
+                history.Text(s.Stored());
             w.Pod(t.viewMode);
             w.Pod(t.iconSize);
             w.Pod((uint32_t)t.sort.size());
@@ -205,7 +206,7 @@ static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
         history.pos += size;
         if (key.empty() || (!location.pidl.empty() && !ValidPidl(location.pidl)) ||
             (location.pidl.empty() && location.parsingName.empty()) ||
-            !m.locations.emplace(key, std::move(location)).second)
+            !m.locations.Insert(key, std::move(location)))
             throw std::runtime_error("位置数据无效");
     }
     m.nextId = r.Pod<Id>();
@@ -265,14 +266,14 @@ static Model Decode(const std::vector<uint8_t> &b, uint32_t version) {
         historyCount != m.panes[0].tabs.size() + m.panes[1].tabs.size() || !m.Valid())
         throw std::runtime_error("状态不合法");
     for (const auto &key : m.recent)
-        if (!m.locations.contains(key))
+        if (!m.locations.Find(key))
             throw std::runtime_error("最近关闭位置缺失");
     for (const auto &pane : m.panes)
         for (const auto &tab : pane.tabs) {
-            if (!m.locations.contains(tab.path) || (!tab.home.empty() && !m.locations.contains(tab.home)))
+            if (!m.locations.Find(tab.path) || (!tab.home.empty() && !m.locations.Find(tab.home)))
                 throw std::runtime_error("标签位置缺失");
             for (const auto &key : tab.history)
-                if (!m.locations.contains(key))
+                if (!m.locations.Find(key))
                     throw std::runtime_error("历史位置缺失");
         }
     for (int p = 0; p < 2; ++p)

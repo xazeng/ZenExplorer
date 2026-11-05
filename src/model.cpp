@@ -37,7 +37,7 @@ int Model::Index(int p, Id id) const {
             return i;
     return -1;
 }
-Id Model::Add(int p, const std::wstring &path, Id group, int index, bool activate, Id opener) {
+Id Model::Add(int p, const LocationKey &path, Id group, int index, bool activate, Id opener) {
     if (p < 0 || p > 1 || path.empty())
         return 0;
     if (group && !FindGroup(p, group))
@@ -62,7 +62,7 @@ Id Model::Add(int p, const std::wstring &path, Id group, int index, bool activat
     }
     return id;
 }
-void Model::Navigate(Id id, const std::wstring &path, bool append) {
+void Model::Navigate(Id id, const LocationKey &path, bool append) {
     auto *t = Find(id);
     if (!t || path.empty())
         return;
@@ -80,6 +80,26 @@ void Model::Navigate(Id id, const std::wstring &path, bool append) {
         t->historyIndex = (int)t->history.size() - 1;
     }
 }
+bool Model::CommitNavigation(Id id, const LocationKey &location, const NavigationRequest &request,
+                             bool sameLocation) {
+    auto *tab = Find(id);
+    if (!tab || location.empty() || tab->history.empty() || tab->historyIndex < 0 ||
+        tab->historyIndex >= (int)tab->history.size() || request.historyIndex < -1 ||
+        request.historyIndex >= (int)tab->history.size())
+        return false;
+    UINT viewMode = tab->viewMode;
+    int iconSize = tab->iconSize;
+    if (request.historyIndex >= 0 && request.historyIndex < (int)tab->history.size())
+        tab->historyIndex = request.historyIndex;
+    Navigate(id, location, request.appendHistory);
+    if (sameLocation) {
+        tab->viewMode = viewMode;
+        tab->iconSize = iconSize;
+    }
+    if (!request.appendHistory)
+        tab->history[tab->historyIndex] = location;
+    return true;
+}
 void Model::Rename(Id id, const std::wstring &n) {
     if (auto *t = Find(id)) {
         if (n.empty()) {
@@ -92,11 +112,12 @@ void Model::Rename(Id id, const std::wstring &n) {
         }
     }
 }
-void Model::Record(const std::vector<std::wstring> &paths) {
-    std::vector<std::wstring> out;
-    auto add = [&](const std::wstring &s) {
+void Model::Record(const std::vector<LocationKey> &paths) {
+    std::vector<LocationKey> out;
+    auto add = [&](const LocationKey &s) {
         if (!s.empty() && std::none_of(out.begin(), out.end(), [&](auto &x) {
-                return CompareStringOrdinal(s.c_str(), -1, x.c_str(), -1, TRUE) == CSTR_EQUAL;
+                return CompareStringOrdinal(s.Stored().c_str(), -1, x.Stored().c_str(), -1, TRUE) ==
+                       CSTR_EQUAL;
             }))
             out.push_back(s);
     };
@@ -160,7 +181,7 @@ void Model::Remove(int p, const std::vector<Id> &ids, bool record, bool wholeGro
     auto removed = [&](Id id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); };
     int sel = Index(p, panes[p].selected);
     Id next = panes[p].selected;
-    std::vector<std::wstring> paths;
+    std::vector<LocationKey> paths;
     if (sel >= 0 && removed(next)) {
         next = 0;
         Id group = v[sel].group;

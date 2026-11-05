@@ -45,242 +45,6 @@ static LRESULT CALLBACK MenuFilter(int code, WPARAM w, LPARAM l) {
 static constexpr UINT Back = 101, Forward = 102, Up = 103, Refresh = 104, Exit = 110, ClearRecent = 111,
                       Wrap = 112, About = 113, SingleGroup = 114, GroupSingleClick = 115,
                       GroupDoubleClick = 116, NavigationBase = 130, ViewBase = 200, RecentBase = 300;
-// 各子控件绘制同一条整栏底线的可见部分，避免按钮重绘覆盖高亮。
-static void PaintNavigationBorder(HDC dc, HWND child, App &app, int pane) {
-    RECT first{}, last{};
-    GetWindowRect(GetDlgItem(app.window, NavigationBase + pane * 4), &first);
-    GetWindowRect(GetDlgItem(app.window, NavigationBase + pane * 4 + 3), &last);
-    POINT corners[]{{first.left, first.top}, {last.right, last.bottom}};
-    MapWindowPoints(nullptr, child, corners, 2);
-    HPEN pen =
-        CreatePen(PS_SOLID, app.S(app.model.active == pane ? 2 : 1),
-                  app.model.active == pane ? (app.windowActive ? RGB(55, 125, 220) : RGB(143, 165, 194))
-                                           : RGB(190, 190, 190));
-    auto old = SelectObject(dc, pen);
-    POINT border[]{{corners[0].x, corners[1].y - 1}, {corners[1].x, corners[1].y - 1}};
-    Polyline(dc, border, ARRAYSIZE(border));
-    SelectObject(dc, old);
-    DeleteObject(pen);
-}
-static LRESULT CALLBACK AddressProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR index, DWORD_PTR ptr) {
-    auto *app = (App *)ptr;
-    int p = (int)index;
-    auto candidatesVisible = [&] {
-        DWORD flags = 0;
-        return app->addressDropDown[p] &&
-               SUCCEEDED(app->addressDropDown[p]->GetDropDownStatus(&flags, nullptr)) &&
-               (flags & ACDD_VISIBLE);
-    };
-    if (m == WM_CHAR && (a == VK_RETURN || a == VK_ESCAPE))
-        return 0;
-    if (m == WM_KEYDOWN) {
-        if ((a == VK_RETURN || a == VK_ESCAPE) && candidatesVisible()) {
-            LPWSTR selected = nullptr;
-            if (a == VK_RETURN)
-                app->addressDropDown[p]->GetDropDownStatus(nullptr, &selected);
-            app->addressComplete[p]->Enable(FALSE);
-            if (selected && *selected) {
-                SetWindowTextW(w, selected);
-                SendMessageW(w, EM_SETSEL, (WPARAM)-1, -1);
-            }
-            CoTaskMemFree(selected);
-            app->addressComplete[p]->Enable(TRUE);
-            return 0;
-        }
-        if (a == VK_RETURN) {
-            auto text = WindowText(w);
-            ShowWindow(w, SW_HIDE);
-            ShowWindow(app->crumb[p], SW_SHOW);
-            const auto &session = app->addressSession[p];
-            auto *tab = app->model.Find(app->model.panes[p].selected);
-            if (tab && tab->id == session.tab && tab->path == session.path && text == session.text)
-                app->Activate(p, 0, true);
-            else
-                app->Navigate(app->model.panes[p].selected, text.empty() ? Home : text);
-            return 0;
-        }
-        if (a == VK_ESCAPE) {
-            ShowWindow(w, SW_HIDE);
-            ShowWindow(app->crumb[p], SW_SHOW);
-            app->Activate(p, 0, true);
-            return 0;
-        }
-    }
-    if (m == WM_KILLFOCUS)
-        PostMessageW(w, WM_APP + 101, 0, 0);
-    if (m == WM_APP + 101 && GetFocus() != w && !candidatesVisible()) {
-        // 延迟到系统候选列表处理失焦后再判断，避免点击候选时提前取消。
-        SetWindowTextW(w, app->AddressText(p).c_str());
-        ShowWindow(w, SW_HIDE);
-        ShowWindow(app->crumb[p], SW_SHOW);
-    }
-    if (m == WM_SETFOCUS)
-        app->Activate(p);
-    return DefSubclassProc(w, m, a, b);
-}
-struct CrumbData {
-    App *app;
-    int pane;
-    POINT hover{-1, -1};
-    struct Link {
-        RECT rect, arrow;
-        std::wstring path;
-    };
-    std::vector<Link> links;
-};
-static void ShowCrumbFolders(HWND owner, App &app, int pane, Id tab, const CrumbData::Link &link) {
-    std::vector<ComPtr<IShellItem>> folders;
-    ComPtr<IShellItem> parent;
-    std::vector<BYTE> identity;
-    bool saved = false;
-    HRESULT hr = app.ResolveLocation(link.path, identity, saved);
-    if (SUCCEEDED(hr))
-        hr = SHCreateItemFromIDList(reinterpret_cast<PCIDLIST_ABSOLUTE>(identity.data()),
-                                    IID_PPV_ARGS(&parent));
-    if (SUCCEEDED(hr))
-        hr = ChildFolderItems(parent.Get(), folders);
-    if (FAILED(hr)) {
-        Report(app.window, L"无法读取子文件夹。", hr);
-        return;
-    }
-    HMENU menu = CreatePopupMenu();
-    if (!menu)
-        return;
-    for (size_t i = 0; i < folders.size(); ++i) {
-        std::wstring label;
-        for (wchar_t c : ItemName(folders[i].Get(), SIGDN_NORMALDISPLAY)) {
-            label += c;
-            if (c == L'&')
-                label += c;
-        }
-        AppendMenuW(menu, MF_STRING, i + 1, label.c_str());
-    }
-    if (folders.empty())
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"无子文件夹");
-    POINT point{link.rect.left, link.rect.bottom};
-    ClientToScreen(owner, &point);
-    UINT chosen = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, point.x,
-                                   point.y, app.window, nullptr);
-    DestroyMenu(menu);
-    if (chosen && chosen <= folders.size() && app.model.panes[pane].selected == tab && app.model.Find(tab)) {
-        app.Activate(pane);
-        auto path = app.RememberLocation(folders[chosen - 1].Get());
-        if (!path.empty()) {
-            app.Navigate(tab, path);
-        }
-    }
-}
-static LRESULT CALLBACK CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
-    auto *d = (CrumbData *)GetWindowLongPtrW(w, GWLP_USERDATA);
-    if (m == WM_NCCREATE) {
-        d = (CrumbData *)((CREATESTRUCTW *)b)->lpCreateParams;
-        SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)d);
-    }
-    if (!d)
-        return DefWindowProcW(w, m, a, b);
-    auto &app = *d->app;
-    int p = d->pane;
-    if (m == WM_PAINT) {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(w, &ps);
-        RECT rc;
-        GetClientRect(w, &rc);
-        FillRect(dc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
-        auto old = SelectObject(dc, app.font);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-        d->links.clear();
-        auto *t = app.model.Find(app.model.panes[p].selected);
-        int x = app.S(8);
-        if (t) {
-            auto view = app.views.find(t->id);
-            auto parts = (GetWindowLongPtrW(app.address[p], GWL_STYLE) & WS_VISIBLE)
-                             ? std::vector<std::pair<std::wstring, std::wstring>>{}
-                         : view != app.views.end() ? view->second->AddressParts()
-                                                   : Breadcrumbs(t->path);
-            DrawIconEx(dc, x, (rc.bottom - app.S(16)) / 2, app.Icon(t->id), app.S(16), app.S(16), 0, nullptr,
-                       DI_NORMAL);
-            x += app.S(26);
-            for (auto &[label, path2] : parts) {
-                SIZE size{};
-                GetTextExtentPoint32W(dc, label.c_str(), (int)label.size(), &size);
-                const int arrowWidth = app.S(18), padding = app.S(6);
-                int width = std::min((int)size.cx + padding * 2, app.S(220)) + arrowWidth;
-                RECT r{x, app.S(3), std::min(x + width, (int)rc.right - app.S(5)), rc.bottom - app.S(3)};
-                if (r.right - r.left < arrowWidth + padding * 2)
-                    break;
-                RECT arrow{r.right - arrowWidth, r.top, r.right, r.bottom};
-                if (PtInRect(&r, d->hover)) {
-                    auto brush = CreateSolidBrush(RGB(232, 240, 250));
-                    FillRect(dc, &r, brush);
-                    DeleteObject(brush);
-                    RECT separator{arrow.left, r.top + app.S(3), arrow.left + app.S(1), r.bottom - app.S(3)};
-                    brush = CreateSolidBrush(RGB(190, 207, 225));
-                    FillRect(dc, &separator, brush);
-                    DeleteObject(brush);
-                }
-                RECT name{r.left + padding, r.top, arrow.left - padding, r.bottom};
-                DrawTextW(dc, label.c_str(), -1, &name,
-                          DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-                DrawUiIcon(dc, arrow, UiIcon::ChevronRight, app.dpi);
-                d->links.push_back({r, arrow, path2});
-                x += width;
-            }
-        }
-        PaintNavigationBorder(dc, w, app, p);
-        // 分隔导航按钮与地址内容；编辑框留在两条分隔线内侧。
-        HBRUSH divider = CreateSolidBrush(RGB(205, 205, 205));
-        RECT leftDivider{0, app.S(8), app.S(1), rc.bottom - app.S(8)};
-        RECT rightDivider{rc.right - app.S(1), app.S(8), rc.right, rc.bottom - app.S(8)};
-        FillRect(dc, &leftDivider, divider);
-        FillRect(dc, &rightDivider, divider);
-        DeleteObject(divider);
-        SelectObject(dc, old);
-        EndPaint(w, &ps);
-        return 0;
-    }
-    if (m == WM_MOUSEMOVE) {
-        POINT next{GET_X_LPARAM(b), GET_Y_LPARAM(b)};
-        bool changed = false;
-        for (const auto &[rect, arrow, path] : d->links)
-            if (PtInRect(&rect, d->hover) != PtInRect(&rect, next))
-                changed = true;
-        d->hover = next;
-        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, w, 0};
-        TrackMouseEvent(&track);
-        if (changed)
-            InvalidateRect(w, nullptr, FALSE);
-        return 0;
-    }
-    if (m == WM_MOUSELEAVE || m == WM_SHOWWINDOW) {
-        d->hover = {-1, -1};
-        InvalidateRect(w, nullptr, FALSE);
-        if (m == WM_MOUSELEAVE)
-            return 0;
-    }
-    if (m == WM_LBUTTONDOWN) {
-        app.Activate(p);
-        POINT pt{GET_X_LPARAM(b), GET_Y_LPARAM(b)};
-        for (const auto &entry : d->links)
-            if (PtInRect(&entry.rect, pt)) {
-                // 弹出菜单会重入绘制，先复制命中信息，避免持有 links 内部引用。
-                auto link = entry;
-                Id tab = app.model.panes[p].selected;
-                if (PtInRect(&link.arrow, pt))
-                    ShowCrumbFolders(w, app, p, tab, link);
-                else
-                    app.Navigate(tab, link.path);
-                return 0;
-            }
-        app.EditAddress(p);
-        return 0;
-    }
-    if (m == WM_NCDESTROY) {
-        delete d;
-        SetWindowLongPtrW(w, GWLP_USERDATA, 0);
-    }
-    return DefWindowProcW(w, m, a, b);
-}
 static LRESULT CALLBACK ButtonHoverProc(HWND hwnd, UINT message, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK)
         SendMessageW(hwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
@@ -293,7 +57,7 @@ static LRESULT CALLBACK ButtonHoverProc(HWND hwnd, UINT message, WPARAM w, LPARA
         InvalidateRect(hwnd, nullptr, FALSE);
     return DefSubclassProc(hwnd, message, w, l);
 }
-App::App() = default;
+App::App() : tasks(*this) {}
 static void PaintCaptionButton(App &app, const DRAWITEMSTRUCT &item) {
     RECT r = item.rcItem;
     POINT cursor{};
@@ -370,11 +134,13 @@ void App::UpdateFrame() {
     for (int i = 0; i < 3; ++i)
         if (HWND button = GetDlgItem(window, CaptionBase + i))
             InvalidateRect(button, nullptr, FALSE);
-    for (HWND child : crumb)
+    for (HWND child : {AddressCrumb(0), AddressCrumb(1)})
         if (child)
             InvalidateRect(child, nullptr, FALSE);
 }
 App::~App() {
+    addressBars[0].reset();
+    addressBars[1].reset();
     if (mainMenu)
         DestroyMenu(mainMenu);
     views.clear();
@@ -658,7 +424,8 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             InflateRect(&r, -S(3), -S(3));
             DrawFocusRect(d->hDC, &r);
         }
-        PaintNavigationBorder(d->hDC, d->hwndItem, *this, (d->CtlID - NavigationBase) / 4);
+        if (auto &bar = addressBars[(d->CtlID - NavigationBase) / 4])
+            bar->PaintBorder(d->hDC, d->hwndItem);
         return TRUE;
     }
     case WM_CREATE: {
@@ -707,44 +474,13 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             ti.lpszText = const_cast<wchar_t *>(help[i % 4]);
             SendMessageW(tips, TTM_ADDTOOLW, 0, (LPARAM)&ti);
         }
-        WNDCLASSW wc{};
-        wc.hInstance = instance;
-        wc.lpfnWndProc = CrumbProc;
-        wc.lpszClassName = L"ZenCrumb";
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
         for (int p = 0; p < 2; ++p) {
             strips[p] = std::make_unique<TabStrip>(*this, p);
             strips[p]->Create();
-            crumb[p] = CreateWindowW(L"ZenCrumb", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 1, 1,
-                                     window, nullptr, instance, (new CrumbData{this, p}));
-            address[p] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 1, 1, window,
-                                         nullptr, instance, nullptr);
-            SendMessageW(address[p], WM_SETFONT, (WPARAM)font, TRUE);
-            SendMessageW(address[p], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
-            ComPtr<IACList2> paths;
-            HRESULT completeHr =
-                CoCreateInstance(CLSID_ACListISF, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&paths));
-            if (SUCCEEDED(completeHr))
-                completeHr = paths->SetOptions(ACLO_CURRENTDIR | ACLO_MYCOMPUTER | ACLO_FILESYSDIRS);
-            if (SUCCEEDED(completeHr))
-                completeHr = CoCreateInstance(CLSID_AutoComplete, nullptr, CLSCTX_INPROC_SERVER,
-                                              IID_PPV_ARGS(&addressComplete[p]));
-            if (SUCCEEDED(completeHr))
-                completeHr =
-                    addressComplete[p]->SetOptions(ACO_AUTOSUGGEST | ACO_AUTOAPPEND | ACO_UPDOWNKEYDROPSLIST);
-            if (SUCCEEDED(completeHr))
-                completeHr = addressComplete[p]->Init(address[p], paths.Get(), nullptr, nullptr);
-            if (SUCCEEDED(completeHr))
-                completeHr = addressComplete[p].As(&addressDropDown[p]);
-            if (FAILED(completeHr)) {
-                Log(L"地址栏系统补全初始化失败 " + ErrorText(completeHr));
-                if (addressComplete[p])
-                    addressComplete[p]->Enable(FALSE);
-                addressDropDown[p].Reset();
-                addressComplete[p].Reset();
-            }
-            SetWindowSubclass(address[p], AddressProc, p, (DWORD_PTR)this);
+            addressBars[p] = std::make_unique<AddressBar>(*this, p);
+            if (FAILED(addressBars[p]->Create(GetDlgItem(window, NavigationBase + p * 4),
+                                              GetDlgItem(window, NavigationBase + p * 4 + 3))))
+                return -1;
             error[p] = CreateWindowW(L"BUTTON", L"目录无法访问，点击重试", WS_CHILD | BS_MULTILINE, 0, 0, 1,
                                      1, window, (HMENU)(INT_PTR)(500 + p), instance, nullptr);
             SendMessageW(error[p], WM_SETFONT, (WPARAM)font, TRUE);
@@ -788,7 +524,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         if (it != views.end()) {
             it->second->Hook();
             if (b == 1)
-                ShowError((Id)a, it->second->error);
+                ShowError((Id)a, it->second->Navigation().Error());
         }
         Changed();
         if (b == 2)
@@ -874,10 +610,10 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         break;
     case WM_TIMER:
         if (!closing) {
-            PollPastes();
+            tasks.Poll();
             for (int p = 0; p < 2; ++p)
-                if (GetWindowLongPtrW(address[p], GWL_STYLE) & WS_VISIBLE)
-                    PostMessageW(address[p], WM_APP + 101, 0, 0);
+                if (GetWindowLongPtrW(AddressEdit(p), GWL_STYLE) & WS_VISIBLE)
+                    PostMessageW(AddressEdit(p), WM_APP + 101, 0, 0);
             for (auto &[id, v] : views)
                 v->Hook();
             if (dirty)
@@ -939,7 +675,7 @@ void App::RefreshDpiResources() {
                              CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
     if (next) {
         // 先替换所有持有旧字体的自有控件，再释放旧字体；不接管 Shell 内部控件字体。
-        for (HWND child : {address[0], address[1], error[0], error[1], status, toolbar})
+        for (HWND child : {AddressEdit(0), AddressEdit(1), error[0], error[1], status, toolbar})
             if (child)
                 SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
         for (int i = 0; i < 8; ++i)
@@ -1000,7 +736,7 @@ static void MoveIfChanged(HWND child, int x, int y, int width, int height, BOOL 
 }
 void App::RedrawPaneFocus() {
     for (int p = 0; p < 2; ++p) {
-        InvalidateRect(crumb[p], nullptr, FALSE);
+        InvalidateRect(AddressCrumb(p), nullptr, FALSE);
         for (int i = 0; i < 4; ++i)
             InvalidateRect(GetDlgItem(window, NavigationBase + p * 4 + i), nullptr, FALSE);
     }
@@ -1045,10 +781,10 @@ void App::Layout(bool updateStatus, int pane) {
             MoveIfChanged(GetDlgItem(window, NavigationBase + p * 4 + i),
                           i == 3 ? left + width - buttonWidth : left + i * buttonWidth, y, buttonWidth, S(32),
                           TRUE);
-        MoveIfChanged(crumb[p], addressLeft, y, addressWidth, S(32), TRUE);
-        MoveIfChanged(address[p], addressLeft + S(34), y + S(6), std::max(1, addressWidth - S(40)), S(20),
+        MoveIfChanged(AddressCrumb(p), addressLeft, y, addressWidth, S(32), TRUE);
+        MoveIfChanged(AddressEdit(p), addressLeft + S(34), y + S(6), std::max(1, addressWidth - S(40)), S(20),
                       TRUE);
-        InvalidateRect(crumb[p], nullptr, TRUE);
+        InvalidateRect(AddressCrumb(p), nullptr, TRUE);
         for (int i = 0; i < 4; ++i)
             InvalidateRect(GetDlgItem(window, NavigationBase + p * 4 + i), nullptr, FALSE);
         RECT view{left, y + S(34), left + width, std::max(y + S(35), bottom)};
@@ -1058,10 +794,10 @@ void App::Layout(bool updateStatus, int pane) {
         for (auto &[id, v] : views)
             if (model.PaneOf(id) == p) {
                 bool selected = id == model.panes[p].selected;
-                v->Show(selected && SUCCEEDED(v->error));
+                v->Show(selected && SUCCEEDED(v->Navigation().Error()));
                 if (selected) {
                     v->Resize(view);
-                    failed = FAILED(v->error);
+                    failed = FAILED(v->Navigation().Error());
                 }
             }
         if (((GetWindowLongPtrW(error[p], GWL_STYLE) & WS_VISIBLE) != 0) != failed)
@@ -1085,7 +821,7 @@ void App::EnsureView(Id id) {
         return;
     }
     Layout(false, model.PaneOf(id));
-    ptr->Browse(model.Find(id)->path, false);
+    ptr->Browse({model.Find(id)->path, false});
 }
 void App::Activate(int p, Id id, bool focus) {
     if (p < 0 || p > 1)
@@ -1138,114 +874,24 @@ void App::Save() {
     }
 }
 std::wstring App::AddressText(int p) const {
-    if (p < 0 || p > 1)
-        return {};
-    auto *tab = model.Find(model.panes[p].selected);
-    if (!tab || tab->path == Home)
-        return {};
-    auto view = views.find(tab->id);
-    return view != views.end() ? view->second->AddressEditText() : LocationText(tab->path);
-}
-std::wstring App::LocationText(const std::wstring &key) const {
-    if (key == Home)
-        return L"此电脑";
-    // 已有完整磁盘/UNC 地址保留全路径；尚未加载的虚拟位置使用保存的可读名称。
-    if ((key.size() > 2 && key[1] == L':') || key.starts_with(L"\\\\"))
-        return key;
-    auto found = model.locations.find(key);
-    return found != model.locations.end() && !found->second.displayName.empty() ? found->second.displayName
-                                                                                : LocationName(key);
+    return p >= 0 && p < 2 && addressBars[p] ? addressBars[p]->Text() : std::wstring{};
 }
 void App::UpdateAddress(int p) {
-    auto *t = model.Find(model.panes[p].selected);
-    if (!t)
-        return;
-    if (GetFocus() != address[p])
-        SetWindowTextW(address[p], AddressText(p).c_str());
-    InvalidateRect(crumb[p], nullptr, FALSE);
+    if (p >= 0 && p < 2 && addressBars[p])
+        addressBars[p]->Update();
 }
 void App::EditAddress(int p) {
-    if (p < 0 || p > 1)
-        return;
-    if (GetWindowLongPtrW(address[p], GWL_STYLE) & WS_VISIBLE) {
-        SetFocus(address[p]);
-        return;
-    }
-    Activate(p);
-    UpdateAddress(p);
-    // 隐藏的编辑框可能仍保留焦点；开始新编辑会话时始终取当前标签文字。
-    SetWindowTextW(address[p], AddressText(p).c_str());
-    if (auto *tab = model.Find(model.panes[p].selected))
-        addressSession[p] = {tab->id, tab->path, WindowText(address[p])};
-    ShowWindow(address[p], SW_SHOW);
-    SetWindowPos(address[p], HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    InvalidateRect(crumb[p], nullptr, FALSE);
-    SetFocus(address[p]);
-    SendMessageW(address[p], EM_SETSEL, 0, -1);
+    if (p >= 0 && p < 2 && addressBars[p])
+        addressBars[p]->Edit();
 }
-std::wstring App::RememberLocation(IShellItem *item) {
-    if (!item)
-        return {};
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    HRESULT hr = SHGetIDListFromObject(item, &pidl);
-    if (FAILED(hr) || !pidl) {
-        Report(window, L"无法获取目录的 Shell 标识", FAILED(hr) ? hr : E_FAIL);
-        return {};
-    }
-    ShellLocation target;
-    target.parsingName = ItemName(item);
-    target.displayName = ItemName(item, SIGDN_NORMALDISPLAY);
-    auto key = target.parsingName;
-    target.pidl.assign((BYTE *)pidl, (BYTE *)pidl + ILGetSize(pidl));
-    CoTaskMemFree(pidl);
-    auto existing = model.locations.find(key);
-    bool collision = existing != model.locations.end() && !existing->second.pidl.empty() &&
-                     existing->second.usable &&
-                     !ILIsEqual(reinterpret_cast<PCIDLIST_ABSOLUTE>(existing->second.pidl.data()),
-                                reinterpret_cast<PCIDLIST_ABSOLUTE>(target.pidl.data()));
-    if (key.empty() || collision) {
-        // 名称缺失或不同对象返回同名时，以真实标识区分，避免父子层级互相覆盖。
-        key = L"zen-shell:";
-        constexpr wchar_t digits[] = L"0123456789abcdef";
-        for (BYTE b : target.pidl) {
-            key += digits[b >> 4];
-            key += digits[b & 15];
-        }
-    }
-    model.locations[key] = std::move(target);
+LocationKey App::RememberLocation(IShellItem *item) {
+    auto key = model.locations.Remember(item);
+    if (key.empty())
+        Report(window, L"无法获取目录的 Shell 标识", E_FAIL);
     return key;
 }
-PCIDLIST_ABSOLUTE App::NavigationPidl(const std::wstring &key) const {
-    auto location = model.locations.find(key);
-    return location != model.locations.end() && location->second.usable && ValidPidl(location->second.pidl)
-               ? reinterpret_cast<PCIDLIST_ABSOLUTE>(location->second.pidl.data())
-               : nullptr;
-}
-HRESULT App::ResolveLocation(const std::wstring &key, std::vector<BYTE> &pidl, bool &savedIdentity) const {
-    pidl.clear();
-    savedIdentity = false;
-    if (key.empty())
-        return E_INVALIDARG;
-    if (auto saved = NavigationPidl(key)) {
-        pidl.assign(reinterpret_cast<const BYTE *>(saved),
-                    reinterpret_cast<const BYTE *>(saved) + ILGetSize(saved));
-        savedIdentity = true;
-        return S_OK;
-    }
-    auto location = model.locations.find(key);
-    auto name = location == model.locations.end() ? key : location->second.parsingName;
-    if (name.empty() || name.starts_with(L"zen-shell:"))
-        return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
-    PIDLIST_ABSOLUTE parsed = nullptr;
-    HRESULT hr = SHParseDisplayName(name.c_str(), nullptr, &parsed, 0, nullptr);
-    if (SUCCEEDED(hr) && parsed)
-        pidl.assign(reinterpret_cast<const BYTE *>(parsed),
-                    reinterpret_cast<const BYTE *>(parsed) + ILGetSize(parsed));
-    CoTaskMemFree(parsed);
-    return SUCCEEDED(hr) && !ValidPidl(pidl) ? E_FAIL : hr;
-}
 void App::PruneLocations() {
-    std::set<std::wstring> retained(model.recent.begin(), model.recent.end());
+    std::set<LocationKey> retained(model.recent.begin(), model.recent.end());
     for (const auto &pane : model.panes)
         for (const auto &tab : pane.tabs) {
             retained.insert(tab.path);
@@ -1253,30 +899,13 @@ void App::PruneLocations() {
             retained.insert(tab.history.begin(), tab.history.end());
         }
     for (const auto &[id, view] : views) {
-        retained.insert(view->expected);
+        retained.insert(view->Navigation().Request().destination);
         for (const auto &[label, path] : view->AddressParts())
             retained.insert(path);
     }
-    std::erase_if(model.locations, [&](const auto &pair) { return !retained.contains(pair.first); });
+    model.locations.Retain(retained);
 }
-void App::InvalidateLocation(const std::wstring &path) {
-    auto found = model.locations.find(path);
-    if (found == model.locations.end() || !ValidPidl(found->second.pidl))
-        return;
-    auto invalid = found->second.pidl;
-    auto matches = [&](const std::vector<BYTE> &bytes) {
-        if (!ValidPidl(bytes))
-            return false;
-        auto parent = reinterpret_cast<PCIDLIST_ABSOLUTE>(invalid.data());
-        auto child = reinterpret_cast<PCIDLIST_ABSOLUTE>(bytes.data());
-        return ILIsEqual(parent, child) || ILIsParent(parent, child, FALSE);
-    };
-    for (auto &[key, location] : model.locations)
-        if (matches(location.pidl))
-            location.usable = false;
-    Log(L"导航失败，目标及下级标识已标记失效");
-}
-void App::Navigate(Id id, const std::wstring &path, bool append, int historyIndex) {
+void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex) {
     ++pasteGeneration;
     auto *t = model.Find(id);
     if (!t || path.empty())
@@ -1286,7 +915,7 @@ void App::Navigate(Id id, const std::wstring &path, bool append, int historyInde
     if (it != views.end()) {
         // 已提交位置保持不变，直到 Shell 报告导航成功。
         it->second->Capture();
-        it->second->Browse(path, append, historyIndex);
+        it->second->Browse({path, append, historyIndex});
         Layout();
     }
 }
@@ -1300,12 +929,10 @@ void App::Travel(int delta) {
         Navigate(t->id, path, false, next);
     }
 }
-void App::NewTab(int p, const std::wstring &path, Id group, int index, Id opener) {
+void App::NewTab(int p, const LocationKey &path, Id group, int index, Id opener) {
     Id id = model.Add(p, path, group, index, true, opener);
     if (!id)
         return;
-    if (group)
-        model.SetGroupCollapsed(p, group, false);
     Activate(p, id);
     strips[p]->EnsureVisible(id);
     BuildMenu();
@@ -1349,6 +976,50 @@ void App::CloseTabs(int p, const std::vector<Id> &ids, bool group) {
     Changed();
     BuildMenu();
 }
+void App::SetGroupCollapsed(int pane, Id group, bool collapsed, GroupInteraction source) {
+    if (pane < 0 || pane > 1 || !model.FindGroup(pane, group))
+        return;
+    model.SetGroupCollapsed(pane, group, collapsed);
+    Changed();
+    SyncViews(pane);
+    if (source == GroupInteraction::User) {
+        Activate(pane);
+        strips[pane]->EnsureVisible(model.panes[pane].selected);
+    }
+}
+void App::ToggleGroup(int pane, Id group) {
+    if (pane < 0 || pane > 1)
+        return;
+    if (auto *found = model.FindGroup(pane, group))
+        SetGroupCollapsed(pane, group, !found->collapsed);
+}
+void App::RestoreGroups(const std::vector<GroupExpansionState> &states) {
+    if (states.empty())
+        return;
+    int affected = states.size() == 1 ? states.front().pane : -1;
+    for (const auto &state : states)
+        model.RestoreGroups(state);
+    Changed();
+    SyncViews(affected);
+}
+void App::MoveTab(Id tab, int target, int index, Id group, bool keepExpanded) {
+    if (!model.Find(tab) || target < 0 || target > 1 || (group && !model.FindGroup(target, group)))
+        return;
+    if (keepExpanded)
+        model.SetGroupCollapsed(target, group, false);
+    model.Move(tab, target, index, group);
+    Changed();
+    SyncViews();
+    Activate(model.active);
+}
+void App::MoveGroup(int pane, Id group, int target, int index) {
+    if (pane < 0 || pane > 1 || target < 0 || target > 1 || !model.FindGroup(pane, group))
+        return;
+    model.MoveGroup(pane, group, target, index);
+    Changed();
+    SyncViews();
+    Activate(model.active);
+}
 std::wstring App::Title(const Tab &t) const {
     return t.Title();
 }
@@ -1372,17 +1043,18 @@ void App::RefreshHomeIcon(Id id) {
     auto *tab = model.Find(id);
     if (!tab || tab->name.empty())
         return;
-    const auto &path = tab->home;
+    const auto &key = tab->home;
+    auto path = model.locations.FilePath(key);
     // 主目录不变时保留图标，导航元数据仅更新地址栏使用的当前目录图标。
-    if (homeIconPaths.contains(id) && homeIconPaths[id] == path && homeIcons[id])
+    if (homeIconPaths.contains(id) && homeIconPaths[id] == key && homeIcons[id])
         return;
     HICON icon = nullptr;
     int index = -1;
-    if (path == tab->path && icons.contains(id)) {
+    if (key == tab->path && icons.contains(id)) {
         icon = CopyIcon(Icon(id));
         if (iconIndices.contains(id))
             index = iconIndices[id];
-    } else if (path == Home) {
+    } else if (key == Home) {
         SHSTOCKICONINFO info{sizeof(info)};
         if (SUCCEEDED(SHGetStockIconInfo(SIID_DESKTOPPC, SHGSI_SYSICONINDEX, &info)))
             index = info.iSysImageIndex;
@@ -1401,11 +1073,11 @@ void App::RefreshHomeIcon(Id id) {
     if (!icon && index >= 0)
         icon = SystemImageIcon(index, S(16));
     if (!icon)
-        icon = CopyIcon(path == Home ? computerIcon : folderIcon);
+        icon = CopyIcon(key == Home ? computerIcon : folderIcon);
     if (homeIcons[id])
         DestroyIcon(homeIcons[id]);
     homeIcons[id] = icon;
-    homeIconPaths[id] = path;
+    homeIconPaths[id] = key;
     homeIconIndices.erase(id);
     if (index >= 0)
         homeIconIndices[id] = index;
@@ -1416,7 +1088,8 @@ void App::RefreshLocalIcon(Id id) {
         return;
     HICON icon = nullptr;
     iconIndices.erase(id);
-    auto state = InspectLocalPath(t->path);
+    auto path = model.locations.FilePath(t->path);
+    auto state = InspectLocalPath(path);
     if (t->path == Home || state == LocalPathState::Missing) {
         SHSTOCKICONINFO info{sizeof(info)};
         if (SUCCEEDED(
@@ -1429,7 +1102,7 @@ void App::RefreshLocalIcon(Id id) {
         icon = CopyIcon(missingIcon);
     else if (state == LocalPathState::Exists) {
         SHFILEINFOW info{};
-        if (SHGetFileInfoW(t->path.c_str(), 0, &info, sizeof(info), SHGFI_SYSICONINDEX | SHGFI_DISPLAYNAME)) {
+        if (SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_SYSICONINDEX | SHGFI_DISPLAYNAME)) {
             iconIndices[id] = info.iIcon;
             icon = SystemImageIcon(info.iIcon, S(16));
             // 版本 1 没有显示名称缓存；复用已有本地图标查询补齐，不额外加载视图。
@@ -1475,7 +1148,7 @@ void App::ShowError(Id id, HRESULT hr) {
     RefreshLocalIcon(id);
     auto it = views.find(id);
     if (it != views.end())
-        it->second->error = hr;
+        it->second->SetFailure(hr);
     int p = model.PaneOf(id);
     if (p >= 0 && model.panes[p].selected == id) {
         auto text = L"目录无法访问\n" + ErrorText(hr) + L"\n点击重试";
@@ -1538,7 +1211,7 @@ void App::BuildMenu() {
     HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近关闭目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
-        AppendMenuW(file, MF_STRING, RecentBase + i, LocationText(model.recent[i]).c_str());
+        AppendMenuW(file, MF_STRING, RecentBase + i, model.locations.Text(model.recent[i]).c_str());
     if (model.recent.empty())
         AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
@@ -1791,11 +1464,7 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     } else if (auto *g = model.FindGroup(p, group)) {
         if (cmd == 15 || cmd == 16) {
             // 使用菜单显示时的明确意图，避免菜单打开期间状态变化后反向切换。
-            model.SetGroupCollapsed(p, group, cmd == 16);
-            Activate(p);
-            Changed();
-            SyncViews(p);
-            strips[p]->EnsureVisible(model.panes[p].selected);
+            SetGroupCollapsed(p, group, cmd == 16);
             return;
         } else if (cmd == 10) {
             auto name = Input(window, L"组名", g->name);
@@ -1834,11 +1503,12 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     Changed();
     SyncViews();
 }
-void App::OpenInExplorer(const std::wstring &path) {
-    auto item = ParseItem(path);
+void App::OpenInExplorer(const LocationKey &path) {
+    ComPtr<IShellItem> item;
+    HRESULT hr = model.locations.ResolveItem(path, &item);
     SFGAOF attributes = 0;
-    HRESULT hr =
-        item ? item->GetAttributes(SFGAO_FOLDER, &attributes) : HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    if (SUCCEEDED(hr))
+        hr = item->GetAttributes(SFGAO_FOLDER, &attributes);
     if (SUCCEEDED(hr) && !(attributes & SFGAO_FOLDER))
         hr = HRESULT_FROM_WIN32(ERROR_DIRECTORY);
     if (SUCCEEDED(hr)) {
@@ -1865,13 +1535,13 @@ void App::OpenInExplorer(const std::wstring &path) {
             }
         }
     }
-    Log(L"系统资源管理器打开 path=" + path + L" result=" + std::to_wstring((unsigned long)hr));
+    Log(L"系统资源管理器打开 path=" + path.Stored() + L" result=" + std::to_wstring((unsigned long)hr));
     if (FAILED(hr))
-        Report(window, L"无法在系统资源管理器中打开：" + path, hr);
+        Report(window, L"无法在系统资源管理器中打开：" + model.locations.Text(path), hr);
 }
 void App::OpenSelected(ShellView &v, bool newTab) {
     auto items = v.Selected();
-    std::vector<std::wstring> paths;
+    std::vector<LocationKey> paths;
     for (auto &i : items) {
         SFGAOF attr = 0;
         i->GetAttributes(SFGAO_FOLDER, &attr);
@@ -1920,109 +1590,6 @@ void App::CopySelection(ShellView &v, bool cut) {
     if (FAILED(hr))
         Report(window, cut ? L"系统剪切命令失败" : L"系统复制命令失败", hr);
 }
-bool App::PasteFeedbackCurrent(const PendingPaste &pending, HWND foreground, HWND focus) {
-    auto it = views.find(pending.tab);
-    return pending.pane >= 0 && pending.pane < 2 && pasteGeneration == pending.generation &&
-           model.active == pending.pane && model.PaneOf(pending.tab) == pending.pane &&
-           model.panes[pending.pane].selected == pending.tab && it != views.end() &&
-           !it->second->navigating && ItemName(it->second->Current().Get()) == pending.destination &&
-           focus == pending.focus && foreground == window && GetTickCount64() <= pending.deadline;
-}
-void App::PollPastes() {
-    std::erase_if(retiredTasks, [&](const RetiredTask &task) {
-        if (!task.process || WaitForSingleObject(task.process.get(), 0) != WAIT_OBJECT_0)
-            return !task.process;
-        if (!CleanupTaskResult(task.result))
-            Log(L"任务结果清理未完成 " + task.result.filename().wstring());
-        return true;
-    });
-    std::erase_if(pendingDrops, [&](PendingDrop &pending) {
-        bool finished = [&]() {
-            std::error_code ec;
-            bool ready = std::filesystem::exists(pending.result, ec);
-            if (!ready &&
-                (!pending.process || WaitForSingleObject(pending.process.get(), 0) != WAIT_OBJECT_0))
-                return false;
-            if (!ready)
-                ready = std::filesystem::exists(pending.result, ec);
-            bool cancelled = false;
-            if (ready) {
-                try {
-                    auto result = ReadTaskResult(pending.result);
-                    cancelled = TaskCancelled(result.invoked) ||
-                                (SUCCEEDED(result.invoked) && result.effect == DROPEFFECT_NONE);
-                } catch (...) {
-                    Log(L"拖放结果不可用，不猜测完成状态");
-                }
-            } else
-                Log(L"拖放操作进程退出但没有结果");
-            // 用户已经继续交互时，不用迟到结果覆盖其分组选择。
-            if (cancelled && pending.generation == dropGeneration) {
-                for (const auto &state : pending.expanded)
-                    model.RestoreGroups(state);
-                Changed();
-                SyncViews();
-            }
-            return true;
-        }();
-        if (finished)
-            retiredTasks.push_back({pending.result, pending.process});
-        return finished;
-    });
-    std::erase_if(pendingPastes, [&](PendingPaste &pending) {
-        bool finished = [&]() {
-            std::error_code ec;
-            if (!std::filesystem::exists(pending.result, ec)) {
-                if (pending.process && WaitForSingleObject(pending.process.get(), 0) == WAIT_OBJECT_0) {
-                    // 进程退出可能早于本次 exists；重新检查，避免丢弃刚写完的结果。
-                    if (std::filesystem::exists(pending.result, ec))
-                        return false;
-                    Log(L"操作进程已退出但没有结果，保留剪贴板和选择 " + pending.result.wstring());
-                    return true;
-                }
-                return false;
-            }
-            try {
-                if (!pending.read) {
-                    auto result = ReadTaskResult(pending.result);
-                    if (FAILED(result.invoked))
-                        return true;
-                    // 复制也跟踪反馈，但仅剪切完成后清理仍对应本次操作的剪贴板。
-                    if (pending.move && result.moveCompleted &&
-                        GetClipboardSequenceNumber() == pending.clipboardSequence)
-                        OleSetClipboard(nullptr);
-                    if (!pending.tab)
-                        return true;
-                    auto detailPath = pending.result;
-                    detailPath += L".items";
-                    // Shell 命令未提供实际结果明细时，不猜测冲突改名后的文件名称。
-                    if (!std::filesystem::exists(detailPath, ec))
-                        return true;
-                    auto details = ReadTaskItems(pending.result);
-                    if (details.destination != pending.destination || details.created.empty())
-                        return true;
-                    pending.created = std::move(details.created);
-                    pending.read = true;
-                    pending.deadline = GetTickCount64() + 5000;
-                }
-                if (!PasteFeedbackCurrent(pending, GetForegroundWindow(), GetFocus()))
-                    return true;
-                auto it = views.find(pending.tab);
-                HRESULT selection = it->second->SelectPasteResults(pending.created);
-                if (selection == S_FALSE)
-                    return false;
-                Log(L"粘贴结果选中 tab=" + std::to_wstring(pending.tab) + L" result=" +
-                    std::to_wstring((unsigned long)selection));
-            } catch (...) {
-                Log(L"粘贴结果或可选明细不可用，跳过自动选中");
-            }
-            return true;
-        }();
-        if (finished)
-            retiredTasks.push_back({pending.result, pending.process});
-        return finished;
-    });
-}
 void App::Paste(ShellView &v, IShellItem *destination) {
     ++pasteGeneration;
     ComPtr<IDataObject> data;
@@ -2051,7 +1618,7 @@ void App::Paste(ShellView &v, IShellItem *destination) {
     bool move = (PreferredEffect(data.Get()) & DROPEFFECT_MOVE) != 0;
     std::filesystem::path result;
     DWORD sequence = GetClipboardSequenceNumber();
-    PendingPaste pending{{}, sequence};
+    PasteFeedback pending{{}, sequence};
     pending.move = move;
     pending.pane = model.PaneOf(v.id);
     pending.generation = pasteGeneration;
@@ -2071,7 +1638,7 @@ void App::Paste(ShellView &v, IShellItem *destination) {
     task.collectResults = dest == ItemName(v.Current().Get());
     if (LaunchTask(window, task, {}, &result, &pending.process)) {
         pending.result = result;
-        pendingPastes.push_back(std::move(pending));
+        tasks.TrackPaste(std::move(pending));
     }
 }
 void App::DeleteSelection(ShellView &v, bool permanent) {
@@ -2080,10 +1647,10 @@ void App::DeleteSelection(ShellView &v, bool permanent) {
     if (hr == S_FALSE)
         return;
     if (SUCCEEDED(hr)) {
-        RetiredTask pending;
+        TaskTicket pending;
         if (LaunchTask(window, {Operation::Delete, L"", paths, permanent}, {}, &pending.result,
                        &pending.process))
-            retiredTasks.push_back(std::move(pending));
+            tasks.TrackDelete(std::move(pending));
     } else {
         Log(L"删除项目快照失败 tab=" + std::to_wstring(v.id) + L" " + ErrorText(hr));
         Report(window,
@@ -2137,7 +1704,7 @@ void App::FileDrop(ShellView &v, IDataObject *data, DWORD key, POINTL point, DWO
     task.allowed = allowed;
     task.preferred = chosen;
     task.collectResults = false;
-    PendingDrop pending;
+    DropFeedback pending;
     if (!LaunchTask(window, task, {}, &pending.result, &pending.process, data, effect))
         return;
     delivered = true;
@@ -2147,7 +1714,7 @@ void App::FileDrop(ShellView &v, IDataObject *data, DWORD key, POINTL point, DWO
         pending.expanded.insert(pending.expanded.end(), expanded.begin(), expanded.end());
     }
     pending.generation = dropGeneration;
-    pendingDrops.push_back(std::move(pending));
+    tasks.TrackDrop(std::move(pending));
     Changed();
 }
 void App::FileMenu(ShellView &v, POINT pt, bool background) {
@@ -2213,11 +1780,16 @@ void App::FileMenu(ShellView &v, POINT pt, bool background) {
         return;
     }
     if (cmd == 0x7002) {
+        auto open = [&](IShellItem *item) {
+            auto key = RememberLocation(item);
+            if (!key.empty())
+                OpenInExplorer(key);
+        };
         if (selected.empty())
-            OpenInExplorer(ItemName(v.Current().Get()));
+            open(v.Current().Get());
         else if (folders)
             for (auto &item : selected)
-                OpenInExplorer(ItemName(item.Get()));
+                open(item.Get());
         return;
     }
     auto verb = verbOf(cmd);
@@ -2276,7 +1848,7 @@ void App::ViewMouse(const MSG &msg) {
             }
         }
         Log(L"文件区点击 pane=" + std::to_wstring(p) + L" tab=" + std::to_wstring(view.id) + L" path=" +
-            model.Find(view.id)->path);
+            model.Find(view.id)->path.Stored());
         return;
     }
 }
@@ -2362,7 +1934,7 @@ bool App::Key(MSG &msg) {
         EditAddress(p);
         return true;
     }
-    if (focus == address[0] || focus == address[1])
+    if (focus == AddressEdit(0) || focus == AddressEdit(1))
         return false;
     wchar_t cls[80]{};
     GetClassNameW(focus, cls, 80);

@@ -116,7 +116,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
     if (GetTickCount64() - since > 15000) {
         std::cerr << "timeout stage=" << stage << "\n";
         Fail("command test timeout");
-    } else if (it != app->views.end() && it->second->shell && !it->second->navigating) {
+    } else if (it != app->views.end() && it->second->shell && !it->second->Navigation().Pending()) {
         auto &view = *it->second;
         if (probeCode) {
             if (probeFolder &&
@@ -170,7 +170,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             ShellMenu menu;
             HRESULT hr = menu.Create(view.shell.Get(), true, app->window);
             if (SUCCEEDED(hr))
-                CheckMenuDirectory(menu, app->model.Find(id)->path);
+                CheckMenuDirectory(menu, app->model.locations.FilePath(app->model.Find(id)->path));
             UINT cmd = SUCCEEDED(hr) ? FindNew(menu, menu.menu, stage % 2 == 0) : 0;
             if (!cmd)
                 Fail("new command missing");
@@ -232,7 +232,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 }
             }
         } else if (stage == 6) {
-            bool done = app->pendingPastes.empty();
+            bool done = (app->tasks.PendingPastes() == 0);
             auto tasks = DataDir() / L"tasks";
             if (std::filesystem::exists(tasks))
                 for (auto &entry : std::filesystem::directory_iterator(tasks)) {
@@ -278,8 +278,8 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 writer.Pod<DWORD>(DROPEFFECT_MOVE);
                 WriteEnvelope(result, TaskMagic, writer.bytes, false);
                 DWORD sequence = GetClipboardSequenceNumber();
-                app->pendingPastes.push_back({result, scenario == 2 ? sequence - 1 : sequence});
-                app->PollPastes();
+                app->tasks.TrackPaste({result, scenario == 2 ? sequence - 1 : sequence});
+                app->tasks.Poll();
                 if (GetClipboardSequenceNumber() != sequence)
                     Fail("paste result cleared preserved clipboard");
             }
@@ -290,22 +290,22 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             writer.Pod<bool>(true);
             writer.Pod<DWORD>(DROPEFFECT_MOVE);
             WriteEnvelope(result, TaskMagic, writer.bytes, false);
-            app->pendingPastes.push_back({result, GetClipboardSequenceNumber()});
-            app->PollPastes();
+            app->tasks.TrackPaste({result, GetClipboardSequenceNumber()});
+            app->tasks.Poll();
             ComPtr<IDataObject> remaining;
             OleGetClipboard(&remaining);
             if (!DataItems(remaining.Get()).empty())
                 Fail("successful move did not clear clipboard");
             // 操作进程退出却没有结果时必须停止等待；不能清空后来复制的剪贴板。
-            App::PendingPaste exited{base / L"worker-exited-without-result", GetClipboardSequenceNumber()};
+            PasteFeedback exited{base / L"worker-exited-without-result", GetClipboardSequenceNumber()};
             exited.process = std::shared_ptr<void>(CreateEventW(nullptr, TRUE, TRUE, nullptr),
                                                    [](void *handle) { CloseHandle(handle); });
             if (!exited.process)
                 Fail("exit observation handle unavailable");
             else {
-                app->pendingPastes.push_back(std::move(exited));
-                app->PollPastes();
-                if (!app->pendingPastes.empty())
+                app->tasks.TrackPaste(std::move(exited));
+                app->tasks.Poll();
+                if (app->tasks.PendingPastes() != 0)
                     Fail("exited worker remained pending");
             }
             app->Navigate(id, (base / L"empty-after-delete").wstring());
@@ -360,14 +360,14 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 std::vector<std::wstring> paths{L"stale path"};
                 if (view.DeletePaths(paths) != S_FALSE || !paths.empty())
                     Fail("empty delete selection was not a no-op");
-                const auto tasks = app->retiredTasks.size();
+                const auto tasks = app->tasks.TrackedCount();
                 MSG deletion{};
                 deletion.message = WM_KEYDOWN;
                 deletion.wParam = VK_DELETE;
                 if (!app->Key(deletion))
                     Fail("empty delete key was not consumed");
                 deletion.lParam = 1LL << 30; // 长按产生的重复按键同样不应报错或创建任务。
-                if (!app->Key(deletion) || app->retiredTasks.size() != tasks)
+                if (!app->Key(deletion) || app->tasks.TrackedCount() != tasks)
                     Fail("repeated empty delete created a task");
                 DestroyWindow(empty);
                 // 真实焦点可纠正过时的活动栏状态，不能把文件快捷键投给另一栏。
@@ -401,7 +401,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 ShellMenu menu;
                 HRESULT hr = menu.Create(view.shell.Get(), false, app->window);
                 if (SUCCEEDED(hr))
-                    CheckMenuDirectory(menu, app->model.Find(id)->path);
+                    CheckMenuDirectory(menu, app->model.locations.FilePath(app->model.Find(id)->path));
                 UINT command = SUCCEEDED(hr) ? menu.Find(L"rename") : 0;
                 if (!command || FAILED(menu.Invoke(command)))
                     Fail("native rename menu missing or failed");
@@ -514,8 +514,9 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             auto rightPath = app->model.Find(app->model.panes[1].selected)->path;
             backHistory = history - 1;
             if (!app->Key(back) ||
-                (view.navigating ? view.pendingHistoryIndex != backHistory || view.expected != previous
-                                 : tab->historyIndex != backHistory || tab->path != previous) ||
+                (view.Navigation().Pending() ? view.Navigation().Request().historyIndex != backHistory ||
+                                                   view.Navigation().Request().destination != previous
+                                             : tab->historyIndex != backHistory || tab->path != previous) ||
                 app->model.Find(app->model.panes[1].selected)->path != rightPath)
                 Fail("Backspace did not navigate focused pane history");
             SetKeyboardState(original);
@@ -553,17 +554,17 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 app->Activate(0, id, true);
                 app->CopySelection(view, false);
                 app->Paste(view);
-                if (app->pendingPastes.empty())
+                if (app->tasks.PendingPastes() == 0)
                     Fail("copy result was not tracked");
                 else
-                    feedbackResult = app->pendingPastes.back().result;
+                    feedbackResult = app->tasks.LastPasteResult();
                 stage = 18;
                 since = GetTickCount64();
             }
         } else if (stage == 18 && std::filesystem::exists(feedbackResult)) {
             feedbackItems = ReadTaskItems(feedbackResult);
-            app->PollPastes();
-            if (app->pendingPastes.empty()) {
+            app->tasks.Poll();
+            if (app->tasks.PendingPastes() == 0) {
                 auto detail = feedbackItems;
                 // 隐藏宿主不冒充前台：直接验证真实副本明细到系统选择接口的链路。
                 if (view.SelectPasteResults(detail.created) == S_FALSE) {
@@ -592,7 +593,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             view.SelectPasteResults({source});
             // 已完成任务遇到用户后续操作、切换或旧版无明细时，不得覆盖现有选择。
             for (int scenario = 0; scenario < 6; ++scenario) {
-                App::PendingPaste pending{feedbackResult, GetClipboardSequenceNumber()};
+                PasteFeedback pending{feedbackResult, GetClipboardSequenceNumber()};
                 pending.move = false;
                 pending.tab = id;
                 pending.pane = 0;
@@ -602,13 +603,13 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 pending.created = detail.created;
                 pending.read = true;
                 pending.deadline = GetTickCount64() + 5000;
-                if (!app->PasteFeedbackCurrent(pending, app->window, GetFocus()) ||
-                    app->PasteFeedbackCurrent(pending, nullptr, GetFocus()))
+                if (!app->tasks.PasteCurrent(pending, app->window, GetFocus()) ||
+                    app->tasks.PasteCurrent(pending, nullptr, GetFocus()))
                     Fail("feedback foreground eligibility mismatch");
                 if (scenario == 0)
                     --pending.generation;
                 if (scenario == 1)
-                    pending.focus = app->address[0];
+                    pending.focus = app->AddressEdit(0);
                 if (scenario == 2)
                     pending.destination = (base / L"destination").wstring();
                 if (scenario == 3)
@@ -624,12 +625,12 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                     legacyResult.Pod<DWORD>(DROPEFFECT_COPY);
                     WriteEnvelope(pending.result, TaskMagic, legacyResult.bytes, false);
                 }
-                if (scenario < 5 && app->PasteFeedbackCurrent(pending, app->window, GetFocus()))
+                if (scenario < 5 && app->tasks.PasteCurrent(pending, app->window, GetFocus()))
                     Fail("changed context remained eligible for feedback");
-                app->pendingPastes.push_back(std::move(pending));
-                app->PollPastes();
+                app->tasks.TrackPaste(std::move(pending));
+                app->tasks.Poll();
                 auto selection = view.Selected();
-                if (!app->pendingPastes.empty() || selection.size() != 1 ||
+                if (app->tasks.PendingPastes() != 0 || selection.size() != 1 ||
                     ItemName(selection[0].Get()) != source)
                     Fail("stale or missing paste feedback changed selection");
             }
@@ -668,8 +669,10 @@ int wmain(int argc, wchar_t **argv) {
     std::ofstream(base / L"empty-after-delete" / L"last.txt") << "last file";
     std::ofstream(base / L"files" / L"clipboard-source.txt") << "clipboard regression";
     Model model;
-    model.Navigate(model.panes[1].selected, (base / L"destination").wstring());
-    model.Navigate(model.panes[0].selected, (base / L"files").wstring());
+    model.CommitNavigation(model.panes[1].selected, (base / L"destination").wstring(),
+                           {(base / L"destination").wstring()});
+    model.CommitNavigation(model.panes[0].selected, (base / L"files").wstring(),
+                           {(base / L"files").wstring()});
     std::filesystem::create_directories(base / L"config");
     if (!SaveModel(model, base / L"config" / L"session.dat"))
         return 1;

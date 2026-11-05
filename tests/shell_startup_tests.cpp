@@ -65,7 +65,7 @@ static LRESULT CALLBACK CountLayoutMessages(HWND window, UINT message, WPARAM w,
 static bool Ready(Id id) {
     auto &app = *state->app;
     auto it = app.views.find(id);
-    if (it == app.views.end() || it->second->navigating || !it->second->shell)
+    if (it == app.views.end() || it->second->Navigation().Pending() || !it->second->shell)
         return false;
     auto &view = *it->second;
     ComPtr<IFolderView2> folder;
@@ -74,7 +74,7 @@ static bool Ready(Id id) {
     RECT bounds{}, hostBounds{};
     GetClientRect(view.host, &hostBounds);
     bool contentReady = state->stage >= 6 && id == state->virtualTab
-                            ? SUCCEEDED(view.error) && !ItemName(view.Current().Get()).empty()
+                            ? SUCCEEDED(view.Navigation().Error()) && !ItemName(view.Current().Get()).empty()
                             : SUCCEEDED(view.shell.As(&folder)) &&
                                   SUCCEEDED(folder->ItemCount(SVGIO_ALLVIEW, &count)) && count > 0;
     return contentReady && SUCCEEDED(view.shell->GetWindow(&hwnd)) && GetClientRect(hwnd, &bounds) &&
@@ -109,8 +109,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             std::cerr << "child=" << child << " child rect=" << cr.right << "," << cr.bottom
                       << " host rect=" << hr.right << "," << hr.bottom << " style=" << std::hex
                       << GetWindowLongPtrW(v->host, GWL_STYLE) << std::dec << "\n";
-            std::cerr << "tab " << id << " navigating=" << v->navigating << " shell=" << (bool)v->shell
-                      << " count=" << count << "\n";
+            std::cerr << "tab " << id << " navigating=" << v->Navigation().Pending()
+                      << " shell=" << (bool)v->shell << " count=" << count << "\n";
         }
         state->failed = true;
         PostMessageW(app.window, WM_CLOSE, 0, 0);
@@ -141,7 +141,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             app.model.Rename(favorite, L"常用测试");
             app.RefreshLocalIcon(favorite);
             HICON homeIcon = app.TabIcon(favorite);
-            app.model.Navigate(favorite, DataDir().wstring());
+            app.model.CommitNavigation(favorite, DataDir().wstring(), {DataDir().wstring()});
             app.RefreshLocalIcon(favorite);
             auto current = ParseItem(DataDir().wstring());
             app.RefreshMetadata(favorite, current.Get());
@@ -189,7 +189,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 RECT back{}, up{}, address{}, refresh{};
                 GetWindowRect(GetDlgItem(app.window, 130 + p * 4), &back);
                 GetWindowRect(GetDlgItem(app.window, 132 + p * 4), &up);
-                GetWindowRect(app.crumb[p], &address);
+                GetWindowRect(app.AddressCrumb(p), &address);
                 GetWindowRect(GetDlgItem(app.window, 133 + p * 4), &refresh);
                 if (back.top != address.top || refresh.top != address.top || up.right != address.left ||
                     address.right != refresh.left || IsWindowEnabled(GetDlgItem(app.window, 132 + p * 4))) {
@@ -206,13 +206,13 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 }
                 app.EditAddress(p);
                 RECT editor{};
-                GetWindowRect(app.address[p], &editor);
+                GetWindowRect(app.AddressEdit(p), &editor);
                 if (editor.right > refresh.left ||
                     !(GetWindowLongPtrW(GetDlgItem(app.window, 133 + p * 4), GWL_STYLE) & WS_VISIBLE)) {
                     std::cerr << "address editor overlapped or hid refresh\n";
                     state->failed = true;
                 }
-                SendMessageW(app.address[p], WM_KEYDOWN, VK_ESCAPE, 0);
+                SendMessageW(app.AddressEdit(p), WM_KEYDOWN, VK_ESCAPE, 0);
             }
             SetFocus(navigationFocus);
             app.Activate(previousPane);
@@ -304,25 +304,25 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             auto path = app.model.Find(addressId)->path;
             auto editText = path == Home ? L"" : path;
             app.EditAddress(0);
-            SetWindowTextW(app.address[0], L"C:/unsubmitted-address");
+            SetWindowTextW(app.AddressEdit(0), L"C:/unsubmitted-address");
             int active = app.model.active;
-            if (!app.addressComplete[0] || !app.addressDropDown[0] ||
-                !(GetWindowLongPtrW(app.crumb[0], GWL_STYLE) & WS_VISIBLE))
+            if (!app.addressBars[0]->CompletionReady() ||
+                !(GetWindowLongPtrW(app.AddressCrumb(0), GWL_STYLE) & WS_VISIBLE))
                 state->failed = true;
-            SetFocus(app.address[1]);
-            SendMessageW(app.address[0], WM_APP + 101, 0, 0);
+            SetFocus(app.AddressEdit(1));
+            SendMessageW(app.AddressEdit(0), WM_APP + 101, 0, 0);
             active = app.model.active;
-            if ((GetWindowLongPtrW(app.address[0], GWL_STYLE) & WS_VISIBLE) ||
-                !(GetWindowLongPtrW(app.crumb[0], GWL_STYLE) & WS_VISIBLE) ||
-                app.model.Find(addressId)->path != path || WindowText(app.address[0]) != editText ||
+            if ((GetWindowLongPtrW(app.AddressEdit(0), GWL_STYLE) & WS_VISIBLE) ||
+                !(GetWindowLongPtrW(app.AddressCrumb(0), GWL_STYLE) & WS_VISIBLE) ||
+                app.model.Find(addressId)->path != path || WindowText(app.AddressEdit(0)) != editText ||
                 app.model.active != active) {
                 std::cerr << "address blur daddressId not cancel editing correctly\n";
                 state->failed = true;
             }
             app.EditAddress(0);
-            if (WindowText(app.address[0]) != editText)
+            if (WindowText(app.AddressEdit(0)) != editText)
                 state->failed = true;
-            SendMessageW(app.address[0], WM_KEYDOWN, VK_ESCAPE, 0);
+            SendMessageW(app.AddressEdit(0), WM_KEYDOWN, VK_ESCAPE, 0);
             app.Activate(1, state->background);
         } else if (state->stage == 1) {
             app.Activate(1, state->original);
@@ -334,12 +334,12 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             checkMode(FVM_ICON);
             // 用不可解析的文字配合真实 PIDL，确认导航没有偷偷退回字符串解析。
             auto destination = ParseItem(DataDir().wstring());
-            auto key = app.RememberLocation(destination.Get());
+            auto key = app.model.locations.Remember(destination.Get());
             if (key.empty())
                 state->failed = true;
             else {
                 auto alias = L"ZenExplorer-test-unparseable-shell-location";
-                app.model.locations[alias] = app.model.locations.at(key);
+                app.model.locations.Set(alias, (*app.model.locations.Find(key)));
                 app.Navigate(id, alias);
             }
             app.Navigate(app.model.panes[0].selected, DataDir().wstring());
@@ -349,10 +349,10 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             checkMode(FVM_DETAILS);
             setIcons();
             app.EditAddress(0);
-            if (WindowText(app.address[0]) != DataDir().wstring())
+            if (WindowText(app.AddressEdit(0)) != DataDir().wstring())
                 state->failed = true;
-            SetWindowTextW(app.address[0], L"");
-            SendMessageW(app.address[0], WM_KEYDOWN, VK_RETURN, 0);
+            SetWindowTextW(app.AddressEdit(0), L"");
+            SendMessageW(app.AddressEdit(0), WM_KEYDOWN, VK_RETURN, 0);
             app.Activate(1, id);
             app.Travel(-1);
         } else if (state->stage == 5) {
@@ -459,6 +459,20 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 state->failed = true;
             app.model.SetGroupCollapsed(0, groupId, false);
             app.Layout();
+            // 同一展开入口保留来源语义：悬停不激活栏，用户操作激活栏；取消恢复快照。
+            app.Activate(1);
+            app.SetGroupCollapsed(0, groupId, true, App::GroupInteraction::DragPreview);
+            auto collapsedState = app.model.CaptureGroups(0);
+            app.SetGroupCollapsed(0, groupId, false, App::GroupInteraction::DragPreview);
+            if (app.model.active != 1 || app.model.FindGroup(0, groupId)->collapsed ||
+                app.model.panes[0].selected != collapsedState.selected)
+                state->failed = true;
+            app.RestoreGroups({collapsedState});
+            if (!app.model.FindGroup(0, groupId)->collapsed || app.model.active != 1)
+                state->failed = true;
+            app.SetGroupCollapsed(0, groupId, false);
+            if (app.model.active != 0 || app.model.FindGroup(0, groupId)->collapsed)
+                state->failed = true;
             app.CloseTabs(0, {grouped}, true);
             app.Activate(0, leftBefore);
             app.Activate(activeBefore);
@@ -516,49 +530,49 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             if (parts.size() < 2 || text.find(L'\\') == std::wstring::npos)
                 state->failed = true;
             for (const auto &[label, path] : parts)
-                if (label.empty() || !app.NavigationPidl(path))
+                if (label.empty() || !app.model.locations.Pidl(path))
                     state->failed = true;
             // 同一解析名称若对应不同对象，不能覆盖原来的层级标识。
-            auto savedIdentity = app.model.locations.at(before);
-            app.model.locations[before] = app.model.locations.at(Home);
-            auto distinct = app.RememberLocation(view.Current().Get());
-            if (distinct == before || !distinct.starts_with(L"zen-shell:"))
+            auto savedIdentity = (*app.model.locations.Find(before));
+            app.model.locations.Set(before, (*app.model.locations.Find(Home)));
+            auto distinct = app.model.locations.Remember(view.Current().Get());
+            if (distinct == before || !distinct.Stored().starts_with(L"zen-shell:"))
                 state->failed = true;
-            app.model.locations[before] = std::move(savedIdentity);
+            app.model.locations.Set(before, std::move(savedIdentity));
             app.PruneLocations();
             if (text.empty() || text == before || text.find(L"::{") != std::wstring::npos)
                 state->failed = true;
             app.EditAddress(pane);
-            if (WindowText(app.address[pane]) != text)
+            if (WindowText(app.AddressEdit(pane)) != text)
                 state->failed = true;
-            SendMessageW(app.address[pane], WM_KEYDOWN, VK_RETURN, 0);
-            if (view.navigating || tab->path != before || tab->history != history ||
-                (GetWindowLongPtrW(app.address[pane], GWL_STYLE) & WS_VISIBLE))
+            SendMessageW(app.AddressEdit(pane), WM_KEYDOWN, VK_RETURN, 0);
+            if (view.Navigation().Pending() || tab->path != before || tab->history != history ||
+                (GetWindowLongPtrW(app.AddressEdit(pane), GWL_STYLE) & WS_VISIBLE))
                 state->failed = true;
             app.EditAddress(pane);
-            SetWindowTextW(app.address[pane], L"unsubmitted virtual path");
-            SendMessageW(app.address[pane], WM_KEYDOWN, VK_ESCAPE, 0);
+            SetWindowTextW(app.AddressEdit(pane), L"unsubmitted virtual path");
+            SendMessageW(app.AddressEdit(pane), WM_KEYDOWN, VK_ESCAPE, 0);
             if (tab->path != before)
                 state->failed = true;
             // 历史仅有不可解析别名时，仍必须从运行期缓存找回对象。
             auto alias = L"ZenExplorer-runtime-history-target";
-            app.model.locations[alias] = app.model.locations.at(before);
+            app.model.locations.Set(alias, (*app.model.locations.Find(before)));
             tab->history[tab->historyIndex] = alias;
             app.Navigate(id, DataDir().wstring());
         } else if (state->stage == 7) {
             if (tab->path != DataDir().wstring() ||
-                !app.NavigationPidl(L"ZenExplorer-runtime-history-target"))
+                !app.model.locations.Pidl(L"ZenExplorer-runtime-history-target"))
                 state->failed = true;
             app.Travel(-1);
         } else if (state->stage == 8) {
             if (app.AddressText(1).empty() || tab->path == DataDir().wstring() ||
-                app.views.at(id)->error != S_OK)
+                app.views.at(id)->Navigation().Error() != S_OK)
                 state->failed = true;
             app.Travel(1);
         } else if (state->stage == 9) {
             if (tab->path != DataDir().wstring())
                 state->failed = true;
-            if (!app.NavigationPidl(DataDir().parent_path().wstring()))
+            if (!app.model.locations.Pidl(DataDir().parent_path().wstring()))
                 state->failed = true;
             auto parts = app.views.at(id)->AddressParts();
             if (parts.size() < 3 || parts.front().second != Home || parts.back().second != tab->path)
@@ -574,61 +588,58 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             auto originalPath = tab->path;
             auto missing = (DataDir() / L"missing-navigation-target").wstring();
             app.Navigate(id, missing);
-            if (SUCCEEDED(view.error) || tab->path != originalPath || tab->history != originalHistory ||
-                tab->historyIndex != originalIndex)
+            if (SUCCEEDED(view.Navigation().Error()) || tab->path != originalPath ||
+                tab->history != originalHistory || tab->historyIndex != originalIndex)
                 state->failed = true;
             tab->history.insert(tab->history.begin() + tab->historyIndex, missing);
             ++tab->historyIndex;
             auto failedHistory = tab->history;
             int failedIndex = tab->historyIndex;
             app.Travel(-1);
-            if (SUCCEEDED(view.error) || tab->path != originalPath || tab->history != failedHistory ||
-                tab->historyIndex != failedIndex)
+            if (SUCCEEDED(view.Navigation().Error()) || tab->path != originalPath ||
+                tab->history != failedHistory || tab->historyIndex != failedIndex)
                 state->failed = true;
             tab->history = originalHistory;
             tab->historyIndex = originalIndex;
             auto targetItem = ParseItem(DataDir().wstring());
-            auto targetPath = app.RememberLocation(targetItem.Get());
-            auto identity = app.model.locations.at(targetPath);
+            auto targetPath = app.model.locations.Remember(targetItem.Get());
+            auto identity = (*app.model.locations.Find(targetPath));
             auto targetId = reinterpret_cast<PCIDLIST_ABSOLUTE>(identity.pidl.data());
             view.OnNavigationPending(targetId);
-            auto unrelated = app.NavigationPidl(Home);
+            auto unrelated = app.model.locations.Pidl(Home);
             view.OnNavigationFailed(unrelated);
-            if (!view.navigating)
+            if (!view.Navigation().Pending())
                 state->failed = true;
             view.OnNavigationFailed(targetId);
             view.OnNavigationComplete(targetId); // 失败后迟到的成功回调必须被忽略。
-            if (view.navigating || SUCCEEDED(view.error) || tab->path != originalPath ||
-                tab->history != originalHistory || app.NavigationPidl(targetPath))
+            if (view.Navigation().Pending() || SUCCEEDED(view.Navigation().Error()) ||
+                tab->path != originalPath || tab->history != originalHistory ||
+                app.model.locations.Pidl(targetPath))
                 state->failed = true;
-            app.RememberLocation(targetItem.Get());
-            if (!app.NavigationPidl(targetPath))
+            app.model.locations.Remember(targetItem.Get());
+            if (!app.model.locations.Pidl(targetPath))
                 state->failed = true;
-            view.error = S_OK;
-            view.expected.clear();
-            view.pendingHistoryIndex = -1;
-            view.appendHistory = true;
             // 最近关闭引用保留标识，清空记录后则回收，无需保留 COM 对象。
             auto recent = app.model.recent;
             auto alias = L"ZenExplorer-runtime-recent-target";
-            app.model.locations[alias] = app.model.locations.at(tab->path);
+            app.model.locations.Set(alias, (*app.model.locations.Find(tab->path)));
             Id closed = app.model.Add(0, alias, 0, -1, false);
             app.CloseTabs(0, {closed});
-            if (!app.NavigationPidl(alias))
+            if (!app.model.locations.Pidl(alias))
                 state->failed = true;
             app.model.recent = recent;
             app.PruneLocations();
-            if (app.NavigationPidl(alias))
+            if (app.model.locations.Pidl(alias))
                 state->failed = true;
             auto home = tab->home;
-            app.model.locations[alias] = app.model.locations.at(tab->path);
+            app.model.locations.Set(alias, (*app.model.locations.Find(tab->path)));
             tab->home = alias;
             app.PruneLocations();
-            if (!app.NavigationPidl(alias))
+            if (!app.model.locations.Pidl(alias))
                 state->failed = true;
             tab->home = home;
             app.PruneLocations();
-            if (app.NavigationPidl(alias))
+            if (app.model.locations.Pidl(alias))
                 state->failed = true;
             app.Activate(1, state->original);
             app.CloseTabs(1, {id});
@@ -658,11 +669,12 @@ int main() {
     if (FAILED(SHParseDisplayName(Home, nullptr, &homePidl, 0, nullptr)))
         return 1;
     std::wstring restoreKey = L"zen-shell:restore-without-parsing-name";
-    auto &savedLocation = model.locations[restoreKey];
+    ShellLocation savedLocation;
     savedLocation.displayName = L"此电脑";
     savedLocation.pidl.assign(reinterpret_cast<BYTE *>(homePidl),
                               reinterpret_cast<BYTE *>(homePidl) + ILGetSize(homePidl));
     CoTaskMemFree(homePidl);
+    model.locations.Set(restoreKey, savedLocation);
     model.Find(original)->path = restoreKey;
     model.Find(original)->history = {restoreKey};
     if (!SaveModel(model, ConfigDir() / L"session.dat"))
@@ -672,16 +684,18 @@ int main() {
         bool recovered = false, future = false;
         if (!LoadModel(resolver.model, ConfigDir() / L"session.dat", recovered, future))
             return 1;
-        std::vector<BYTE> identity;
-        bool saved = false;
-        if (FAILED(resolver.ResolveLocation(restoreKey, identity, saved)) || !saved)
+        LocationResolution resolved;
+        if (FAILED(resolver.model.locations.Resolve(restoreKey, resolved)) || !resolved.savedIdentity)
             return 1;
-        resolver.InvalidateLocation(restoreKey);
-        if (SUCCEEDED(resolver.ResolveLocation(restoreKey, identity, saved)))
+        resolver.model.locations.Invalidate(restoreKey);
+        if (SUCCEEDED(resolver.model.locations.Resolve(restoreKey, resolved)))
             return 1;
         // 标识失效后仅通过保存的系统解析名称回退，不解析内部引用或显示名称。
-        resolver.model.locations.at(restoreKey).parsingName = Home;
-        if (FAILED(resolver.ResolveLocation(restoreKey, identity, saved)) || saved || !ValidPidl(identity))
+        auto named = *resolver.model.locations.Find(restoreKey);
+        named.parsingName = Home;
+        resolver.model.locations.Set(restoreKey, named);
+        if (FAILED(resolver.model.locations.Resolve(restoreKey, resolved)) || resolved.savedIdentity ||
+            !ValidPidl(resolved.pidl))
             return 1;
     }
     // 使用系统枚举器确认本地目录可提供补全候选。
@@ -744,6 +758,12 @@ int main() {
         KillTimer(nullptr, timer);
         state = nullptr;
         failed = check.failed || check.stage != 11;
+        // 主窗口已销毁、App 尚未析构时，控件引用和补全对象也应完成释放。
+        for (int pane = 0; pane < 2; ++pane)
+            if (app.AddressEdit(pane) || app.AddressCrumb(pane) || app.addressBars[pane]->CompletionReady()) {
+                std::cerr << "address bar resources retained after window destruction\n";
+                failed = true;
+            }
     }
     Gdiplus::GdiplusShutdown(token);
     OleUninitialize();

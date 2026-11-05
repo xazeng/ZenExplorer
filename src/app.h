@@ -1,5 +1,7 @@
 #pragma once
 #include "storage.h"
+#include "address_bar.h"
+#include "task_feedback.h"
 #include <shldisp.h>
 #include <unordered_map>
 namespace zen {
@@ -8,14 +10,14 @@ class TabStrip;
 inline constexpr UINT WM_ZEN_NAV = WM_APP + 10, WM_ZEN_CHANGED = WM_APP + 11, WM_ZEN_ACTION = WM_APP + 12;
 struct NavRequest {
     Id id;
-    std::wstring path;
+    LocationKey path;
     bool newTab = false;
     ComPtr<IShellItem> item;
 };
 class App {
   public:
     HINSTANCE instance{};
-    HWND window{}, toolbar{}, status{}, address[2]{}, crumb[2]{}, error[2]{};
+    HWND window{}, toolbar{}, status{}, error[2]{};
     HMENU mainMenu{};
     HWND menuReturnFocus{};
     bool menuOpen = false;
@@ -23,13 +25,13 @@ class App {
     HMENU selectedMenu{};
     UINT selectedMenuFlags = 0;
     void ShowMainMenu(int index);
-    ComPtr<IAutoComplete2> addressComplete[2];
-    ComPtr<IAutoCompleteDropDown> addressDropDown[2];
-    struct AddressEditSession {
-        Id tab = 0;
-        std::wstring path, text;
-    };
-    AddressEditSession addressSession[2];
+    std::unique_ptr<AddressBar> addressBars[2];
+    HWND AddressEdit(int p) const {
+        return addressBars[p] ? addressBars[p]->EditWindow() : nullptr;
+    }
+    HWND AddressCrumb(int p) const {
+        return addressBars[p] ? addressBars[p]->CrumbWindow() : nullptr;
+    }
     HFONT font{};
     HICON folderIcon{}, computerIcon{}, missingIcon{}, windowLargeIcon{}, windowSmallIcon{};
     UINT dpi = 96;
@@ -42,9 +44,8 @@ class App {
     Model model;
     std::unique_ptr<TabStrip> strips[2];
     std::unordered_map<Id, std::unique_ptr<ShellView>> views;
-    std::wstring RememberLocation(IShellItem *item);
+    LocationKey RememberLocation(IShellItem *item);
     void PruneLocations();
-    void InvalidateLocation(const std::wstring &path);
     bool readOnly = false, dirty = false, closing = false, sizing = false, restoring = false;
     int saveFailures = 0;
     ComPtr<IContextMenu2> menu2;
@@ -52,7 +53,7 @@ class App {
     std::unordered_map<Id, HICON> icons;
     std::unordered_map<Id, HICON> homeIcons;
     std::unordered_map<Id, int> homeIconIndices;
-    std::unordered_map<Id, std::wstring> homeIconPaths;
+    std::unordered_map<Id, LocationKey> homeIconPaths;
     std::unordered_map<Id, int> iconIndices;
     App();
     ~App();
@@ -73,57 +74,32 @@ class App {
     void UpdateStatus();
     void UpdateAddress(int p);
     std::wstring AddressText(int p) const;
-    std::wstring LocationText(const std::wstring &key) const;
     void BuildMenu();
     void Command(UINT id);
-    void Navigate(Id id, const std::wstring &path, bool append = true, int historyIndex = -1);
-    PCIDLIST_ABSOLUTE NavigationPidl(const std::wstring &key) const;
-    HRESULT ResolveLocation(const std::wstring &key, std::vector<BYTE> &pidl, bool &savedIdentity) const;
+    void Navigate(Id id, const LocationKey &path, bool append = true, int historyIndex = -1);
     void Travel(int delta);
-    void NewTab(int pane, const std::wstring &path = Home, Id group = 0, int index = -1, Id opener = 0);
+    void NewTab(int pane, const LocationKey &path = Home, Id group = 0, int index = -1, Id opener = 0);
     void CloseTabs(int p, const std::vector<Id> &ids, bool group = false);
+    enum class GroupInteraction { User, DragPreview };
+    void SetGroupCollapsed(int pane, Id group, bool collapsed,
+                           GroupInteraction source = GroupInteraction::User);
+    void ToggleGroup(int pane, Id group);
+    void RestoreGroups(const std::vector<GroupExpansionState> &states);
+    void MoveTab(Id tab, int target, int index, Id group, bool keepExpanded);
+    void MoveGroup(int pane, Id group, int target, int index);
     void SyncViews(int pane = -1);
     void TabMenu(int p, Id tab, Id group, POINT pt);
     void FileMenu(ShellView &, POINT, bool background);
-    struct PendingPaste {
-        std::filesystem::path result;
-        DWORD clipboardSequence;
-        bool move = true;
-        Id tab = 0;
-        int pane = -1;
-        uint64_t generation = 0;
-        HWND focus = nullptr;
-        std::wstring destination;
-        std::vector<std::wstring> created;
-        bool read = false;
-        ULONGLONG deadline = 0;
-        // 仅用于观察退出；关闭句柄绝不终止工作进程。
-        std::shared_ptr<void> process;
-    };
-    std::vector<PendingPaste> pendingPastes;
-    struct PendingDrop {
-        std::filesystem::path result;
-        std::shared_ptr<void> process;
-        std::vector<GroupExpansionState> expanded;
-        uint64_t generation = 0;
-    };
-    std::vector<PendingDrop> pendingDrops;
-    struct RetiredTask {
-        std::filesystem::path result;
-        std::shared_ptr<void> process;
-    };
-    std::vector<RetiredTask> retiredTasks;
+    FileTaskFeedback tasks;
     uint64_t pasteGeneration = 0;
     uint64_t dropGeneration = 0;
-    bool PasteFeedbackCurrent(const PendingPaste &, HWND foreground, HWND focus);
-    void PollPastes();
     void Paste(ShellView &, IShellItem *destination = nullptr);
     HRESULT ShellVerb(ShellView &, const std::wstring &, bool background,
                       std::optional<DWORD> modifiers = std::nullopt);
     void DeleteSelection(ShellView &, bool permanent);
     void CopySelection(ShellView &, bool cut);
     void OpenSelected(ShellView &, bool newTab);
-    void OpenInExplorer(const std::wstring &path);
+    void OpenInExplorer(const LocationKey &path);
     void FileDrop(ShellView &, IDataObject *, DWORD, POINTL, DWORD *);
     bool Key(MSG &);
     void ViewMouse(const MSG &);

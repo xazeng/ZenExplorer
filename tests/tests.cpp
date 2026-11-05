@@ -217,7 +217,7 @@ static void CheckLocationStorage() {
     auto id = m.panes[0].selected;
     std::wstring key = L"zen-shell:device-folder";
     ShellLocation location{L"", L"内部存储设备", {2, 0, 0, 0}, false};
-    m.locations[key] = location;
+    m.locations.Set(key, location);
     auto *tab = m.Find(id);
     tab->path = tab->home = key;
     tab->name = L"手机";
@@ -231,15 +231,17 @@ static void CheckLocationStorage() {
     CHECK(LoadModel(loaded, file, recovered, future));
     CHECK(loaded.Find(id)->path == key && loaded.Find(id)->home == key);
     CHECK(loaded.Find(id)->history == tab->history && loaded.recent == m.recent);
-    CHECK(loaded.locations.at(key).pidl == location.pidl);
-    CHECK(loaded.locations.at(key).displayName == location.displayName);
-    CHECK(loaded.locations.at(key).parsingName.empty() && loaded.locations.at(key).usable);
+    CHECK((*loaded.locations.Find(key)).pidl == location.pidl);
+    CHECK((*loaded.locations.Find(key)).displayName == location.displayName);
+    CHECK((*loaded.locations.Find(key)).parsingName.empty() && (*loaded.locations.Find(key)).usable);
     CHECK(ValidPidl({0, 0}) && !ValidPidl({0}) && !ValidPidl({1, 0, 0, 0}));
     CHECK(!ValidPidl({2, 0}) && !ValidPidl({0, 0, 0, 0}));
-    m.locations[key].pidl = {255, 255, 0, 0};
+    auto invalid = location;
+    invalid.pidl = {255, 255, 0, 0};
+    m.locations.Set(key, invalid);
     CHECK(!SaveModel(m, file));
     CHECK(LoadModel(loaded, file, recovered, future) && !recovered);
-    CHECK(loaded.locations.at(key).pidl == location.pidl);
+    CHECK((*loaded.locations.Find(key)).pidl == location.pidl);
 }
 int main() {
     auto portable =
@@ -278,7 +280,7 @@ int main() {
         CHECK(m.Valid());
         m.Rename(a, L"项目");
         CHECK(m.Find(a)->home == Home);
-        m.Navigate(a, L"C:\\other");
+        CHECK(m.CommitNavigation(a, L"C:\\other", {L"C:\\other"}));
         m.Rename(a, L"项目二");
         CHECK(m.Find(a)->home == Home);
         m.panes[0].selected = a;
@@ -414,9 +416,9 @@ int main() {
         CHECK(loaded.Find(c)->Title() == L"固定名称优先");
         loaded.Rename(c, L"");
         CHECK(loaded.Find(c)->Title() == L"系统显示名称");
-        loaded.Navigate(d, L"D:\\", false);
+        CHECK(loaded.CommitNavigation(d, L"D:\\", {L"D:\\", false}));
         CHECK(loaded.Find(d)->displayName == L"数据盘 (D:)");
-        loaded.Navigate(d, L"D:\\other");
+        CHECK(loaded.CommitNavigation(d, L"D:\\other", {L"D:\\other"}));
         CHECK(loaded.Find(d)->displayName.empty());
         Model legacy;
         auto fixture = std::filesystem::path(ZEN_TEST_SOURCE_DIR) / "tests" / "fixtures" / "session-v1.dat";

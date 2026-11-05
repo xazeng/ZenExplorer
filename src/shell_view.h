@@ -20,11 +20,10 @@ class ShellView : public IExplorerBrowserEvents,
     bool destroyed = false;
     bool browserSized = false;
     RECT browserBounds{};
-    std::vector<BYTE> requestedPidl;
-    bool usingSavedIdentity = false;
-    std::wstring navigationPath, parentPath;
+    NavigationState navigation;
+    LocationKey navigationPath, parentPath;
     std::wstring addressEditText;
-    std::vector<std::pair<std::wstring, std::wstring>> breadcrumbs;
+    std::vector<std::pair<std::wstring, LocationKey>> breadcrumbs;
     void UpdateNavigation(IShellItem *item);
     void NavigationFailed(HRESULT result);
 
@@ -34,15 +33,16 @@ class ShellView : public IExplorerBrowserEvents,
     HWND host{};
     ComPtr<IExplorerBrowser> browser;
     ComPtr<IShellView> shell;
-    bool navigating = false;
-    std::wstring expected;
-    bool appendHistory = true;
-    int pendingHistoryIndex = -1;
-    HRESULT error = S_OK;
+    const NavigationState &Navigation() const {
+        return navigation;
+    }
+    void SetFailure(HRESULT result) {
+        navigation.Fail(result);
+    }
     ShellView(App &, Id);
     ~ShellView();
     HRESULT Create(HWND parent, RECT bounds);
-    HRESULT Browse(const std::wstring &, bool append = true, int historyIndex = -1);
+    HRESULT Browse(const NavigationRequest &request);
     void Retry();
     void Destroy();
     void Capture();
@@ -56,7 +56,7 @@ class ShellView : public IExplorerBrowserEvents,
     HRESULT SelectPasteResults(const std::vector<std::wstring> &paths);
     void Up();
     bool CanUp() const;
-    std::vector<std::pair<std::wstring, std::wstring>> AddressParts() const;
+    std::vector<std::pair<std::wstring, LocationKey>> AddressParts() const;
     std::wstring AddressEditText() const;
     std::vector<ComPtr<IShellItem>> Selected();
     ComPtr<IDataObject> SelectedData();
