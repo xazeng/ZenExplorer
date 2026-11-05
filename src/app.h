@@ -90,6 +90,7 @@ class App {
     void SyncViews(int pane = -1);
     void TabMenu(int p, Id tab, Id group, POINT pt);
     void FileMenu(ShellView &, POINT, bool background);
+    ShellView *MenuSource(Id id, IShellView *shell, const LocationKey &path);
     FileTaskFeedback tasks;
     uint64_t pasteGeneration = 0;
     uint64_t dropGeneration = 0;

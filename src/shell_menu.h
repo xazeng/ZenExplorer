@@ -1,6 +1,7 @@
 #pragma once
 #include "platform.h"
 namespace zen {
+bool IsShellMenuMessage(UINT message, WPARAM wParam, LPARAM lParam);
 // 菜单句柄及动态扩展必须存活到 InvokeCommand 返回之后。
 class ShellMenu {
     ComPtr<IObjectWithSite> attachedSite;

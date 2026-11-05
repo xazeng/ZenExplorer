@@ -107,6 +107,42 @@ static void CheckModifiedClipboardKeys(ShellView &view) {
     view.shell = shell;
     SetFocus(focus);
 }
+static void CheckMenuGuards(ShellView &view) {
+    DRAWITEMSTRUCT draw{};
+    MEASUREITEMSTRUCT measure{};
+    draw.CtlType = ODT_BUTTON;
+    measure.CtlType = ODT_LISTBOX;
+    if (IsShellMenuMessage(WM_DRAWITEM, 0, (LPARAM)&draw) ||
+        IsShellMenuMessage(WM_MEASUREITEM, 0, (LPARAM)&measure) || IsShellMenuMessage(WM_DRAWITEM, 0, 0))
+        Fail("control drawing was classified as a Shell menu message");
+    draw.CtlType = measure.CtlType = ODT_MENU;
+    if (!IsShellMenuMessage(WM_DRAWITEM, 0, (LPARAM)&draw) ||
+        !IsShellMenuMessage(WM_MEASUREITEM, 0, (LPARAM)&measure) ||
+        !IsShellMenuMessage(WM_INITMENUPOPUP, 0, 0) || !IsShellMenuMessage(WM_MENUCHAR, 0, 0))
+        Fail("native menu message was rejected");
+
+    const Id id = view.id;
+    const auto path = app->model.Find(id)->path;
+    auto shell = view.shell;
+    auto valid = [&] { return app->MenuSource(id, shell.Get(), path); };
+    if (valid() != &view)
+        Fail("live menu source was rejected");
+    app->closing = true;
+    bool rejectedClosing = !valid();
+    app->closing = false;
+    app->model.Find(id)->path = L"menu-source-changed";
+    bool rejectedPath = !valid();
+    app->model.Find(id)->path = path;
+    view.shell.Reset();
+    bool rejectedShell = !valid();
+    view.shell = shell;
+    // 模拟菜单循环期间宿主被移出视图注册表，检查时不得解引用旧宿主。
+    auto removed = app->views.extract(id);
+    bool rejectedRemoved = !valid();
+    app->views.insert(std::move(removed));
+    if (!rejectedClosing || !rejectedPath || !rejectedShell || !rejectedRemoved || valid() != &view)
+        Fail("stale menu source was accepted");
+}
 static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
     if (busy || !app || !app->window)
         return;
@@ -118,6 +154,11 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
         Fail("command test timeout");
     } else if (it != app->views.end() && it->second->shell && !it->second->Navigation().Pending()) {
         auto &view = *it->second;
+        static bool guardsChecked = false;
+        if (!guardsChecked && !probeCode) {
+            guardsChecked = true;
+            CheckMenuGuards(view);
+        }
         if (probeCode) {
             if (probeFolder &&
                 view.SelectPasteResults({(base / L"files" / L"selected folder").wstring()}) != S_OK) {

@@ -1,5 +1,18 @@
 #include "shell_menu.h"
 namespace zen {
+bool IsShellMenuMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_INITMENUPOPUP:
+    case WM_MENUCHAR:
+        return true;
+    case WM_DRAWITEM:
+        return !wParam && lParam && reinterpret_cast<const DRAWITEMSTRUCT *>(lParam)->CtlType == ODT_MENU;
+    case WM_MEASUREITEM:
+        return !wParam && lParam && reinterpret_cast<const MEASUREITEMSTRUCT *>(lParam)->CtlType == ODT_MENU;
+    default:
+        return false;
+    }
+}
 ShellMenu::~ShellMenu() {
     ResourceTrace trace(L"释放 Shell 菜单");
     if (menu)

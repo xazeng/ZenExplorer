@@ -275,11 +275,11 @@ LRESULT CALLBACK App::Proc(HWND w, UINT m, WPARAM a, LPARAM b) {
 LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
     if ((m == WM_ACTIVATEAPP && !a) || m == WM_ENTERMENULOOP)
         ++pasteGeneration;
-    if (menu3 && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM || m == WM_MENUCHAR)) {
+    if (menu3 && IsShellMenuMessage(m, a, b)) {
         LRESULT result = 0;
         if (SUCCEEDED(menu3->HandleMenuMsg2(m, a, b, &result)))
             return result;
-    } else if (menu2 && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM))
+    } else if (menu2 && m != WM_MENUCHAR && IsShellMenuMessage(m, a, b))
         if (SUCCEEDED(menu2->HandleMenuMsg(m, a, b)))
             return 0;
     switch (m) {
@@ -1717,9 +1717,24 @@ void App::FileDrop(ShellView &v, IDataObject *data, DWORD key, POINTL point, DWO
     tasks.TrackDrop(std::move(pending));
     Changed();
 }
+ShellView *App::MenuSource(Id id, IShellView *shell, const LocationKey &path) {
+    auto *tab = model.Find(id);
+    auto found = views.find(id);
+    if (closing || !IsWindow(window) || !tab || tab->path != path || found == views.end() || !shell ||
+        found->second->shell.Get() != shell || found->second->Navigation().Pending())
+        return nullptr;
+    return found->second.get();
+}
 void App::FileMenu(ShellView &v, POINT pt, bool background) {
     int pane = model.PaneOf(v.id);
     if (pane < 0 || !v.shell)
+        return;
+    const Id sourceId = v.id;
+    const LocationKey sourcePath = model.Find(sourceId)->path;
+    // 扩展和菜单循环均可重入；持有系统视图身份，之后只通过注册表重新取得宿主。
+    ComPtr<IShellView> sourceShell = v.shell;
+    auto source = [&] { return MenuSource(sourceId, sourceShell.Get(), sourcePath); };
+    if (!source())
         return;
     model.active = pane;
     // 背景菜单与残留选择无关，不能把当前目录命令误投递给选中的子文件夹。
@@ -1733,8 +1748,12 @@ void App::FileMenu(ShellView &v, POINT pt, bool background) {
             folders = false;
     }
     ShellMenu session;
-    HRESULT hr = session.Create(v.shell.Get(), background, window,
+    if (!source())
+        return;
+    HRESULT hr = session.Create(sourceShell.Get(), background, window,
                                 CMF_NORMAL | ((GetKeyState(VK_SHIFT) & 0x8000) ? CMF_EXTENDEDVERBS : 0));
+    if (!source())
+        return;
     if (FAILED(hr)) {
         Report(window, L"无法创建系统菜单", hr);
         return;
@@ -1772,11 +1791,14 @@ void App::FileMenu(ShellView &v, POINT pt, bool background) {
     } restore{*this, previous2, previous3};
     menu2 = session.menu2;
     menu3 = session.menu3;
+    if (!source())
+        return;
     UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, window, nullptr);
-    if (!cmd)
+    auto *current = source();
+    if (!cmd || !current)
         return;
     if (cmd == 0x7001) {
-        OpenSelected(v, true);
+        OpenSelected(*current, true);
         return;
     }
     if (cmd == 0x7002) {
@@ -1786,37 +1808,40 @@ void App::FileMenu(ShellView &v, POINT pt, bool background) {
                 OpenInExplorer(key);
         };
         if (selected.empty())
-            open(v.Current().Get());
+            open(current->Current().Get());
         else if (folders)
             for (auto &item : selected)
                 open(item.Get());
         return;
     }
     auto verb = verbOf(cmd);
+    current = source();
+    if (!current)
+        return;
     if (folders && verb == L"open") {
-        OpenSelected(v, false);
+        OpenSelected(*current, false);
         return;
     }
     if (verb == L"copy" || verb == L"cut") {
-        CopySelection(v, verb == L"cut");
+        CopySelection(*current, verb == L"cut");
         return;
     }
     if (verb == L"paste") {
         // 项目菜单的目标是右键选中的文件夹；快捷键与背景菜单仍使用当前目录。
         if (selected.empty())
-            Paste(v);
+            Paste(*current);
         else if (folders && selected.size() == 1)
-            Paste(v, selected.front().Get());
+            Paste(*current, selected.front().Get());
         else
             Report(window, L"请选择一个目标文件夹后粘贴。");
         return;
     }
     if (verb == L"delete") {
-        DeleteSelection(v, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        DeleteSelection(*current, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
         return;
     }
     hr = session.Invoke(cmd, pt);
-    if (FAILED(hr))
+    if (FAILED(hr) && !closing && IsWindow(window))
         Report(window, L"系统菜单命令执行失败", hr);
 }
 void App::ViewMouse(const MSG &msg) {
