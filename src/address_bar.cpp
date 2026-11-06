@@ -116,11 +116,16 @@ LRESULT CALLBACK AddressBar::EditProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_P
             auto text = WindowText(w);
             ShowWindow(w, SW_HIDE);
             ShowWindow(bar->crumb, SW_SHOW);
+            SetFocus(app->window);
             const auto &session = bar->session;
             auto *tab = app->model.Find(app->model.panes[p].selected);
-            if (tab && tab->id == session.tab && tab->path == session.path && text == session.text)
-                app->Activate(p, 0, true);
-            else if (tab) {
+            if (tab && tab->id == session.tab && tab->path == session.path && text == session.text) {
+                auto view = app->views.find(tab->id);
+                if (view != app->views.end() && FAILED(view->second->Navigation().Error()))
+                    view->second->Retry();
+                else
+                    app->Activate(p, 0, true);
+            } else if (tab) {
                 const Id id = tab->id;
                 const auto before = tab->path;
                 LocationKey destination;

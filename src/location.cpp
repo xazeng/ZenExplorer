@@ -125,6 +125,23 @@ void LocationStore::AllowRetry(const LocationKey &key) {
     if (it != entries.end() && it->second.parsingName.empty())
         it->second.usable = true;
 }
+HRESULT LocationStore::ValidateDirectory(const LocationKey &key) const {
+    auto path = FileSystemPath(key);
+    if (!path.empty()) {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+            return HRESULT_FROM_WIN32(GetLastError());
+        if (!(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    }
+    ComPtr<IShellItem> item;
+    HRESULT hr = ResolveItem(key, &item);
+    if (FAILED(hr))
+        return hr;
+    SFGAOF attributes = 0;
+    hr = item->GetAttributes(SFGAO_FOLDER | SFGAO_VALIDATE, &attributes);
+    return FAILED(hr) ? hr : (attributes & SFGAO_FOLDER) ? S_OK : HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+}
 HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &destination) {
     destination.clear();
     if (text.size() > 32768 || text.find(L'\0') != std::wstring::npos)

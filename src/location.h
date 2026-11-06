@@ -69,6 +69,7 @@ class LocationStore {
     HRESULT ResolveItem(const LocationKey &key, IShellItem **item) const;
     // 编辑文字不是位置键；先使用 Shell 解析，再从已知可读层级按对象身份定位。
     HRESULT ResolveInput(const std::wstring &text, LocationKey &destination);
+    HRESULT ValidateDirectory(const LocationKey &key) const;
     PCIDLIST_ABSOLUTE Pidl(const LocationKey &key) const;
     bool Same(const LocationKey &key, PCIDLIST_ABSOLUTE pidl) const;
     std::wstring DisplayName(const LocationKey &key) const;

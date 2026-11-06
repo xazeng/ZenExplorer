@@ -842,7 +842,9 @@ void App::Activate(int p, Id id, bool focus) {
     Changed();
     if (focus) {
         auto it = views.find(model.panes[p].selected);
-        if (it != views.end() && it->second->shell) {
+        if (it != views.end() && FAILED(it->second->Navigation().Error())) {
+            SetFocus(error[p]);
+        } else if (it != views.end() && it->second->shell) {
             HWND w;
             it->second->shell->GetWindow(&w);
             SetFocus(w);
@@ -917,7 +919,7 @@ void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex
     EnsureView(id);
     auto it = views.find(id);
     if (it != views.end()) {
-        // 已提交位置保持不变，直到 Shell 报告导航成功。
+        // 位置与历史由视图统一提交：新地址要求成功，已有历史允许停留在失败位置。
         it->second->Capture();
         it->second->Browse({path, append, historyIndex});
         Layout();
@@ -934,6 +936,11 @@ void App::Travel(int delta) {
     }
 }
 void App::NewTab(int p, const LocationKey &path, Id group, int index, Id opener) {
+    HRESULT hr = model.locations.ValidateDirectory(path);
+    if (FAILED(hr)) {
+        Report(window, L"目标目录无法访问，未新建标签。", hr);
+        return;
+    }
     Id id = model.Add(p, path, group, index, true, opener);
     if (!id)
         return;

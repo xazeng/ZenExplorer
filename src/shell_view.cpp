@@ -158,13 +158,21 @@ void ShellView::Destroy() {
         DestroyWindow(host);
     host = nullptr;
 }
-HRESULT ShellView::Browse(const NavigationRequest &request) {
+HRESULT ShellView::Browse(const NavigationRequest &request, bool fallback) {
     if (!browser || request.destination.empty())
         return E_INVALIDARG;
     Trace(L"Browse start");
+    if (!fallback)
+        previousNavigation = navigation;
     navigation.Begin(request);
     LocationResolution resolved;
-    HRESULT hr = app.model.locations.Resolve(request.destination, resolved);
+    auto *tab = app.model.Find(id);
+    // 历史可能仍持有已删除目录的有效 PIDL；先校验，避免 Shell 弹出位置不可用对话框。
+    HRESULT hr = (request.historyIndex >= 0 || (tab && request.destination != tab->path))
+                     ? app.model.locations.ValidateDirectory(request.destination)
+                     : S_OK;
+    if (SUCCEEDED(hr))
+        hr = app.model.locations.Resolve(request.destination, resolved);
     if (SUCCEEDED(hr)) {
         auto bytes = resolved.pidl;
         navigation.SetIdentity(std::move(resolved));
@@ -175,6 +183,8 @@ HRESULT ShellView::Browse(const NavigationRequest &request) {
     return hr;
 }
 void ShellView::NavigationFailed(HRESULT result) {
+    if (destroyed || app.closing)
+        return;
     bool fallback = navigation.Fail(result);
     auto request = navigation.Request();
     if (!NavigationState::Cancelled(result))
@@ -182,19 +192,34 @@ void ShellView::NavigationFailed(HRESULT result) {
     auto *location = app.model.locations.Find(request.destination);
     if (fallback && location && !location->parsingName.empty()) {
         Log(L"Shell 标识导航失败，改用同一位置的系统解析名称重试");
-        Browse(request);
+        Browse(request, true);
         return;
     }
     Trace(L"NavigationFailed", result);
+    auto *tab = app.model.Find(id);
+    if (!tab)
+        return;
+    if (request.historyIndex >= 0 && !NavigationState::Cancelled(result)) {
+        if (!app.model.CommitNavigation(id, request.destination, request, false))
+            return;
+        app.Changed();
+    } else if (request.destination != tab->path) {
+        // 新地址失败不能替换原位置及其成功／失败状态。
+        navigation = previousNavigation;
+        if (navigation.Pending())
+            navigation.Complete();
+        app.Layout();
+        if (!NavigationState::Cancelled(result))
+            Report(app.window, L"目标目录无法访问，当前位置未改变。", result);
+        return;
+    }
     app.ShowError(id, result);
 }
 void ShellView::Retry() {
     auto *tab = app.model.Find(id);
     if (!tab)
         return;
-    auto request = navigation.Request();
-    if (request.destination.empty())
-        request.destination = tab->path;
+    NavigationRequest request{tab->path, false};
     app.model.locations.AllowRetry(request.destination);
     app.Navigate(id, request.destination, request.appendHistory, request.historyIndex);
 }
@@ -211,6 +236,7 @@ HRESULT ShellView::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
         auto destination = app.RememberLocation(item.Get());
         if (destination.empty())
             return E_FAIL;
+        previousNavigation = navigation;
         navigation.Begin({destination});
         LocationResolution resolved;
         resolved.pidl.assign(reinterpret_cast<const BYTE *>(pidl),
@@ -310,7 +336,9 @@ void ShellView::Show(bool show) {
         ShowWindow(host, show ? SW_SHOW : SW_HIDE);
 }
 void ShellView::Refresh() {
-    if (shell)
+    if (FAILED(navigation.Error()) || !shell)
+        Retry();
+    else
         shell->Refresh();
 }
 HRESULT ShellView::SelectPasteResults(const std::vector<std::wstring> &paths) {

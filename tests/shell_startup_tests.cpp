@@ -5,6 +5,7 @@
 #include <gdiplus.h>
 #include <iostream>
 #include <fstream>
+#include <thread>
 #include <wrl/implements.h>
 using namespace zen;
 // 模拟没有文件系统路径且不实现 GetParent 的设备扩展，仅提供有效对象标识。
@@ -337,6 +338,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             SendMessageW(app.AddressEdit(0), WM_KEYDOWN, VK_ESCAPE, 0);
             app.Activate(1, state->background);
         } else if (state->stage == 1) {
+
             app.Activate(1, state->original);
         } else if (state->stage == 2) {
             checkMode(FVM_ICON);
@@ -593,23 +595,74 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         } else {
             if (tab->path != DataDir().parent_path().wstring())
                 state->failed = true;
-            // 解析失败、历史失败和迟到回调不得改变已提交的目录及历史。
+            // 新地址失败保留当前位置；历史失败仍移动索引并显示失效地址。
             auto &view = *app.views.at(id);
             auto originalHistory = tab->history;
             int originalIndex = tab->historyIndex;
             auto originalPath = tab->path;
             auto missing = (DataDir() / L"missing-navigation-target").wstring();
+            // 模拟真实历史：目录曾存在且缓存了 PIDL，离开后目录才被删除。
+            std::filesystem::create_directory(missing);
+            auto missingItem = ParseItem(missing);
+            app.model.locations.Refresh(missingItem.Get());
+            auto cachedMissing = *app.model.locations.Find(missing);
+            missingItem.Reset();
+            std::filesystem::remove(missing);
+
             app.Navigate(id, missing);
-            if (SUCCEEDED(view.Navigation().Error()) || tab->path != originalPath ||
+
+            if (FAILED(view.Navigation().Error()) || tab->path != originalPath ||
                 tab->history != originalHistory || tab->historyIndex != originalIndex)
                 state->failed = true;
             tab->history.insert(tab->history.begin() + tab->historyIndex, missing);
             ++tab->historyIndex;
             auto failedHistory = tab->history;
             int failedIndex = tab->historyIndex;
+            app.model.locations.Set(missing, cachedMissing);
             app.Travel(-1);
-            if (SUCCEEDED(view.Navigation().Error()) || tab->path != originalPath ||
-                tab->history != failedHistory || tab->historyIndex != failedIndex)
+            if (SUCCEEDED(view.Navigation().Error()) || tab->path != missing ||
+                tab->history != failedHistory || tab->historyIndex != failedIndex - 1)
+                state->failed = true;
+            // 未改文字回车和刷新均重试当前失败位置，不新增历史。
+            app.EditAddress(1);
+            SendMessageW(app.addressBars[1]->EditWindow(), WM_KEYDOWN, VK_RETURN, 0);
+            view.Refresh();
+            if (view.Navigation().Pending() || SUCCEEDED(view.Navigation().Error()) ||
+                tab->path != missing || tab->history != failedHistory || tab->historyIndex != failedIndex - 1)
+                state->failed = true;
+
+            app.Navigate(id, missing + L"-another");
+
+            if (SUCCEEDED(view.Navigation().Error()) || tab->path != missing || tab->history != failedHistory)
+                state->failed = true;
+            app.Travel(1);
+            ULONGLONG until = GetTickCount64() + 5000;
+            while (view.Navigation().Pending() && GetTickCount64() < until) {
+                MSG msg{};
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                Sleep(10);
+            }
+            if (FAILED(view.Navigation().Error()) || tab->path != originalPath || tab->historyIndex != failedIndex)
+                state->failed = true;
+            app.Travel(-1);
+            app.EditAddress(1);
+            HWND editor = app.addressBars[1]->EditWindow();
+            SetWindowTextW(editor, originalPath.Stored().c_str());
+            SendMessageW(editor, WM_KEYDOWN, VK_RETURN, 0);
+            until = GetTickCount64() + 5000;
+            while (view.Navigation().Pending() && GetTickCount64() < until) {
+                MSG msg{};
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                Sleep(10);
+            }
+            if (FAILED(view.Navigation().Error()) || tab->path != originalPath ||
+                tab->historyIndex != failedIndex || tab->history != failedHistory || GetFocus() == editor)
                 state->failed = true;
             tab->history = originalHistory;
             tab->historyIndex = originalIndex;
@@ -622,9 +675,11 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             view.OnNavigationFailed(unrelated);
             if (!view.Navigation().Pending())
                 state->failed = true;
+
             view.OnNavigationFailed(targetId);
+
             view.OnNavigationComplete(targetId); // 失败后迟到的成功回调必须被忽略。
-            if (view.Navigation().Pending() || SUCCEEDED(view.Navigation().Error()) ||
+            if (view.Navigation().Pending() || FAILED(view.Navigation().Error()) ||
                 tab->path != originalPath || tab->history != originalHistory ||
                 app.model.locations.Pidl(targetPath))
                 state->failed = true;
@@ -653,6 +708,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             app.PruneLocations();
             if (app.model.locations.Pidl(alias))
                 state->failed = true;
+
             app.Activate(1, state->original);
             app.CloseTabs(1, {id});
             PostMessageW(app.window, WM_CLOSE, 0, 0);
@@ -663,6 +719,22 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
     state->busy = false;
 }
 int main() {
+    std::cout << std::unitbuf;
+    // 提示框可能来自 Shell 的嵌套消息循环；仅关闭本测试进程的错误对话框。
+    std::jthread dialogs([](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            EnumWindows([](HWND w, LPARAM) -> BOOL {
+                DWORD process = 0;
+                GetWindowThreadProcessId(w, &process);
+                wchar_t cls[32]{};
+                GetClassNameW(w, cls, ARRAYSIZE(cls));
+                if (process == GetCurrentProcessId() && IsWindowVisible(w) && !wcscmp(cls, L"#32770"))
+                    PostMessageW(w, WM_CLOSE, 0, 0);
+                return TRUE;
+            }, 0);
+            Sleep(25);
+        }
+    });
     auto dir = std::filesystem::current_path() / L".test-data" /
                (L"shell-" + std::to_wstring(GetCurrentProcessId()));
     std::filesystem::create_directories(dir);
@@ -820,9 +892,11 @@ int main() {
         App app;
         CheckState check{&app, original, background, cached};
         state = &check;
+
         UINT_PTR timer = SetTimer(nullptr, 0, 100, Check);
         app.Run(GetModuleHandleW(nullptr), SW_HIDE, L"");
         KillTimer(nullptr, timer);
+
         state = nullptr;
         failed = check.failed || check.stage != 11;
         // 主窗口已销毁、App 尚未析构时，控件引用和补全对象也应完成释放。

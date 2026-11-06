@@ -21,6 +21,7 @@ class ShellView : public IExplorerBrowserEvents,
     bool browserSized = false;
     RECT browserBounds{};
     NavigationState navigation;
+    NavigationState previousNavigation;
     LocationKey navigationPath;
     void UpdateNavigation(IShellItem *item);
     void NavigationFailed(HRESULT result);
@@ -40,7 +41,7 @@ class ShellView : public IExplorerBrowserEvents,
     ShellView(App &, Id);
     ~ShellView();
     HRESULT Create(HWND parent, RECT bounds);
-    HRESULT Browse(const NavigationRequest &request);
+    HRESULT Browse(const NavigationRequest &request, bool fallback = false);
     void Retry();
     void Destroy();
     void Capture();

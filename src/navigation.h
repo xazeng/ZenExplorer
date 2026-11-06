@@ -6,7 +6,7 @@ struct NavigationRequest {
     bool appendHistory = true;
     int historyIndex = -1;
 };
-// 只保存尚未提交的请求；成功后由模型一次性提交当前位置和历史。
+// 新地址成功后提交；已有历史即使加载失败也提交其位置。
 class NavigationState {
     NavigationRequest request;
     LocationResolution identity;
