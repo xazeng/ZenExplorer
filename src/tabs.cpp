@@ -377,9 +377,9 @@ void TabStrip::Paint() {
             if (icon)
                 DrawIconEx(dc, r.left, r.top + app.S(5), icon, app.S(16), app.S(16), 0, nullptr, DI_NORMAL);
             if (!t->name.empty()) {
-                RECT star{r.left + app.S(16) - app.S(12), r.top + app.S(5) + app.S(16) - app.S(12),
+                RECT badge{r.left + app.S(16) - app.S(12), r.top + app.S(5) + app.S(16) - app.S(12),
                           r.left + app.S(16), r.top + app.S(5) + app.S(16)};
-                DrawFavoriteBadge(dc, star);
+                DrawHomeBadge(dc, badge);
             }
             r.left += app.S(23);
             auto text = app.Title(*t);
@@ -724,9 +724,9 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             auto hit = Hit(cursor);
             tipText.clear();
             if (auto *t = app.model.Find(hit.tab)) {
-                tipText = app.Title(*t) + L"\n" + app.model.locations.Text(t->path);
+                tipText = app.Title(*t) + L"\n" + app.model.locations.DisplayPath(t->path);
                 if (!t->name.empty())
-                    tipText += L"\n主目录：" + app.model.locations.Text(t->home);
+                    tipText += L"\n主目录：" + app.model.locations.DisplayPath(t->home);
             } else if (auto *g = app.model.FindGroup(pane, hit.group))
                 tipText = g->name;
             ((NMTTDISPINFOW *)b)->lpszText = tipText.data();

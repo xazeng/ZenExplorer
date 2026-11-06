@@ -120,8 +120,22 @@ LRESULT CALLBACK AddressBar::EditProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_P
             auto *tab = app->model.Find(app->model.panes[p].selected);
             if (tab && tab->id == session.tab && tab->path == session.path && text == session.text)
                 app->Activate(p, 0, true);
-            else
-                app->Navigate(app->model.panes[p].selected, text.empty() ? Home : text);
+            else if (tab) {
+                const Id id = tab->id;
+                const auto before = tab->path;
+                LocationKey destination;
+                HRESULT hr = app->model.locations.ResolveInput(text, destination);
+                // Shell 解析可能重入；不能把原编辑操作提交给已经切换的标签。
+                tab = app->model.Find(id);
+                if (app->closing || !tab || app->model.panes[p].selected != id || tab->path != before)
+                    return 0;
+                if (SUCCEEDED(hr))
+                    app->Navigate(id, destination);
+                else {
+                    Log(L"地址输入解析失败 " + ErrorText(hr));
+                    Report(app->window, L"无法确定此地址对应的目录，请检查路径或通过地址层级选择目录。", hr);
+                }
+            }
             return 0;
         }
         if (a == VK_ESCAPE) {
@@ -212,7 +226,7 @@ LRESULT CALLBACK AddressBar::CrumbProc(HWND w, UINT m, WPARAM a, LPARAM b) {
             auto parts = (GetWindowLongPtrW(d->edit, GWL_STYLE) & WS_VISIBLE)
                              ? std::vector<std::pair<std::wstring, LocationKey>>{}
                          : view != app.views.end() ? view->second->AddressParts()
-                                                   : app.model.locations.FallbackParts(t->path);
+                                                   : app.model.locations.Breadcrumbs(t->path);
             DrawIconEx(dc, x, (rc.bottom - app.S(16)) / 2, app.Icon(t->id), app.S(16), app.S(16), 0, nullptr,
                        DI_NORMAL);
             x += app.S(26);
@@ -304,7 +318,7 @@ std::wstring AddressBar::Text() const {
     if (!tab || tab->path == Home)
         return {};
     auto view = views.find(tab->id);
-    return view != views.end() ? view->second->AddressEditText() : model.locations.Text(tab->path);
+    return view != views.end() ? view->second->AddressEditText() : model.locations.EditText(tab->path);
 }
 void AddressBar::Update() {
     if (!edit || !crumb)

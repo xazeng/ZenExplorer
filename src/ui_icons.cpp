@@ -1,7 +1,9 @@
 #include "ui_icons.h"
 #include <gdiplus.h>
 namespace zen {
-void DrawFavoriteBadge(HDC dc, RECT bounds) {
+static constexpr COLORREF NavigationIconColor = RGB(80, 80, 80);
+static constexpr COLORREF DisabledNavigationIconColor = RGB(210, 210, 210);
+void DrawHomeBadge(HDC dc, RECT bounds) {
     if (!dc || bounds.right <= bounds.left || bounds.bottom <= bounds.top)
         return;
     Gdiplus::Graphics graphics(dc);
@@ -14,21 +16,22 @@ void DrawFavoriteBadge(HDC dc, RECT bounds) {
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.TranslateTransform(static_cast<float>(bounds.left), static_cast<float>(bounds.top));
     graphics.ScaleTransform((bounds.right - bounds.left) / 8.0f, (bounds.bottom - bounds.top) / 8.0f);
-    // 对应第一张常用标签预览：金色填充、细赭色轮廓、白色隔离边。
-    const Gdiplus::PointF points[] = {{4.0f, 0.65f},  {5.02f, 2.75f}, {7.35f, 3.08f}, {5.66f, 4.72f},
-                                      {6.06f, 7.05f}, {4.0f, 5.95f},  {1.94f, 7.05f}, {2.34f, 4.72f},
-                                      {0.65f, 3.08f}, {2.98f, 2.75f}};
-    Gdiplus::GraphicsPath star;
-    star.AddPolygon(points, 10);
-    Gdiplus::Pen separator(Gdiplus::Color(255, 255, 255, 255), 1.15f);
+    // 浅色隔离边避免小房子的轮廓与底层系统图标混在一起。
+    const Gdiplus::PointF points[] = {{0.9f, 3.6f}, {4.0f, 1.0f}, {7.1f, 3.6f},
+                                    {6.4f, 3.6f}, {6.4f, 6.8f}, {1.6f, 6.8f}, {1.6f, 3.6f}};
+    Gdiplus::GraphicsPath house;
+    house.AddPolygon(points, 7);
+    Gdiplus::Pen separator(Gdiplus::Color(255, 255, 255, 255), 1.8f);
     separator.SetLineJoin(Gdiplus::LineJoinRound);
-    graphics.DrawPath(&separator, &star);
-    Gdiplus::LinearGradientBrush gold(Gdiplus::PointF(0, 0), Gdiplus::PointF(0, 8),
-                                      Gdiplus::Color(255, 255, 199, 48), Gdiplus::Color(255, 245, 166, 0));
-    graphics.FillPath(&gold, &star);
-    Gdiplus::Pen outline(Gdiplus::Color(255, 183, 119, 10), 0.55f);
+    graphics.DrawPath(&separator, &house);
+    Gdiplus::SolidBrush fill(Gdiplus::Color(255, 255, 255, 255));
+    graphics.FillPath(&fill, &house);
+    COLORREF ink = NavigationIconColor;
+    Gdiplus::Pen outline(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)), 0.8f);
     outline.SetLineJoin(Gdiplus::LineJoinRound);
-    graphics.DrawPath(&outline, &star);
+    graphics.DrawPath(&outline, &house);
+    const Gdiplus::PointF door[] = {{3.2f, 6.8f}, {3.2f, 4.6f}, {4.8f, 4.6f}, {4.8f, 6.8f}};
+    graphics.DrawLines(&outline, door, 4);
 }
 void DrawUiIcon(HDC dc, RECT bounds, UiIcon icon, UINT dpi, bool disabled) {
     if (!dc || !dpi)
@@ -39,12 +42,18 @@ void DrawUiIcon(HDC dc, RECT bounds, UiIcon icon, UINT dpi, bool disabled) {
     graphics.ScaleTransform(dpi / 96.0f, dpi / 96.0f);
     graphics.TranslateTransform(-8.0f, -8.0f);
     COLORREF ink = icon == UiIcon::Add ? GetSysColor(disabled ? COLOR_GRAYTEXT : COLOR_BTNTEXT)
-                                       : (disabled ? RGB(210, 210, 210) : RGB(128, 128, 128));
+                                       : (disabled ? DisabledNavigationIconColor : NavigationIconColor);
     Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)), 1.6f);
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
     pen.SetLineJoin(Gdiplus::LineJoinRound);
     switch (icon) {
+    case UiIcon::More: {
+        Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(ink), GetGValue(ink), GetBValue(ink)));
+        for (float y : {3.25f, 8.0f, 12.75f})
+            graphics.FillEllipse(&brush, 6.75f, y - 1.25f, 2.5f, 2.5f);
+        break;
+    }
     case UiIcon::ChevronRight: {
         pen.SetWidth(1.4f);
         const Gdiplus::PointF points[] = {{6.5f, 5.0f}, {9.5f, 8.0f}, {6.5f, 11.0f}};

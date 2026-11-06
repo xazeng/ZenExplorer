@@ -56,6 +56,12 @@ struct CheckState {
     Id virtualTab = 0;
 };
 static CheckState *state;
+static void CALLBACK DismissQuickMenu(HWND, UINT, UINT_PTR timer, DWORD) {
+    KillTimer(nullptr, timer);
+    if (state && state->app->quickMenuPane < 0)
+        state->failed = true;
+    EndMenu();
+}
 static LRESULT CALLBACK CountLayoutMessages(HWND window, UINT message, WPARAM w, LPARAM l, UINT_PTR,
                                             DWORD_PTR data) {
     if (message == WM_WINDOWPOSCHANGED || message == WM_SIZE || message == WM_SHOWWINDOW)
@@ -136,7 +142,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
         };
         if (state->stage == 0) {
             checkMode(FVM_ICON);
-            // 常用标签图标与当前目录图标分离，导航不能覆盖主目录图标。
+            // 主目录标签图标与当前目录图标分离，导航不能覆盖主目录图标。
             Id favorite = app.model.Add(0, Home, 0, -1, false);
             app.model.Rename(favorite, L"常用测试");
             app.RefreshLocalIcon(favorite);
@@ -192,15 +198,21 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 GetWindowRect(app.AddressCrumb(p), &address);
                 GetWindowRect(GetDlgItem(app.window, 133 + p * 4), &refresh);
                 if (back.top != address.top || refresh.top != address.top || up.right != address.left ||
-                    address.right != refresh.left || IsWindowEnabled(GetDlgItem(app.window, 132 + p * 4))) {
+                    address.right != refresh.left || !IsWindowEnabled(GetDlgItem(app.window, 132 + p * 4))) {
                     std::cerr << "pane navigation layout/state mismatch pane=" << p << "\n";
                     state->failed = true;
                 }
                 app.Activate(1 - p);
-                // 以按钮通知验证路由；此电脑的上一级无导航副作用。
+                // 快捷访问在此电脑也可用；取消菜单不改变目录，并恢复按钮状态。
+                auto selectedBefore = app.model.panes[p].selected;
+                auto pathBefore = app.model.Find(selectedBefore)->path;
+                auto cancelTimer = SetTimer(nullptr, 0, 80, DismissQuickMenu);
                 SendMessageW(app.window, WM_COMMAND, MAKEWPARAM(132 + p * 4, BN_CLICKED),
                              (LPARAM)GetDlgItem(app.window, 132 + p * 4));
-                if (app.model.active != p) {
+                KillTimer(nullptr, cancelTimer);
+                if (app.model.active != p || app.quickMenuPane != -1 ||
+                    app.model.Find(selectedBefore)->path != pathBefore ||
+                    WindowText(GetDlgItem(app.window, 132 + p * 4)) != L"快捷访问") {
                     std::cerr << "pane navigation routing mismatch\n";
                     state->failed = true;
                 }
@@ -723,6 +735,61 @@ int main() {
         !ItemName(virtualItem.Get(), SIGDN_FILESYSPATH).empty())
         return 1;
     hierarchy.clear();
+    {
+        Model presentation;
+        auto key = presentation.locations.Refresh(virtualItem.Get());
+        auto text = presentation.locations.DisplayPath(key);
+        auto parts = presentation.locations.Breadcrumbs(key);
+        if (key.empty() || text == L"同名设备目录" || !text.ends_with(L"\\同名设备目录") ||
+            presentation.locations.DisplayName(key) != L"同名设备目录" ||
+            presentation.locations.EditText(key) != text || parts.size() < 3 ||
+            presentation.locations.Parent(key).empty() || !presentation.locations.FileSystemPath(key).empty())
+            return 1;
+        std::filesystem::create_directories(childrenRoot / L"folder2" / L"edited-child");
+        LocationKey edited;
+        auto resolvesTo = [&](const std::wstring &input, const std::filesystem::path &expected) {
+            ComPtr<IShellItem> resolved;
+            return SUCCEEDED(presentation.locations.ResolveInput(input, edited)) &&
+                   SUCCEEDED(presentation.locations.ResolveItem(edited, &resolved)) &&
+                   ItemName(resolved.Get(), SIGDN_FILESYSPATH) == expected.wstring();
+        };
+        if (!resolvesTo(text + L"\\edited-child", childrenRoot / L"folder2" / L"edited-child") ||
+            !resolvesTo(text.substr(0, text.find_last_of(L'\\')), childrenRoot) ||
+            !resolvesTo(text.substr(0, text.find_last_of(L'\\')) + L"\\folder10",
+                        childrenRoot / L"folder10") ||
+            !resolvesTo((childrenRoot / L"folder2").wstring(), childrenRoot / L"folder2") ||
+            SUCCEEDED(presentation.locations.ResolveInput(text + L"\\missing-child", edited)) ||
+            !edited.empty() || FAILED(presentation.locations.ResolveInput(L"", edited)) || edited != Home)
+            return 1;
+        auto tab = presentation.Add(0, key);
+        presentation.Remove(0, {tab}, true);
+        auto file = ConfigDir() / L"display-cache.dat";
+        if (!SaveModel(presentation, file))
+            return 1;
+        Model restored;
+        bool recovered = false, future = false;
+        if (!LoadModel(restored, file, recovered, future) ||
+            restored.locations.DisplayPath(restored.recent.front()) != text ||
+            restored.locations.DisplayName(key) != L"同名设备目录")
+            return 1;
+        // 缓存只保存文字，读取和显示不需要重新访问设备或导航。
+        restored.locations.Invalidate(key);
+        if (restored.locations.DisplayPath(key) != text || restored.locations.EditText(key) != text)
+            return 1;
+        auto home = ParseItem(Home);
+        auto homeKey = restored.locations.Refresh(home.Get());
+        if (restored.locations.DisplayPath(homeKey) != L"此电脑" ||
+            !restored.locations.EditText(homeKey).empty())
+            return 1;
+        auto sameName = Microsoft::WRL::Make<VirtualHierarchyItem>();
+        sameName->actual = ParseItem((childrenRoot / L"folder10").wstring());
+        auto otherKey = presentation.locations.Refresh(sameName.Get());
+        if (otherKey == key || presentation.locations.DisplayPath(otherKey) != text ||
+            presentation.locations.ResolveInput(text + L"\\edited-child", edited) !=
+                HRESULT_FROM_WIN32(ERROR_DUP_NAME) ||
+            !edited.empty())
+            return 1;
+    }
     virtualItem.Reset();
     ComPtr<IACList2> candidates;
     ComPtr<IEnumString> strings;

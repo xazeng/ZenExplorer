@@ -162,8 +162,9 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
     instance = h;
     std::error_code ec;
     std::filesystem::create_directories(ConfigDir(), ec);
-    bool recovered = false, future = false, obsolete = false;
-    LoadModel(model, ConfigDir() / L"session.dat", recovered, future, &obsolete);
+    bool recovered = false, future = false;
+    LoadModel(model, ConfigDir() / L"session.dat", recovered, future);
+    model.quickAccess.Load(model.locations, ConfigDir() / L"quick-access.dat");
     readOnly = future;
     // 恢复后确保当前标签可见。
     for (int p = 0; p < 2; ++p)
@@ -241,14 +242,9 @@ int App::Run(HINSTANCE h, int show, const std::wstring &path) {
         Log(L"从有效备份恢复会话");
         MessageBoxW(window, L"会话文件异常，已从备份恢复。", L"ZenExplorer",
                     MB_OK | MB_ICONINFORMATION); // 避免下一次保存用损坏主文件覆盖有效备份。
-        auto corrupt = ConfigDir() / L"session.corrupt";
-        MoveFileExW((ConfigDir() / L"session.dat").c_str(), corrupt.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
-    if (obsolete)
-        MessageBoxW(window, L"会话格式已更新，旧版标签、分组和历史不再读取。本次已重置为默认会话。",
-                    L"ZenExplorer", MB_OK | MB_ICONINFORMATION);
     if (future)
-        MessageBoxW(window, L"配置来自较新版本。本次使用默认会话且不会覆盖原配置。", L"ZenExplorer",
+        MessageBoxW(window, L"部分配置无法安全读取。本次仅恢复可读取的数据，不会覆盖原配置。", L"ZenExplorer",
                     MB_OK | MB_ICONWARNING);
     if (!path.empty())
         NewTab(model.active, path);
@@ -413,13 +409,16 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         POINT cursor;
         GetCursorPos(&cursor);
         ScreenToClient(d->hwndItem, &cursor);
-        COLORREF bg = (d->itemState & ODS_SELECTED)       ? RGB(210, 220, 233)
-                      : PtInRect(&r, cursor) && !disabled ? RGB(228, 234, 242)
-                                                          : GetSysColor(COLOR_WINDOW);
+        const int navigationIndex = (d->CtlID - NavigationBase) % 4;
+        bool menuPressed = navigationIndex == 2 && quickMenuPane == (int)(d->CtlID - NavigationBase) / 4;
+        COLORREF bg = ((d->itemState & ODS_SELECTED) || menuPressed) ? RGB(210, 220, 233)
+                      : PtInRect(&r, cursor) && !disabled            ? RGB(228, 234, 242)
+                                                                     : GetSysColor(COLOR_WINDOW);
         auto brush = CreateSolidBrush(bg);
         FillRect(d->hDC, &r, brush);
         DeleteObject(brush);
-        DrawUiIcon(d->hDC, r, static_cast<UiIcon>((d->CtlID - NavigationBase) % 4), dpi, disabled);
+        DrawUiIcon(d->hDC, r, navigationIndex == 2 ? UiIcon::More : static_cast<UiIcon>(navigationIndex), dpi,
+                   disabled);
         if (d->itemState & ODS_FOCUS) {
             InflateRect(&r, -S(3), -S(3));
             DrawFocusRect(d->hDC, &r);
@@ -449,7 +448,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             SendMessageW(toolbar, TB_ADDBUTTONSW, 1, (LPARAM)&button);
         }
         for (int i = 0; i < 8; ++i) {
-            const wchar_t *labels[] = {L"后退", L"前进", L"上一级", L"刷新"};
+            const wchar_t *labels[] = {L"后退", L"前进", L"快捷访问", L"刷新"};
             HWND btn = CreateWindowW(L"BUTTON", labels[i % 4], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 1,
                                      1, window, (HMENU)(INT_PTR)(NavigationBase + i), instance, nullptr);
             SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
@@ -465,7 +464,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         }
         HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP, 0, 0,
                                     0, 0, window, nullptr, instance, nullptr);
-        const wchar_t *help[] = {L"后退（Alt+←）", L"前进（Alt+→）", L"上一级（Alt+↑）", L"刷新（F5）"};
+        const wchar_t *help[] = {L"后退（Alt+←）", L"前进（Alt+→）", L"快捷访问", L"刷新（F5）"};
         for (int i = 0; i < 8; ++i) {
             TOOLINFOW ti{sizeof(ti)};
             ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
@@ -538,7 +537,10 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         if (LOWORD(a) >= NavigationBase && LOWORD(a) < NavigationBase + 8) {
             const int offset = LOWORD(a) - NavigationBase;
             Activate(offset / 4);
-            Command(Back + offset % 4);
+            if (offset % 4 == 2)
+                ShowQuickAccess(offset / 4);
+            else
+                Command(Back + offset % 4);
         } else if (LOWORD(a) == 500 || LOWORD(a) == 501) {
             int p = LOWORD(a) - 500;
             auto *t = model.Find(model.panes[p].selected);
@@ -892,6 +894,8 @@ LocationKey App::RememberLocation(IShellItem *item) {
 }
 void App::PruneLocations() {
     std::set<LocationKey> retained(model.recent.begin(), model.recent.end());
+    for (const auto &entry : model.quickAccess.links)
+        retained.insert(entry.target);
     for (const auto &pane : model.panes)
         for (const auto &tab : pane.tabs) {
             retained.insert(tab.path);
@@ -969,7 +973,7 @@ void App::CloseTabs(int p, const std::vector<Id> &ids, bool group) {
         if (auto *t = model.Find(id))
             named |= !t->name.empty();
     if (named &&
-        !Confirm(window, group ? L"当前关闭的组包含常用标签，是否确认" : L"当前关闭的是常用标签，是否确认"))
+        !Confirm(window, group ? L"当前关闭的组包含主目录标签，是否确认" : L"当前关闭的是主目录标签，是否确认"))
         return;
     model.Remove(p, ids, true, group);
     SyncViews();
@@ -1021,7 +1025,9 @@ void App::MoveGroup(int pane, Id group, int target, int index) {
     Activate(model.active);
 }
 std::wstring App::Title(const Tab &t) const {
-    return t.Title();
+    return !t.name.empty()          ? t.name
+           : !t.displayName.empty() ? t.displayName
+                                    : model.locations.DisplayName(t.path);
 }
 HICON App::Icon(Id id) const {
     auto it = icons.find(id);
@@ -1044,7 +1050,7 @@ void App::RefreshHomeIcon(Id id) {
     if (!tab || tab->name.empty())
         return;
     const auto &key = tab->home;
-    auto path = model.locations.FilePath(key);
+    auto path = model.locations.FileSystemPath(key);
     // 主目录不变时保留图标，导航元数据仅更新地址栏使用的当前目录图标。
     if (homeIconPaths.contains(id) && homeIconPaths[id] == key && homeIcons[id])
         return;
@@ -1088,7 +1094,7 @@ void App::RefreshLocalIcon(Id id) {
         return;
     HICON icon = nullptr;
     iconIndices.erase(id);
-    auto path = model.locations.FilePath(t->path);
+    auto path = model.locations.FileSystemPath(t->path);
     auto state = InspectLocalPath(path);
     if (t->path == Home || state == LocalPathState::Missing) {
         SHSTOCKICONINFO info{sizeof(info)};
@@ -1120,7 +1126,8 @@ void App::RefreshLocalIcon(Id id) {
     RefreshHomeIcon(id);
 }
 void App::RefreshMetadata(Id id, IShellItem *item) {
-    auto title = ItemName(item, SIGDN_NORMALDISPLAY);
+    auto key = model.locations.Remember(item);
+    auto title = model.locations.DisplayName(key);
     if (auto *tab = model.Find(id); tab && !title.empty() && tab->displayName != title) {
         tab->displayName = std::move(title);
         Changed();
@@ -1169,8 +1176,7 @@ void App::UpdateStatus() {
         EnableWindow(GetDlgItem(window, NavigationBase + p * 4), tab && tab->historyIndex > 0);
         EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 1),
                      tab && tab->historyIndex + 1 < (int)tab->history.size());
-        EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 2),
-                     view != views.end() && view->second->CanUp());
+        EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 2), tab != nullptr);
         EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 3), view != views.end());
     }
     auto it = views.find(t->id);
@@ -1211,7 +1217,7 @@ void App::BuildMenu() {
     HMENU main = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"最近关闭目录");
     for (size_t i = 0; i < model.recent.size(); ++i)
-        AppendMenuW(file, MF_STRING, RecentBase + i, model.locations.Text(model.recent[i]).c_str());
+        AppendMenuW(file, MF_STRING, RecentBase + i, model.locations.DisplayPath(model.recent[i]).c_str());
     if (model.recent.empty())
         AppendMenuW(file, MF_STRING | MF_GRAYED, 0, L"暂无记录");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
@@ -1362,12 +1368,13 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
     constexpr UINT ColorBase = 20;
     if (tab) {
         auto *t = model.Find(tab);
-        AppendMenuW(menu, MF_STRING, 1, t && !t->name.empty() ? L"修改常用标签名称…" : L"设为常用标签…");
+        AppendMenuW(menu, MF_STRING, 1, t && !t->name.empty() ? L"修改名称…" : L"设置主目录…");
         if (t && !t->name.empty()) {
-            AppendMenuW(menu, MF_STRING, 2, L"将当前目录设为主目录");
-            AppendMenuW(menu, MF_STRING, 6, L"取消常用标签");
+            AppendMenuW(menu, MF_STRING, 2, L"更新主目录为当前目录");
+            AppendMenuW(menu, MF_STRING, 6, L"取消主目录");
         }
         AppendMenuW(menu, MF_STRING, 5, L"在系统资源管理器中打开");
+        AppendMenuW(menu, MF_STRING | (model.quickAccess.readOnly ? MF_GRAYED : 0), 7, L"添加到快捷访问…");
         AppendMenuW(menu, MF_STRING, 3, L"添加到新组");
         HMENU groups = CreatePopupMenu();
         for (size_t i = 0; i < model.panes[p].groups.size(); ++i)
@@ -1434,12 +1441,16 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             OpenInExplorer(t->path);
             return;
         }
+        if (cmd == 7) {
+            AddQuickAccess(tab);
+            return;
+        }
         if (cmd == 1) {
             auto value =
-                Input(window, t->name.empty() ? L"设为常用标签" : L"修改常用标签名称", Title(*t),
-                      t->name.empty() ? L"设置标签名称，并以当前目录为主目录。浏览其他目录时名称和图标不变，"
-                                        L"双击标签返回主目录。"
-                                      : L"修改名称不会改变主目录；清空名称或使用右键菜单可取消常用标签。");
+                Input(window, t->name.empty() ? L"设置主目录" : L"修改名称", Title(*t),
+                      t->name.empty() ? L"为标签命名，并将当前目录设为主目录；"
+                                        L"双击标签可返回。"
+                                      : L"修改名称不会改变主目录；清空名称或选择“取消主目录”可恢复普通标签。");
             if (value)
                 model.Rename(tab, *value);
         } else if (cmd == 2) {
@@ -1537,7 +1548,7 @@ void App::OpenInExplorer(const LocationKey &path) {
     }
     Log(L"系统资源管理器打开 path=" + path.Stored() + L" result=" + std::to_wstring((unsigned long)hr));
     if (FAILED(hr))
-        Report(window, L"无法在系统资源管理器中打开：" + model.locations.Text(path), hr);
+        Report(window, L"无法在系统资源管理器中打开：" + model.locations.DisplayPath(path), hr);
 }
 void App::OpenSelected(ShellView &v, bool newTab) {
     auto items = v.Selected();

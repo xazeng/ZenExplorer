@@ -111,6 +111,11 @@ std::wstring LocationName(const std::wstring &path) {
     auto pos = path.find_last_of(L"\\/");
     return pos == std::wstring::npos || pos + 1 == path.size() ? path : path.substr(pos + 1);
 }
+bool IsAbsoluteDrivePath(const std::wstring &path) {
+    return path.size() >= 3 &&
+           ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
+           path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
+}
 std::wstring SizeText(uint64_t bytes) {
     static const wchar_t *units[] = {L"B", L"KB", L"MB", L"GB", L"TB", L"PB"};
     double n = (double)bytes;
@@ -155,7 +160,7 @@ void Report(HWND w, const std::wstring &s, HRESULT hr) {
 }
 // 不访问 UNC 或映射网络驱动器；只有在线本地卷上的路径不存在才显示失效。
 LocalPathState InspectLocalPath(const std::wstring &path) {
-    if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
+    if (!IsAbsoluteDrivePath(path))
         return LocalPathState::Deferred;
     auto root = path.substr(0, 2) + L"\\";
     UINT type = GetDriveTypeW(root.c_str());
@@ -191,7 +196,7 @@ std::vector<std::pair<std::wstring, std::wstring>> Breadcrumbs(const std::wstrin
     std::replace(path.begin(), path.end(), L'/', L'\\');
     if (path.starts_with(L"::"))
         return {{LocationName(path), path}};
-    bool drive = path.size() >= 3 && path[1] == L':' && path[2] == L'\\';
+    bool drive = IsAbsoluteDrivePath(path);
     bool unc = path.starts_with(L"\\\\");
     if (!drive && !unc)
         return {{LocationName(path), path}};

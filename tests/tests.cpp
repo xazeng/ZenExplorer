@@ -1,4 +1,5 @@
 #include "storage.h"
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <limits>
@@ -126,13 +127,6 @@ static void CheckSingleExpandedGroups() {
     bool recovered = false, future = false;
     CHECK(LoadModel(loaded, file, recovered, future) && !loaded.singleExpandedGroup);
     CHECK(loaded.groupDoubleClick);
-    auto bytes = ReadEnvelope(file, 0x434E455A, 6);
-    for (uint32_t version = 1; version < 6; ++version) {
-        CHECK(WriteEnvelope(file, 0x434E455A, bytes, false, version));
-        bool obsolete = false;
-        CHECK(!LoadModel(loaded, file, recovered, future, &obsolete));
-        CHECK(obsolete && !recovered && !future);
-    }
 }
 static void CheckGroupSelectionMemory() {
     Model m;
@@ -212,6 +206,38 @@ static void CheckGroupColors() {
     CHECK(loaded.FindGroup(0, groups[2])->color == RGB(1, 2, 3));
     CHECK(loaded.FindGroup(0, available)->color == GroupColors[2].color);
 }
+static void CheckLocationText() {
+    Model model;
+    // 模拟设备提供程序的解析名称；不依赖设备型号、实际连接或名称前缀特判。
+    const std::wstring device = L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\"
+                                L"\\\\?\\usb#vid_1234&pid_5678#device\\{storage-id}";
+    model.locations.Set(device, {device, L"内部存储设备", {}});
+    model.locations.Set(L"zen-shell:another-device", {L"", L"SD 卡", {2, 0, 0, 0}});
+    CHECK(model.locations.DisplayPath(device) == L"内部存储设备");
+    CHECK(model.locations.FileSystemPath(device).empty());
+    CHECK(model.locations.Breadcrumbs(device).front().first == L"内部存储设备");
+    CHECK(model.locations.DisplayPath(L"zen-shell:another-device") == L"SD 卡");
+    CHECK(model.locations.DisplayPath(Home) == L"此电脑");
+    for (const auto *path : {L"C:\\", L"d:/work/child", L"C:\\work\\child", L"\\\\server\\share\\child"}) {
+        model.locations.Set(path, {path, L"只显示末级名称会丢失路径", {}});
+        CHECK(model.locations.DisplayPath(path) == path);
+        CHECK(model.locations.FileSystemPath(path) == path);
+    }
+    for (const auto *path : {L"", L"C:", L"C:relative", L"::\\device", L"1:\\invalid", L"https://host"})
+        CHECK(!IsAbsoluteDrivePath(path));
+    auto id = model.Add(0, device);
+    model.Remove(0, {id}, true);
+    CHECK(model.recent.front() == device);
+    CHECK(model.locations.DisplayPath(model.recent.front()) == L"内部存储设备");
+    const auto file = ConfigDir() / L"recent-device.dat";
+    CHECK(SaveModel(model, file));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future));
+    CHECK(loaded.recent.front() == device);
+    CHECK(loaded.locations.DisplayPath(loaded.recent.front()) == L"内部存储设备");
+    CHECK(loaded.locations.FileSystemPath(loaded.recent.front()).empty());
+}
 static void CheckLocationStorage() {
     Model m;
     auto id = m.panes[0].selected;
@@ -243,7 +269,169 @@ static void CheckLocationStorage() {
     CHECK(LoadModel(loaded, file, recovered, future) && !recovered);
     CHECK((*loaded.locations.Find(key)).pidl == location.pidl);
 }
-int main() {
+static void CheckIndependentTabs() {
+    Model m;
+    auto id = m.panes[0].selected;
+    m.CommitNavigation(id, L"C:\\home", {L"C:\\home"});
+    m.Rename(id, L"常用工作目录");
+    auto group = m.MakeGroup(0, id);
+    m.FindGroup(0, group)->name = L"工作";
+    m.CommitNavigation(id, L"C:\\elsewhere", {L"C:\\elsewhere"});
+    auto file = ConfigDir() / L"independent.dat";
+    CHECK(SaveModel(m, file));
+    auto tabs = TabsPath(file);
+    auto originalTabs = ReadEnvelope(tabs, 0x544E455A, 2);
+    std::filesystem::remove(file);
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future) && !future && !recovered);
+    CHECK(loaded.Find(id)->name == L"常用工作目录" && loaded.Find(id)->path == L"C:\\home");
+    CHECK(loaded.Find(id)->group == group && loaded.FindGroup(0, group)->name == L"工作");
+    CHECK(ReadEnvelope(tabs, 0x544E455A, 2) == originalTabs);
+    // 标签文件损坏只回退自己的备份；附属配置不参与标签定义恢复。
+    CHECK(SaveModel(m, file));
+    std::ofstream(tabs, std::ios::binary | std::ios::trunc) << "broken";
+    CHECK(LoadModel(loaded, file, recovered, future) && recovered && !future);
+    CHECK(loaded.Find(id)->name == m.Find(id)->name);
+    CHECK(SaveModel(loaded, file));
+    CHECK(LoadModel(loaded, file, recovered, future) && !recovered && !future);
+    auto current = ReadEnvelope(tabs, 0x544E455A, 2);
+    CHECK(WriteEnvelope(tabs, 0x544E455A, current, false, 3));
+    CHECK(!LoadModel(loaded, file, recovered, future) && future);
+    CHECK(!SaveModel(m, file));
+    CHECK(ReadEnvelope(tabs, 0x544E455A, 3) == current);
+}
+static void CheckQuickAccess() {
+    Model m;
+    auto tab = m.Add(0, L"C:\\quick-only");
+    auto entry = m.quickAccess.Put(m.locations, m.Find(tab)->path, L"工作");
+    CHECK(entry && m.quickAccess.links.size() == 1);
+    CHECK(m.quickAccess.Put(m.locations, m.Find(tab)->path, L"新名称") == entry);
+    CHECK(m.quickAccess.links.size() == 1 && m.quickAccess.links[0].name == L"新名称");
+    auto second = m.quickAccess.Put(m.locations, Home, L"起点");
+    CHECK(second && m.quickAccess.Move(1, -1) && m.quickAccess.links[0].id == second);
+    CHECK(!m.quickAccess.Move(0, -1));
+    auto file = ConfigDir() / L"quick-access-test.dat";
+    CHECK(m.quickAccess.Save(m.locations, file));
+    m.Remove(0, {tab}, false);
+    auto session = ConfigDir() / L"quick-only-session.dat";
+    CHECK(SaveModel(m, session));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, session, recovered, future));
+    CHECK(loaded.locations.Find(L"C:\\quick-only"));
+    // 独立配置可在没有标签会话的情况下恢复，并保留顺序与目录身份。
+    Model independent;
+    independent.quickAccess.Load(independent.locations, file);
+    CHECK(!independent.quickAccess.readOnly && independent.quickAccess.links.size() == 2);
+    CHECK(independent.quickAccess.links[0].id == second && independent.quickAccess.links[1].id == entry);
+    CHECK(independent.locations.EnsureId(independent.quickAccess.links[1].target) ==
+          m.locations.EnsureId(L"C:\\quick-only"));
+    CHECK(independent.quickAccess.Remove(1));
+    CHECK(independent.quickAccess.Save(independent.locations, file));
+    CHECK(independent.quickAccess.Save(independent.locations, file));
+    CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"quick-access" / file.stem()),
+                        std::filesystem::directory_iterator{}) == 2);
+    std::ofstream(file, std::ios::binary | std::ios::trunc) << "broken";
+    QuickAccess backup;
+    backup.Load(independent.locations, file);
+    CHECK(!backup.readOnly && backup.links.size() == 1 && backup.links[0].id == second);
+    CHECK(backup.Save(independent.locations, file));
+    auto bytes = ReadEnvelope(file, 0x514E455A);
+    CHECK(WriteEnvelope(file, 0x514E455A, bytes, false, 2));
+    QuickAccess newer;
+    newer.Load(independent.locations, file);
+    CHECK(newer.readOnly && !newer.Save(independent.locations, file));
+}
+static void CheckLocationReferencesAndCleanup() {
+    Model m;
+    auto first = m.Add(0, L"C:\\shared-location");
+    auto second = m.Add(0, L"C:\\shared-location");
+    m.Rename(first, L"保留的主目录标签");
+    auto group = m.MakeGroup(0, first);
+    auto file = ConfigDir() / L"stable-ids.dat";
+    CHECK(SaveModel(m, file));
+    auto shared = m.locations.EnsureId(m.Find(first)->path);
+    CHECK(shared == m.locations.EnsureId(m.Find(second)->path));
+    auto bytes = ReadEnvelope(TabsPath(file), 0x544E455A, 2);
+    Reader reader{bytes};
+    auto generation = reader.Pod<GUID>();
+    auto recordsFile = LocationsPath(file, generation);
+    // 关系文件中不再嵌入目录解析名称；位置表中同一目录只存一份。
+    Writer needle;
+    needle.Text(L"C:\\shared-location");
+    CHECK(std::search(bytes.begin(), bytes.end(), needle.bytes.begin(), needle.bytes.end()) == bytes.end());
+    auto records = ReadEnvelope(recordsFile, 0x4C4E455A);
+    Reader data{records};
+    LocationStore store;
+    store.ReadRecords(data);
+    CHECK(store.Count() == 2 && store.EnsureId(L"C:\\shared-location") == shared);
+    CHECK(m.CommitNavigation(first, L"D:\\corrected", {L"D:\\corrected"}));
+    CHECK(SaveModel(m, file));
+    CHECK(m.locations.EnsureId(m.Find(first)->path) != shared);
+    CHECK(m.locations.EnsureId(m.Find(second)->path) == shared);
+    CHECK(m.locations.EnsureId(m.Find(first)->home) == shared);
+    // 主资料缺失时使用上一份资料补齐同一 ID，不能恢复成旧标签结构。
+    bytes = ReadEnvelope(TabsPath(file), 0x544E455A, 2);
+    Reader head{bytes};
+    auto current = head.Pod<GUID>();
+    std::filesystem::remove(LocationsPath(file, current));
+    Model loaded;
+    bool recovered = false, future = false;
+    CHECK(LoadModel(loaded, file, recovered, future));
+    CHECK(loaded.Find(first)->name == m.Find(first)->name && loaded.Find(first)->group == group);
+    CHECK(loaded.Find(second)->path == L"C:\\shared-location");
+    CHECK(loaded.locations.EnsureId(loaded.Find(first)->path) == m.locations.EnsureId(m.Find(first)->path));
+    CHECK(loaded.Find(first)->path != Home);
+    // 两份目录资料均缺失，仍保留标签和组及不可解析的 ID 引用。
+    std::filesystem::remove(recordsFile);
+    CHECK(LoadModel(loaded, file, recovered, future));
+    CHECK(loaded.Find(first)->name == m.Find(first)->name && loaded.Find(first)->group == group);
+    CHECK(loaded.locations.EnsureId(loaded.Find(second)->path) == shared);
+    CHECK(loaded.Find(second)->path != Home);
+    // 历史和最近关闭仍是有效引用；移除后只剩此电脑，备份轮换后旧资料被回收。
+    m.Remove(0, {first, second}, true);
+    CHECK(SaveModel(m, file));
+    CHECK(LoadModel(loaded, file, recovered, future) && !loaded.recent.empty());
+    CHECK(loaded.locations.Find(L"C:\\shared-location"));
+    m.recent.clear();
+    GUID orphan{};
+    CHECK(SUCCEEDED(CoCreateGuid(&orphan)));
+    CHECK(WriteEnvelope(LocationsPath(file, orphan), 0x4C4E455A, records, false));
+    CHECK(SaveModel(m, file));
+    CHECK(!std::filesystem::exists(LocationsPath(file, orphan)));
+    CHECK(SaveModel(m, file));
+    CHECK(LoadModel(loaded, file, recovered, future) && loaded.locations.Count() == 1);
+    CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"locations" / L"stable-ids"),
+                        std::filesystem::directory_iterator{}) == 2);
+    CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history" / L"stable-ids"),
+                        std::filesystem::directory_iterator{}) == 2);
+}
+int main(int argc, char **argv) {
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--check-storage") {
+        auto root = std::filesystem::absolute(argv[2]);
+        SetEnvironmentVariableW(L"ZENEXPLORER_ROOT_DIR", root.c_str());
+        Model m;
+        bool recovered = false, future = false;
+        if (!LoadModel(m, ConfigDir() / L"session.dat", recovered, future) || recovered || future)
+            return 1;
+        for (int p = 0; p < 2; ++p) {
+            size_t named = 0;
+            for (const auto &t : m.panes[p].tabs)
+                named += !t.name.empty();
+            std::cout << "pane=" << p << " tabs=" << m.panes[p].tabs.size()
+                      << " groups=" << m.panes[p].groups.size() << " named=" << named << "\n";
+        }
+        if (argc == 4) {
+            auto output = std::filesystem::absolute(argv[3]);
+            if (output == root)
+                return 1;
+            SetEnvironmentVariableW(L"ZENEXPLORER_ROOT_DIR", output.c_str());
+            if (!SaveModel(m, ConfigDir() / L"session.dat"))
+                return 1;
+        }
+        return m.Valid() ? 0 : 1;
+    }
     auto portable =
         std::filesystem::current_path() / L".test-data" /
         (L"portable-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
@@ -403,12 +591,12 @@ int main() {
         CHECK(!loaded.wrap && loaded.Valid() && !recovered && loaded.windowDpi == m.windowDpi);
         CHECK(loaded.recent == m.recent && loaded.Find(c)->history == m.Find(c)->history);
         CHECK(loaded.Find(c)->historyIndex == m.Find(c)->historyIndex);
-        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history"),
+        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history" / L"session"),
                             std::filesystem::directory_iterator{}) == 2);
         auto blockedConfig = ConfigDir() / L"blocked.dat";
         std::filesystem::create_directories(blockedConfig);
         CHECK(!SaveModel(m, blockedConfig));
-        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history"),
+        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history" / L"session"),
                             std::filesystem::directory_iterator{}) == 2);
         CHECK(LoadModel(loaded, file, recovered, future) && !recovered && !loaded.wrap);
         CHECK(!loaded.Find(d)->opener);
@@ -420,23 +608,19 @@ int main() {
         CHECK(loaded.Find(d)->displayName == L"数据盘 (D:)");
         CHECK(loaded.CommitNavigation(d, L"D:\\other", {L"D:\\other"}));
         CHECK(loaded.Find(d)->displayName.empty());
-        Model legacy;
-        auto fixture = std::filesystem::path(ZEN_TEST_SOURCE_DIR) / "tests" / "fixtures" / "session-v1.dat";
-        CHECK(!LoadModel(legacy, fixture, recovered, future) && !future && !recovered);
-
         // 历史丢失时必须恢复同一代配置和历史，不能与其他快照混用。
-        auto configBytes = ReadEnvelope(file, 0x434E455A, 6);
+        auto configBytes = ReadEnvelope(file, 0x434E455A, 7);
         Reader configReader{configBytes};
         auto generation = configReader.Pod<GUID>();
         wchar_t generationName[40]{};
         StringFromGUID2(generation, generationName, 40);
-        auto historyFile = DataDir() / L"history" / (std::wstring(generationName) + L".dat");
+        auto historyFile = DataDir() / L"history" / L"session" / (std::wstring(generationName) + L".dat");
         std::filesystem::remove(historyFile);
-        CHECK(LoadModel(loaded, file, recovered, future) && recovered && loaded.wrap);
-        CHECK(loaded.recent == m.recent);
+        CHECK(LoadModel(loaded, file, recovered, future) && !recovered && !loaded.wrap);
+        CHECK(loaded.recent.empty());
         CHECK(SaveModel(m, file));
         CHECK(SaveModel(m, file));
-        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history"),
+        CHECK(std::distance(std::filesystem::directory_iterator(DataDir() / L"history" / L"session"),
                             std::filesystem::directory_iterator{}) == 2);
         // 为下面的损坏恢复用例建立 wrap=true 的有效备份。
         m.wrap = true;
@@ -447,17 +631,18 @@ int main() {
         HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING, 0, nullptr);
         CHECK(h != INVALID_HANDLE_VALUE);
         CloseHandle(h);
-        CHECK(LoadModel(loaded, file, recovered, future) && recovered && loaded.wrap);
+        CHECK(LoadModel(loaded, file, recovered, future) && !recovered && loaded.wrap);
         // 有效备份存在时也不降级加载未来版本，避免旧程序覆盖新格式。
         CHECK(SaveModel(m, file));
         h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         CHECK(h != INVALID_HANDLE_VALUE);
         SetFilePointer(h, 4, nullptr, FILE_BEGIN);
         DWORD written = 0;
-        uint32_t version = 7;
+        uint32_t version = 8;
         CHECK(WriteFile(h, &version, sizeof(version), &written, nullptr) && written == sizeof(version));
         CloseHandle(h);
-        CHECK(!LoadModel(loaded, file, recovered, future) && future && !recovered);
+        CHECK(LoadModel(loaded, file, recovered, future) && future && !recovered);
+        CHECK(loaded.Find(c)->name == m.Find(c)->name);
         std::vector<uint8_t> badBool{2};
         Reader reader{badBool};
         bool rejected = false;
@@ -473,6 +658,10 @@ int main() {
         std::filesystem::remove(backup);
         CHECK(m.Find(d) != nullptr);
         CheckLocationStorage();
+        CheckIndependentTabs();
+        CheckLocationReferencesAndCleanup();
+        CheckQuickAccess();
+        CheckLocationText();
         CheckSingleExpandedGroups();
         CheckGroupColors();
         CheckGroupSelectionMemory();

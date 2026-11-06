@@ -89,6 +89,11 @@ class App {
     void MoveGroup(int pane, Id group, int target, int index);
     void SyncViews(int pane = -1);
     void TabMenu(int p, Id tab, Id group, POINT pt);
+    int quickMenuPane = -1;
+    void ShowQuickAccess(int pane);
+    void AddQuickAccess(Id tab);
+    void ManageQuickAccess();
+    bool CommitQuickAccess(QuickAccess value);
     void FileMenu(ShellView &, POINT, bool background);
     ShellView *MenuSource(Id id, IShellView *shell, const LocationKey &path);
     FileTaskFeedback tasks;

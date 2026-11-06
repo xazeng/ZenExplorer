@@ -42,6 +42,8 @@ ComPtr<IShellItem> ParseItem(const std::wstring &path);
 // 产品导航边界；实际是否存在父级由 ShellView 的导航缓存确认。
 bool CanNavigateUp(const std::wstring &path);
 std::wstring LocationName(const std::wstring &path);
+// 仅判断盘符绝对路径的语法，不访问磁盘或解析 Shell 命名空间。
+bool IsAbsoluteDrivePath(const std::wstring &path);
 std::wstring SizeText(uint64_t size);
 std::wstring Quote(const std::wstring &text);
 std::wstring WindowText(HWND hwnd);

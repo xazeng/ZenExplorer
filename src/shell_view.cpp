@@ -375,94 +375,26 @@ ComPtr<IShellItem> ShellView::Current() {
     return out;
 }
 void ShellView::UpdateNavigation(IShellItem *item) {
-    navigationPath = app.RememberLocation(item);
-    addressEditText = app.model.locations.Text(navigationPath);
-    parentPath.clear();
-    breadcrumbs = app.model.locations.FallbackParts(navigationPath);
-    if (!item || navigationPath.empty())
-        return;
-
-    // 只在导航完成时查询 Shell；重绘和工具栏更新不解析网络路径。
-    SFGAOF attributes = 0;
-    bool filePath =
-        SUCCEEDED(item->GetAttributes(SFGAO_FILESYSTEM, &attributes)) && (attributes & SFGAO_FILESYSTEM);
-    auto filesystemPath = filePath ? ItemName(item, SIGDN_FILESYSPATH) : std::wstring{};
-    if (filePath && !filesystemPath.empty())
-        breadcrumbs = app.model.locations.FallbackParts(filesystemPath);
-    std::vector<ComPtr<IShellItem>> objects;
-    HRESULT identity = ShellHierarchy(item, objects);
-    if (FAILED(identity))
-        Log(L"地址层级不完整 " + ErrorText(identity));
-    std::vector<std::pair<std::wstring, LocationKey>> hierarchy;
-    std::vector<std::wstring> displayHierarchy;
-    for (size_t depth = 0; depth < objects.size(); ++depth) {
-        const auto &current = objects[depth];
-        auto path = app.RememberLocation(current.Get());
-        if (path.empty())
-            break;
-        if (depth == 1)
-            parentPath = path;
-        const bool driveRoot =
-            path.Stored().size() == 3 && path.Stored()[1] == L':' && path.Stored()[2] == L'\\';
-        auto label =
-            ItemName(current.Get(), driveRoot ? SIGDN_NORMALDISPLAY : SIGDN_PARENTRELATIVEFORADDRESSBAR);
-        if (label.empty())
-            label = ItemName(current.Get(), SIGDN_NORMALDISPLAY);
-        if (label.empty())
-            label = app.model.locations.Text(path);
-        hierarchy.push_back({label, path});
-        auto display = ItemName(current.Get(), SIGDN_NORMALDISPLAY);
-        displayHierarchy.push_back(display.empty() ? label : display);
-        if (filePath) {
-            // 保留既定的此电脑、磁盘或服务器/共享层级，只替换系统显示名。
-            for (auto &[name, target] : breadcrumbs)
-                if (_wcsicmp(target.Stored().c_str(), path.Stored().c_str()) == 0)
-                    name = label;
-        }
-    }
-    if (!filePath && !hierarchy.empty()) {
-        std::reverse(hierarchy.begin(), hierarchy.end());
-        breadcrumbs = std::move(hierarchy);
-    }
-    // 显示路径与导航标识分离，不依赖设备名称或特定命名空间 GUID。
-    if (!filesystemPath.empty())
-        addressEditText = filesystemPath;
-    else {
-        addressEditText.clear();
-        for (auto it = displayHierarchy.rbegin(); it != displayHierarchy.rend(); ++it) {
-            if (!addressEditText.empty())
-                addressEditText += L"\\";
-            addressEditText += *it;
-        }
-        if (addressEditText.empty())
-            addressEditText = ItemName(item, SIGDN_NORMALDISPLAY);
-    }
+    navigationPath = app.model.locations.Refresh(item);
 }
 std::wstring ShellView::AddressEditText() const {
     auto *tab = app.model.Find(id);
-    if (!tab || tab->path == Home)
-        return {};
-    return tab->path == navigationPath ? addressEditText : app.model.locations.Text(tab->path);
+    return tab ? app.model.locations.EditText(tab->path) : std::wstring{};
 }
 std::vector<std::pair<std::wstring, LocationKey>> ShellView::AddressParts() const {
     auto *tab = app.model.Find(id);
-    if (!tab)
-        return {};
-    if (tab->path == navigationPath)
-        return breadcrumbs;
-    if (app.model.locations.Find(tab->path))
-        return {{app.model.locations.Text(tab->path), tab->path}};
-    return app.model.locations.FallbackParts(tab->path);
+    return tab ? app.model.locations.Breadcrumbs(tab->path)
+               : std::vector<std::pair<std::wstring, LocationKey>>{};
 }
 bool ShellView::CanUp() const {
     auto *tab = app.model.Find(id);
     return tab && !navigation.Pending() && SUCCEEDED(navigation.Error()) && tab->path == navigationPath &&
-           CanNavigateUp(tab->path.Stored()) && !parentPath.empty();
+           CanNavigateUp(tab->path.Stored()) && !app.model.locations.Parent(tab->path).empty();
 }
 void ShellView::Up() {
     if (!CanUp())
         return;
-    auto destination = parentPath;
+    auto destination = app.model.locations.Parent(navigationPath);
     app.Navigate(id, destination);
 }
 std::vector<ComPtr<IShellItem>> ShellView::Selected() {

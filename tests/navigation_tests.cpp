@@ -21,8 +21,8 @@ static void LocationIdentity() {
     auto record = *locations.Find(home);
     record.parsingName.clear();
     locations.Set(alias, record);
-    CHECK(locations.FilePath(alias).empty());
-    CHECK(locations.Text(alias) == record.displayName);
+    CHECK(locations.FileSystemPath(alias).empty());
+    CHECK(locations.DisplayPath(alias) == record.displayName);
     LocationResolution resolved;
     CHECK(SUCCEEDED(locations.Resolve(alias, resolved)) && resolved.savedIdentity);
     ComPtr<IShellItem> restored;
@@ -37,7 +37,7 @@ static void LocationIdentity() {
     CHECK(SUCCEEDED(locations.Resolve(alias, resolved)) && !resolved.savedIdentity);
     locations.Retain({alias});
     CHECK(locations.Find(alias) && !locations.Find(home));
-    CHECK(locations.FilePath(L"C:\\work") == L"C:\\work");
+    CHECK(locations.FileSystemPath(L"C:\\work") == L"C:\\work");
 }
 
 static void NavigationTransitions() {

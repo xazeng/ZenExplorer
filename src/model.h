@@ -1,5 +1,6 @@
 #pragma once
 #include "navigation.h"
+#include "quick_access.h"
 #include <unordered_map>
 namespace zen {
 using Id = uint64_t;
@@ -59,6 +60,7 @@ struct GroupExpansionState {
 };
 struct Model {
     LocationStore locations;
+    QuickAccess quickAccess;
     Pane panes[2];
     int active = 0;
     double split = .5;

@@ -211,7 +211,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             ShellMenu menu;
             HRESULT hr = menu.Create(view.shell.Get(), true, app->window);
             if (SUCCEEDED(hr))
-                CheckMenuDirectory(menu, app->model.locations.FilePath(app->model.Find(id)->path));
+                CheckMenuDirectory(menu, app->model.locations.FileSystemPath(app->model.Find(id)->path));
             UINT cmd = SUCCEEDED(hr) ? FindNew(menu, menu.menu, stage % 2 == 0) : 0;
             if (!cmd)
                 Fail("new command missing");
@@ -442,7 +442,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 ShellMenu menu;
                 HRESULT hr = menu.Create(view.shell.Get(), false, app->window);
                 if (SUCCEEDED(hr))
-                    CheckMenuDirectory(menu, app->model.locations.FilePath(app->model.Find(id)->path));
+                    CheckMenuDirectory(menu, app->model.locations.FileSystemPath(app->model.Find(id)->path));
                 UINT command = SUCCEEDED(hr) ? menu.Find(L"rename") : 0;
                 if (!command || FAILED(menu.Invoke(command)))
                     Fail("native rename menu missing or failed");

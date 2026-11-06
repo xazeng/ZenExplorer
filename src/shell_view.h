@@ -21,9 +21,7 @@ class ShellView : public IExplorerBrowserEvents,
     bool browserSized = false;
     RECT browserBounds{};
     NavigationState navigation;
-    LocationKey navigationPath, parentPath;
-    std::wstring addressEditText;
-    std::vector<std::pair<std::wstring, LocationKey>> breadcrumbs;
+    LocationKey navigationPath;
     void UpdateNavigation(IShellItem *item);
     void NavigationFailed(HRESULT result);
 
