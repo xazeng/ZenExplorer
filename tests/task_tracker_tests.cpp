@@ -122,6 +122,50 @@ static void DestructionDoesNotCancel() {
     CHECK(WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT);
     CHECK(std::filesystem::exists(file));
 }
+static std::shared_ptr<void> PreventDeletion(const std::filesystem::path &file) {
+    HANDLE handle = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(handle != INVALID_HANDLE_VALUE);
+    return std::shared_ptr<void>(handle, [](void *value) { CloseHandle(value); });
+}
+static void CleanupRetriesWithoutRepeatingFeedback() {
+    TaskTracker tracker;
+    auto file = ResultFile(L"cleanup-retry");
+    WriteResult(file);
+    auto locked = PreventDeletion(file);
+    int callbacks = 0;
+    tracker.Track({file, ExitSignal(true)}, TaskFeedbackKind::Paste, [&](const TaskCompletion &completion) {
+        CHECK(completion.result && completion.result->invoked == S_OK);
+        ++callbacks;
+        return true;
+    });
+    tracker.Poll(1000); // 消费结果。
+    tracker.Poll(1000); // 首次清理因占用失败。
+    CHECK(callbacks == 1 && tracker.Count() == 1 && tracker.Pending(TaskFeedbackKind::Paste) == 0);
+    locked.reset();
+    tracker.Poll(1999);
+    CHECK(tracker.Count() == 1 && std::filesystem::exists(file));
+    tracker.Poll(2000);
+    CHECK(callbacks == 1 && tracker.Count() == 0 && !std::filesystem::exists(file));
+}
+static void PermanentCleanupFailureReleasesObservation() {
+    TaskTracker tracker;
+    auto file = ResultFile(L"cleanup-permanent-failure");
+    WriteResult(file);
+    auto locked = PreventDeletion(file);
+    auto process = ExitSignal(true);
+    std::weak_ptr<void> observation = process;
+    tracker.Track({file, process});
+    process.reset();
+    tracker.Poll(0);
+    CHECK(tracker.Count() == 1 && !observation.expired());
+    // 单调时钟替代真实等待，永久占用不能使观察句柄无限保留。
+    for (ULONGLONG minute = 1; minute <= 8 && tracker.Count(); ++minute)
+        tracker.Poll(minute * 60000);
+    CHECK(tracker.Count() == 0 && observation.expired() && std::filesystem::exists(file));
+    locked.reset();
+    CHECK(CleanupTaskResult(file));
+}
 int main() {
     auto root = std::filesystem::current_path() / L".test-data" /
                 (L"task-tracker-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -137,7 +181,9 @@ int main() {
                              Case{"missing_and_corrupt_results", MissingAndCorruptResults},
                              Case{"reentrant_feedback", ReentrantFeedback},
                              Case{"invalid_optional_details", InvalidOptionalDetails},
-                             Case{"destruction_does_not_cancel", DestructionDoesNotCancel}}) {
+                             Case{"destruction_does_not_cancel", DestructionDoesNotCancel},
+                             Case{"cleanup_retry", CleanupRetriesWithoutRepeatingFeedback},
+                             Case{"cleanup_permanent_failure", PermanentCleanupFailureReleasesObservation}}) {
         try {
             test.run();
             std::cout << test.name << ": passed\n";

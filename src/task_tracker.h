@@ -21,7 +21,8 @@ class TaskTracker {
     // 返回 false 表示界面反馈尚未完成，例如等待 Shell 枚举出新文件。
     using Feedback = std::function<bool(const TaskCompletion &)>;
     void Track(TaskTicket ticket, TaskFeedbackKind kind = TaskFeedbackKind::None, Feedback feedback = {});
-    void Poll();
+    // 可传入单调时钟值验证退避；正常调用使用系统运行时间。
+    void Poll(ULONGLONG now = GetTickCount64());
     size_t Pending(TaskFeedbackKind kind) const;
     size_t Count() const {
         return entries.size();
@@ -34,6 +35,8 @@ class TaskTracker {
         Feedback feedback;
         std::optional<TaskCompletion> completion;
         bool consumed = false;
+        unsigned cleanupFailures = 0;
+        ULONGLONG nextCleanupAttempt = 0;
     };
     std::list<Entry> entries;
     bool polling = false;

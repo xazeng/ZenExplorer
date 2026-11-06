@@ -25,10 +25,13 @@ std::filesystem::path ConfigDir() {
 std::filesystem::path LogDir() {
     return PortableRoot() / L"log";
 }
+bool FileLogEnabled() {
+    wchar_t enabled[2]{};
+    return GetEnvironmentVariableW(L"ZENEXPLORER_FILE_LOG", enabled, 2) == 1 && enabled[0] == L'1';
+}
 void Log(const std::wstring &s) {
     // 默认不创建目录或文件；诊断时显式设置为 1，子任务继承该开关。
-    wchar_t enabled[2]{};
-    if (GetEnvironmentVariableW(L"ZENEXPLORER_FILE_LOG", enabled, 2) != 1 || enabled[0] != L'1')
+    if (!FileLogEnabled())
         return;
     std::error_code ec;
     auto p = LogDir();
@@ -52,8 +55,7 @@ void Log(const std::wstring &s) {
     }
 }
 ResourceTrace::ResourceTrace(std::wstring name) : phase(std::move(name)) {
-    wchar_t value[2]{};
-    enabled = GetEnvironmentVariableW(L"ZENEXPLORER_FILE_LOG", value, 2) == 1 && value[0] == L'1';
+    enabled = FileLogEnabled();
     if (!enabled)
         return;
     start = GetTickCount64();

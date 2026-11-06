@@ -25,7 +25,7 @@ target_link_libraries(ZenExplorer PRIVATE zen_ui zen_worker)
 install(TARGETS ZenExplorer RUNTIME DESTINATION .)
 
 enable_testing()
-add_executable(zen_tests tests/tests.cpp src/app.manifest)
+add_executable(zen_tests tests/tests.cpp tests/storage_reliability.cpp src/app.manifest)
 target_link_libraries(zen_tests PRIVATE zen_core)
 add_test(NAME model_and_storage COMMAND zen_tests)
 

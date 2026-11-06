@@ -18,6 +18,7 @@ class ShellView : public IExplorerBrowserEvents,
     std::wstring dragHitName;
     ComPtr<IShellItem> dragHitItem;
     bool destroyed = false;
+    bool initialized = false, creating = false;
     bool browserSized = false;
     RECT browserBounds{};
     NavigationState navigation;
@@ -41,6 +42,9 @@ class ShellView : public IExplorerBrowserEvents,
     ShellView(App &, Id);
     ~ShellView();
     HRESULT Create(HWND parent, RECT bounds);
+    bool Initialized() const {
+        return initialized;
+    }
     HRESULT Browse(const NavigationRequest &request, bool fallback = false);
     void Retry();
     void Destroy();
@@ -95,9 +99,7 @@ class ShellView : public IExplorerBrowserEvents,
         *f = CDB2GVF_NOINCLUDEITEM;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE OnColumnClicked(IShellView *, int) override {
-        return S_OK;
-    }
+    HRESULT STDMETHODCALLTYPE OnColumnClicked(IShellView *, int) override;
     HRESULT STDMETHODCALLTYPE GetCurrentFilter(LPWSTR p, int n) override {
         if (n)
             p[0] = 0;

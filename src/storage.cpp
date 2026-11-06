@@ -10,14 +10,31 @@ static uint32_t Hash(const std::vector<uint8_t> &b) {
 }
 bool WriteEnvelope(const std::filesystem::path &p, uint32_t magic, const std::vector<uint8_t> &b, bool backup,
                    uint32_t version) {
+    if (p.empty() || !version || b.size() > MaxEnvelopeBytes)
+        return false;
     std::error_code ec;
-    std::filesystem::create_directories(p.parent_path(), ec);
+    if (!p.parent_path().empty())
+        std::filesystem::create_directories(p.parent_path(), ec);
+    if (ec)
+        return false;
     auto temp = p;
     temp += L".tmp";
     HANDLE f =
         CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE)
         return false;
+    // 只清理本次已成功创建的临时文件，覆盖写入、刷新、替换失败及异常路径。
+    struct PendingFile {
+        const std::filesystem::path &path;
+        HANDLE file;
+        ~PendingFile() {
+            DWORD error = GetLastError();
+            if (file != INVALID_HANDLE_VALUE)
+                CloseHandle(file);
+            DeleteFileW(path.c_str());
+            SetLastError(error);
+        }
+    } pending{temp, f};
     uint32_t header[] = {magic, version, (uint32_t)b.size(), Hash(b)};
     DWORD n = 0;
     bool ok = WriteFile(f, header, sizeof(header), &n, nullptr) && n == sizeof(header);
@@ -26,9 +43,13 @@ bool WriteEnvelope(const std::filesystem::path &p, uint32_t magic, const std::ve
     if (ok)
         ok = FlushFileBuffers(f) != 0;
     CloseHandle(f);
+    pending.file = INVALID_HANDLE_VALUE;
     if (!ok)
         return false;
-    if (backup && std::filesystem::exists(p)) {
+    bool exists = std::filesystem::exists(p, ec);
+    if (ec)
+        return false;
+    if (backup && exists) {
         auto bak = p;
         bak += L".bak";
         ok = ReplaceFileW(p.c_str(), temp.c_str(), bak.c_str(), 0, nullptr, nullptr) != 0;
@@ -44,7 +65,7 @@ std::vector<uint8_t> ReadEnvelope(const std::filesystem::path &p, uint32_t magic
         throw std::runtime_error("无效文件头");
     if (h[1] > maxVersion)
         throw std::domain_error("较新版本");
-    if (h[1] < 1 || h[2] > 32 * 1024 * 1024)
+    if (h[1] < 1 || h[2] > MaxEnvelopeBytes)
         throw std::runtime_error("无效长度");
     std::vector<uint8_t> b(h[2]);
     if (!f.read((char *)b.data(), h[2]) || f.peek() != EOF || Hash(b) != h[3])
@@ -225,8 +246,28 @@ static void DecodeHistory(Model &m, const std::vector<uint8_t> &bytes) {
     if (r.pos != bytes.size() || !m.Valid())
         throw std::runtime_error("历史状态无效");
 }
+static bool SessionMatchesCommittedTabs(const std::filesystem::path &session,
+                                        const std::vector<uint8_t> &bytes) {
+    auto path = TabsPath(session);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        GUID generation{};
+        Model tabs;
+        try {
+            tabs = DecodeTabs(ReadCurrent(path, TabsMagic, TabsVersion), generation);
+        } catch (const std::domain_error &) {
+            throw;
+        } catch (...) {
+            path += L".bak";
+            continue;
+        }
+        // 只认可当前可恢复标签对应的会话，不能把未提交的新一代轮换进有效备份。
+        DecodeSession(bytes, tabs, generation);
+        return true;
+    }
+    return false;
+}
 static bool WriteSnapshot(const std::filesystem::path &p, uint32_t magic, const Writer &w, uint32_t version) {
-    if (w.bytes.size() > 32 * 1024 * 1024)
+    if (w.bytes.size() > MaxEnvelopeBytes)
         return false;
     // 只有通过格式及校验检查的主文件才可替换有效备份。
     bool backup = false;
@@ -236,7 +277,7 @@ static bool WriteSnapshot(const std::filesystem::path &p, uint32_t magic, const 
             GUID ignored{};
             DecodeTabs(bytes, ignored);
         }
-        backup = true;
+        backup = magic == Magic ? SessionMatchesCommittedTabs(p, bytes) : true;
     } catch (const std::domain_error &) {
         return false;
     } catch (...) {
@@ -333,23 +374,31 @@ bool SaveModel(Model &m, const std::filesystem::path &p) {
         session.Pod(m.windowDpi);
         session.Pod(m.groupDoubleClick);
         auto tabPath = TabsPath(p);
-        auto backup = tabPath;
-        backup += L".bak";
         auto historyPath = HistoryPath(p, generation);
         auto locationPath = LocationsPath(p, generation);
-        if (locations.bytes.size() > 32 * 1024 * 1024 || history.bytes.size() > 32 * 1024 * 1024)
+        if (locations.bytes.size() > MaxEnvelopeBytes || history.bytes.size() > MaxEnvelopeBytes ||
+            session.bytes.size() > MaxEnvelopeBytes || tabs.bytes.size() > MaxEnvelopeBytes)
             return false;
+        // 每次事务有独立 GUID；失败仅回收本次快照，绝不触及已提交或备份引用的数据。
+        struct PendingSnapshots {
+            const std::filesystem::path &history, &locations;
+            bool committed = false;
+            ~PendingSnapshots() {
+                if (!committed) {
+                    DeleteFileW(history.c_str());
+                    DeleteFileW(locations.c_str());
+                }
+            }
+        } pending{historyPath, locationPath};
         if (!WriteEnvelope(locationPath, LocationsMagic, locations.bytes, false) ||
             !WriteEnvelope(historyPath, HistoryMagic, history.bytes, false, HistoryVersion))
             return false;
         // tabs 是提交点；任何附属文件写入失败都不能替换已经保存的标签关系。
         if (!WriteSnapshot(p, Magic, session, SessionVersion) ||
             !WriteSnapshot(tabPath, TabsMagic, tabs, TabsVersion)) {
-            std::error_code ec;
-            std::filesystem::remove(historyPath, ec);
-            std::filesystem::remove(locationPath, ec);
             return false;
         }
+        pending.committed = true;
         CleanupSnapshots(p);
         return true;
     } catch (...) {

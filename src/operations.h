@@ -17,6 +17,10 @@ struct FileTask {
 };
 // 开发阶段采用新的任务格式，不读取旧操作任务；会话格式不变。
 inline constexpr uint32_t TaskMagic = 0x324E455A;
+inline constexpr uint32_t MaxTaskItems = 100000;
+inline constexpr uint32_t MaxTaskFeedbackBytes = 1024 * 1024;
+// 校验实际待写入的回执包大小，成功时返回不含封装头的序列化长度；不访问 Shell 或文件系统。
+HRESULT ValidateTaskPayload(const FileTask &task, size_t feedbackBytes, size_t *payloadBytes = nullptr);
 struct TaskResult {
     HRESULT invoked = E_FAIL;
     bool moveCompleted = false;

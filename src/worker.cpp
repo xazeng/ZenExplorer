@@ -18,15 +18,20 @@ class TaskProgress final
     HRESULT Record(IShellItem *source, IShellItem *newItem, HRESULT hr) {
         auto name = ItemName(source);
         outcomes[name] = hr;
+        std::optional<std::wstring> createdName;
         // 只回传提交的顶层项目，避免把复制文件夹的后代也作为待选项目。
         if (SUCCEEDED(hr) && hr != COPYENGINE_S_USER_IGNORED && hr != COPYENGINE_S_PENDING && newItem &&
             roots.contains(name)) {
-            auto path = ItemName(newItem);
-            if (!path.empty() && seen.insert(path).second)
-                created.push_back(path);
+            createdName = ItemName(newItem);
+            if (!createdName->empty() && seen.insert(*createdName).second)
+                created.push_back(*createdName);
         }
-        Log(L"文件任务逐项结果 source=" + ItemName(source) + L" created=" + ItemName(newItem) + L" hr=" +
-            std::to_wstring((unsigned long)hr));
+        if (FileLogEnabled()) {
+            if (!createdName)
+                createdName = ItemName(newItem);
+            Log(L"文件任务逐项结果 source=" + name + L" created=" + *createdName + L" hr=" +
+                std::to_wstring((unsigned long)hr));
+        }
         return S_OK;
     }
     void Summarize() {
@@ -108,15 +113,18 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
             throw HRESULT_FROM_WIN32(GetLastError());
         auto task = ReadTask(file);
         if (!task.sourceFeedback.empty()) {
-            Log(L"拖放来源回执开始解封送");
+            if (FileLogEnabled())
+                Log(L"拖放来源回执开始解封送");
             ComPtr<IStream> stream;
             stream.Attach(SHCreateMemStream(task.sourceFeedback.data(), (UINT)task.sourceFeedback.size()));
             HRESULT hr =
                 stream ? CoUnmarshalInterface(stream.Get(), IID_PPV_ARGS(&sourceFeedback)) : E_OUTOFMEMORY;
-            if (FAILED(hr))
-                Log(L"来源回执接口不可用，独立文件操作继续 " + ErrorText(hr));
-            else
-                Log(L"拖放来源回执解封送成功");
+            if (FileLogEnabled()) {
+                if (FAILED(hr))
+                    Log(L"来源回执接口不可用，独立文件操作继续 " + ErrorText(hr));
+                else
+                    Log(L"拖放来源回执解封送成功");
+            }
         }
         Operation operation = task.operation;
         if (operation == Operation::Paste)
@@ -196,8 +204,9 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
             hr = op->Advise(sink.Get(), &cookie);
             if (FAILED(hr))
                 throw hr;
-            Log(L"独立 IFileOperation 开始 operation=" + std::to_wstring((UINT)operation) + L" count=" +
-                std::to_wstring(items.size()) + L" destination=" + task.destination);
+            if (FileLogEnabled())
+                Log(L"独立 IFileOperation 开始 operation=" + std::to_wstring((UINT)operation) + L" count=" +
+                    std::to_wstring(items.size()) + L" destination=" + task.destination);
             hr = op->PerformOperations();
             BOOL aborted = FALSE;
             HRESULT status = op->GetAnyOperationsAborted(&aborted);
@@ -227,7 +236,8 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
             Report(owner, L"无法提交系统文件操作", hr);
     } catch (...) {
         result.invoked = E_INVALIDARG;
-        Log(L"文件操作任务无效或已损坏");
+        if (FileLogEnabled())
+            Log(L"文件操作任务无效或已损坏");
     }
     if (sourceFeedback) {
         // 移动由目标完整执行，不能再让来源删除一次；仅在真正完成后反馈。
@@ -236,9 +246,11 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
         SetDataEffect(sourceFeedback.Get(), CFSTR_LOGICALPERFORMEDDROPEFFECT, result.effect);
         ComPtr<IDataObjectAsyncCapability> async;
         if (SUCCEEDED(sourceFeedback.As(&async))) {
-            Log(L"拖放来源完成回执开始");
+            if (FileLogEnabled())
+                Log(L"拖放来源完成回执开始");
             HRESULT hr = async->EndOperation(result.invoked, nullptr, result.effect);
-            Log(L"拖放来源完成回执 hr=" + std::to_wstring((unsigned long)hr));
+            if (FileLogEnabled())
+                Log(L"拖放来源完成回执 hr=" + std::to_wstring((unsigned long)hr));
         }
     }
     auto done = file;
@@ -251,18 +263,19 @@ int zen::RunFileTask(HINSTANCE instance, const std::filesystem::path &file) {
             detail.Text(path);
         auto itemsFile = done;
         itemsFile += L".items";
-        if (!WriteEnvelope(itemsFile, TaskItemsMagic, detail.bytes, false))
+        if (!WriteEnvelope(itemsFile, TaskItemsMagic, detail.bytes, false) && FileLogEnabled())
             Log(L"结果明细写入失败，跳过自动选中");
     }
     Writer writer;
     writer.Pod(result.invoked);
     writer.Pod(result.moveCompleted);
     writer.Pod(result.effect);
-    if (!WriteEnvelope(done, TaskMagic, writer.bytes, false))
+    if (!WriteEnvelope(done, TaskMagic, writer.bytes, false) && FileLogEnabled())
         Log(L"文件操作结果写入失败");
     DeleteFileW(file.c_str());
-    Log(L"独立 IFileOperation 结束 hr=" + std::to_wstring((unsigned long)result.invoked) + L" effect=" +
-        std::to_wstring(result.effect));
+    if (FileLogEnabled())
+        Log(L"独立 IFileOperation 结束 hr=" + std::to_wstring((unsigned long)result.invoked) + L" effect=" +
+            std::to_wstring(result.effect));
     if (owner)
         DestroyWindow(owner);
     return FAILED(result.invoked) ? 1 : 0;

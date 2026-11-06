@@ -42,11 +42,16 @@ class App {
     void UpdateFrame();
     RECT viewBounds[2]{};
     Model model;
+    // 未提交的快捷访问管理草稿也持有位置资料，关闭管理窗口时解除注册。
+    std::vector<const QuickAccess *> quickAccessDrafts;
     std::unique_ptr<TabStrip> strips[2];
     std::unordered_map<Id, std::unique_ptr<ShellView>> views;
     LocationKey RememberLocation(IShellItem *item);
     void PruneLocations();
     bool readOnly = false, dirty = false, closing = false, sizing = false, restoring = false;
+    bool saving = false, saveRequested = false, closeRequested = false, statusUpdatePending = false;
+    uint64_t changeRevision = 0;
+    ULONGLONG saveRetryAt = 0;
     int saveFailures = 0;
     ComPtr<IContextMenu2> menu2;
     ComPtr<IContextMenu3> menu3;
@@ -70,7 +75,8 @@ class App {
     void Activate(int p, Id id = 0, bool focus = false);
     void EnsureView(Id id);
     void Changed();
-    void Save();
+    void Save(bool force = true);
+    void QueueStatusUpdate();
     void UpdateStatus();
     void UpdateAddress(int p);
     std::wstring AddressText(int p) const;

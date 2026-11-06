@@ -264,6 +264,21 @@ void App::ManageQuickAccess() {
     if (model.quickAccess.readOnly)
         return;
     QuickManager state{*this, model.quickAccess};
+    struct DraftRegistration {
+        App &app;
+        const QuickAccess *draft;
+        DraftRegistration(App &owner, const QuickAccess &value) : app(owner), draft(&value) {
+            app.quickAccessDrafts.push_back(draft);
+        }
+        ~DraftRegistration() {
+            std::erase(app.quickAccessDrafts, draft);
+            // 清理失败可留给下一次正常状态更新，不能让析构期间的分配失败终止进程。
+            try {
+                app.PruneLocations();
+            } catch (...) {
+            }
+        }
+    } registration{*this, state.draft};
     state.dpi = dpi;
     WNDCLASSW wc{};
     wc.hInstance = instance;
@@ -299,7 +314,6 @@ void App::ManageQuickAccess() {
     DestroyWindow(dialog);
     if (state.font)
         DeleteObject(state.font);
-    PruneLocations();
     if (IsWindow(window)) {
         EnableWindow(window, TRUE);
         SetForegroundWindow(window);

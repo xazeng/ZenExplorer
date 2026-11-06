@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <limits>
 using namespace zen;
+void CheckStorageReliability();
 #define CHECK(x)                                                                                             \
     do {                                                                                                     \
         if (!(x))                                                                                            \
@@ -343,6 +344,114 @@ static void CheckQuickAccess() {
     newer.Load(independent.locations, file);
     CHECK(newer.readOnly && !newer.Save(independent.locations, file));
 }
+static std::filesystem::path QuickRecordsFile(const std::filesystem::path &file, bool backup = false) {
+    auto bytes = ReadEnvelope(backup ? std::filesystem::path(file.wstring() + L".bak") : file, 0x514E455A);
+    Reader reader{bytes};
+    auto generation = reader.Pod<GUID>();
+    wchar_t name[40]{};
+    StringFromGUID2(generation, name, 40);
+    return DataDir() / L"quick-access" / file.stem() / (std::wstring(name) + L".dat");
+}
+static void CheckLocationImportRepair() {
+    LocationStore source, restored;
+    const LocationKey key = L"zen-shell:import-repair";
+    ShellLocation record{L"", L"独立快照中的设备", {2, 0, 0, 0}};
+    source.Set(key, record);
+    auto identity = source.EnsureId(key);
+    auto placeholder = restored.KeyForId(identity);
+    CHECK(placeholder != key && !restored.Find(placeholder)->usable);
+    CHECK(restored.Import(source, key) == placeholder);
+    CHECK(restored.EnsureId(placeholder) == identity && restored.Find(placeholder)->pidl == record.pidl);
+    CHECK(restored.DisplayName(placeholder) == record.displayName && restored.Find(placeholder)->usable);
+
+    // 缓存失效不是资料丢失，旧快照不能借同 ID 导入重新启用或替换完整记录。
+    auto invalidated = *restored.Find(placeholder);
+    invalidated.usable = false;
+    invalidated.displayName = L"运行期已有资料";
+    restored.Set(placeholder, invalidated);
+    CHECK(restored.Import(source, key) == placeholder);
+    CHECK(!restored.Find(placeholder)->usable &&
+          restored.DisplayName(placeholder) == invalidated.displayName);
+}
+static void CheckQuickAccessRecovery() {
+    for (bool corrupt : {false, true}) {
+        LocationStore source;
+        const LocationKey target = L"zen-shell:recoverable-device";
+        const LocationKey added = L"C:\\new-quick-location";
+        ShellLocation record{L"", L"设备目录", {2, 0, 0, 0}};
+        source.Set(target, record);
+        QuickAccess access;
+        CHECK(access.Put(source, target, L"旧名称"));
+        auto file = ConfigDir() / (corrupt ? L"quick-corrupt-records.dat" : L"quick-missing-records.dat");
+        CHECK(access.Save(source, file));
+        auto identity = source.EnsureId(target);
+        CHECK(access.Put(source, target, L"当前名称"));
+        CHECK(access.Put(source, added, L"当前新增目录"));
+        auto addedIdentity = source.EnsureId(added);
+        CHECK(access.Save(source, file));
+        auto backupFile = std::filesystem::path(file.wstring() + L".bak");
+        auto backupBytes = ReadEnvelope(backupFile, 0x514E455A);
+        auto backupRecords = QuickRecordsFile(file, true);
+        auto currentRecords = QuickRecordsFile(file);
+        if (corrupt)
+            std::ofstream(currentRecords, std::ios::binary | std::ios::trunc) << "broken";
+        else
+            CHECK(std::filesystem::remove(currentRecords));
+
+        LocationStore restoredLocations;
+        auto placeholder = restoredLocations.KeyForId(identity);
+        QuickAccess restored;
+        restored.Load(restoredLocations, file);
+        CHECK(!restored.readOnly && restored.links.size() == 2);
+        CHECK(restored.links[0].name == L"当前名称" && restored.links[0].target == placeholder);
+        CHECK(restoredLocations.Find(placeholder)->pidl == record.pidl);
+        CHECK(restoredLocations.EnsureId(placeholder) == identity);
+        // 仅补齐相同 ID；备份中不存在的新条目必须保留，不能退回旧列表或猜测目标。
+        CHECK(restored.links[1].name == L"当前新增目录");
+        auto missing = restored.links[1].target;
+        CHECK(restoredLocations.EnsureId(missing) == addedIdentity);
+        CHECK(restoredLocations.Find(missing)->parsingName.empty() &&
+              restoredLocations.Find(missing)->pidl.empty());
+        LocationResolution resolution;
+        CHECK(FAILED(restoredLocations.Resolve(missing, resolution)));
+
+        restored.links[0].name = L"恢复后修改";
+        CHECK(restored.Save(restoredLocations, file));
+        CHECK(ReadEnvelope(backupFile, 0x514E455A) == backupBytes);
+        CHECK(std::filesystem::exists(backupRecords));
+        LocationStore reloadedLocations;
+        QuickAccess reloaded;
+        reloaded.Load(reloadedLocations, file);
+        CHECK(!reloaded.readOnly && reloaded.links.size() == 2);
+        CHECK(reloaded.links[0].name == L"恢复后修改");
+        CHECK(reloadedLocations.Find(reloaded.links[0].target)->pidl == record.pidl);
+        CHECK(reloadedLocations.EnsureId(reloaded.links[1].target) == addedIdentity);
+        // 当前快照虽可解码，但仍有无法补齐的新 ID，占位不能在连续保存时挤掉完整备份。
+        for (int i = 0; i < 2; ++i) {
+            CHECK(reloaded.Save(reloadedLocations, file));
+            CHECK(ReadEnvelope(backupFile, 0x514E455A) == backupBytes);
+            CHECK(std::filesystem::exists(backupRecords));
+        }
+    }
+
+    // 目录快照来自未来版本时可保留可恢复显示，但不能覆盖该快照或引用文件。
+    LocationStore locations;
+    QuickAccess access;
+    CHECK(access.Put(locations, L"C:\\future-quick-location", L"未来资料"));
+    auto file = ConfigDir() / L"quick-future-records.dat";
+    CHECK(access.Save(locations, file));
+    CHECK(access.Save(locations, file));
+    auto recordsFile = QuickRecordsFile(file);
+    auto records = ReadEnvelope(recordsFile, 0x4C4E455A);
+    CHECK(WriteEnvelope(recordsFile, 0x4C4E455A, records, false, 2));
+    auto references = ReadEnvelope(file, 0x514E455A);
+    LocationStore restoredLocations;
+    QuickAccess restored;
+    restored.Load(restoredLocations, file);
+    CHECK(restored.readOnly && !restored.Save(restoredLocations, file));
+    CHECK(ReadEnvelope(file, 0x514E455A) == references);
+    CHECK(ReadEnvelope(recordsFile, 0x4C4E455A, 2) == records);
+}
 static void CheckLocationReferencesAndCleanup() {
     Model m;
     auto first = m.Add(0, L"C:\\shared-location");
@@ -661,6 +770,9 @@ int main(int argc, char **argv) {
         CheckIndependentTabs();
         CheckLocationReferencesAndCleanup();
         CheckQuickAccess();
+        CheckLocationImportRepair();
+        CheckQuickAccessRecovery();
+        CheckStorageReliability();
         CheckLocationText();
         CheckSingleExpandedGroups();
         CheckGroupColors();

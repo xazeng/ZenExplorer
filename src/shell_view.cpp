@@ -75,6 +75,8 @@ HRESULT ShellView::QueryService(REFGUID service, REFIID iid, void **p) {
     return E_NOINTERFACE;
 }
 void ShellView::Trace(const std::wstring &phase, HRESULT hr) {
+    if (!FileLogEnabled())
+        return;
     RECT parent{}, child{};
     HWND viewWindow = nullptr;
     if (host)
@@ -89,6 +91,20 @@ void ShellView::Trace(const std::wstring &phase, HRESULT hr) {
 HRESULT ShellView::Create(HWND parent, RECT bounds) {
     if (!IsWindow(parent) || bounds.right <= bounds.left || bounds.bottom <= bounds.top)
         return E_INVALIDARG;
+    if (initialized)
+        return S_OK;
+    if (creating)
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    creating = true;
+    struct FinishCreate {
+        ShellView &view;
+        ~FinishCreate() {
+            if (!view.initialized)
+                view.Destroy();
+            view.creating = false;
+        }
+    } finish{*this};
+    destroyed = false;
     host = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, bounds.left,
                            bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top, parent,
                            nullptr, app.instance, nullptr);
@@ -122,6 +138,7 @@ HRESULT ShellView::Create(HWND parent, RECT bounds) {
     RECT inner{0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top};
     FOLDERSETTINGS settings{FVM_DETAILS, FWF_AUTOARRANGE};
     hr = browser->Initialize(host, &inner, &settings);
+    initialized = SUCCEEDED(hr);
     Trace(L"Initialize", hr);
     return hr;
 }
@@ -129,6 +146,8 @@ void ShellView::Destroy() {
     if (destroyed)
         return;
     destroyed = true;
+    initialized = false;
+    browserSized = false;
     ResourceTrace trace(L"销毁 Shell 视图 tab=" + std::to_wstring(id));
     // 撤销注册可能重入窗口消息，先转移列表，避免回调修改正在遍历的容器。
     auto registered = std::move(drops);
@@ -159,8 +178,17 @@ void ShellView::Destroy() {
     host = nullptr;
 }
 HRESULT ShellView::Browse(const NavigationRequest &request, bool fallback) {
-    if (!browser || request.destination.empty())
+    if (request.destination.empty())
         return E_INVALIDARG;
+    if (!initialized) {
+        int pane = app.model.PaneOf(id);
+        HRESULT hr = pane < 0 ? E_INVALIDARG : Create(app.window, app.viewBounds[pane]);
+        if (FAILED(hr)) {
+            app.ShowError(id, hr);
+            return hr;
+        }
+        app.Layout(false, pane);
+    }
     Trace(L"Browse start");
     if (!fallback)
         previousNavigation = navigation;
@@ -302,15 +330,26 @@ HRESULT ShellView::OnDefaultCommand(IShellView *) {
     return S_FALSE;
 }
 HRESULT ShellView::OnStateChange(IShellView *, ULONG change) {
-    if (change == CDBOSC_SELCHANGE)
+    if (destroyed || app.closing)
+        return S_OK;
+    if (change == CDBOSC_SELCHANGE) {
         ++app.pasteGeneration;
-    if (change == CDBOSC_SETFOCUS) {
+        // 文件选择不属于会话；高频通知只合并刷新状态栏。
+        app.QueueStatusUpdate();
+    } else if (change == CDBOSC_KILLFOCUS) {
+        app.QueueStatusUpdate();
+    } else if (change == CDBOSC_SETFOCUS) {
         int p = app.model.PaneOf(id);
         if (p >= 0 && app.model.panes[p].selected == id) {
             app.model.active = p;
             PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 2);
         }
     } else
+        PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 3);
+    return S_OK;
+}
+HRESULT ShellView::OnColumnClicked(IShellView *, int) {
+    if (!destroyed && !app.closing)
         PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 3);
     return S_OK;
 }
@@ -507,37 +546,68 @@ void ShellView::Capture() {
     auto *t = app.model.Find(id);
     if (!t || !shell || navigation.Pending() || FAILED(navigation.Error()))
         return;
+    App &owner = app;
+    const Id tabId = id;
+    const auto path = t->path;
+    ShellView *source = this;
+    ComPtr<IShellView> sourceShell = shell;
+    std::optional<std::pair<FOLDERVIEWMODE, int>> mode;
+    std::optional<std::vector<SORTCOLUMN>> sort;
+    std::optional<std::vector<Column>> columns;
     ComPtr<IFolderView2> f;
-    if (SUCCEEDED(shell.As(&f))) {
-        FOLDERVIEWMODE mode;
-        if (SUCCEEDED(f->GetViewModeAndIconSize(&mode, &t->iconSize)))
-            t->viewMode = mode;
+    if (SUCCEEDED(sourceShell.As(&f))) {
+        FOLDERVIEWMODE currentMode;
+        int iconSize = 0;
+        if (SUCCEEDED(f->GetViewModeAndIconSize(&currentMode, &iconSize)))
+            mode = std::make_pair(currentMode, iconSize);
         int n = 0;
         if (SUCCEEDED(f->GetSortColumnCount(&n)) && n > 0 && n < 64) {
-            t->sort.resize(n);
-            f->GetSortColumns(t->sort.data(), n);
+            std::vector<SORTCOLUMN> values(n);
+            if (SUCCEEDED(f->GetSortColumns(values.data(), n)))
+                sort = std::move(values);
         }
         ComPtr<IColumnManager> cm;
-        auto folder = Current();
+        ComPtr<IShellItem> folder;
+        ComPtr<IPersistFolder2> persisted;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(f->GetFolder(IID_PPV_ARGS(&persisted))) && SUCCEEDED(persisted->GetCurFolder(&pidl))) {
+            SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&folder));
+        }
+        CoTaskMemFree(pidl);
         SFGAOF folderFlags = 0;
         bool filesystem = folder && SUCCEEDED(folder->GetAttributes(SFGAO_FILESYSTEM, &folderFlags)) &&
                           (folderFlags & SFGAO_FILESYSTEM);
-        if (filesystem && SUCCEEDED(shell.As(&cm))) {
+        if (filesystem && SUCCEEDED(sourceShell.As(&cm))) {
             UINT count = 0;
             if (SUCCEEDED(cm->GetColumnCount(CM_ENUM_VISIBLE, &count)) && count < 128) {
                 std::vector<PROPERTYKEY> keys(count);
                 if (SUCCEEDED(cm->GetColumns(CM_ENUM_VISIBLE, keys.data(), count))) {
-                    t->columns.clear();
+                    columns.emplace();
                     for (auto key : keys) {
                         CM_COLUMNINFO info{sizeof(info)};
                         info.dwMask = CM_MASK_WIDTH;
                         if (SUCCEEDED(cm->GetColumnInfo(key, &info)))
-                            t->columns.push_back({key, info.uWidth});
+                            columns->push_back({key, info.uWidth});
                     }
                 }
             }
         }
     }
+    // Shell 外呼可能重入关闭、移动或导航。只向仍对应本次采样的视图提交设置。
+    auto found = owner.views.find(tabId);
+    t = owner.model.Find(tabId);
+    if (!t || t->path != path || found == owner.views.end() || found->second.get() != source ||
+        found->second->shell.Get() != sourceShell.Get() || found->second->Navigation().Pending() ||
+        FAILED(found->second->Navigation().Error()))
+        return;
+    if (mode) {
+        t->viewMode = mode->first;
+        t->iconSize = mode->second;
+    }
+    if (sort)
+        t->sort = std::move(*sort);
+    if (columns)
+        t->columns = std::move(*columns);
 }
 HRESULT ShellView::ApplyViewMode() {
     auto *tab = app.model.Find(id);
@@ -695,6 +765,11 @@ std::optional<bool> ShellView::ContextMenuBackground(HWND input, POINT point, bo
 }
 LRESULT CALLBACK ShellView::Subclass(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR key, DWORD_PTR data) {
     auto *s = (ShellView *)data;
+    if (m == WM_NOTIFY && b) {
+        const UINT code = reinterpret_cast<NMHDR *>(b)->code;
+        if (code == HDN_ENDTRACKW || code == HDN_ENDTRACKA || code == HDN_ENDDRAG)
+            PostMessageW(s->app.window, WM_ZEN_CHANGED, (WPARAM)s->id, 3);
+    }
     if (m == WM_KILLFOCUS)
         ++s->app.pasteGeneration;
     if (m == WM_XBUTTONUP) {

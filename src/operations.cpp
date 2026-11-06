@@ -6,6 +6,43 @@ bool TaskCancelled(HRESULT result) {
     return result == E_ABORT || result == HRESULT_FROM_WIN32(ERROR_CANCELLED) ||
            result == COPYENGINE_E_USER_CANCELLED || result == COPYENGINE_E_CANCELLED;
 }
+HRESULT ValidateTaskPayload(const FileTask &task, size_t feedbackBytes, size_t *payloadBytes) {
+    if (payloadBytes)
+        *payloadBytes = 0;
+    if (task.sources.empty() || task.operation < Operation::Copy || task.operation > Operation::Drop ||
+        (task.operation != Operation::Delete && task.destination.empty()) ||
+        (task.allowed & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
+        (task.preferred & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
+        (feedbackBytes && task.operation != Operation::Drop))
+        return E_INVALIDARG;
+    if (task.sources.size() > MaxTaskItems || feedbackBytes > MaxTaskFeedbackBytes)
+        return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+    // 固定字段包括目标字符串长度、源项目数量和回执包长度，字符串内容单独计入。
+    size_t bytes = sizeof(Operation) + 2 * sizeof(bool) + 3 * sizeof(DWORD) + sizeof(POINTL) +
+                   3 * sizeof(uint32_t) + feedbackBytes;
+    auto addText = [&](const std::wstring &text, bool source) -> HRESULT {
+        if (text.size() > MaxStoredTextLength)
+            return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+        if ((source && text.empty()) || text.find(L'\0') != std::wstring::npos)
+            return E_INVALIDARG;
+        size_t length = text.size() * sizeof(wchar_t) + (source ? sizeof(uint32_t) : 0);
+        if (length > MaxEnvelopeBytes - bytes)
+            return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
+        bytes += length;
+        return S_OK;
+    };
+    HRESULT hr = addText(task.destination, false);
+    if (FAILED(hr))
+        return hr;
+    for (const auto &source : task.sources) {
+        hr = addText(source, true);
+        if (FAILED(hr))
+            return hr;
+    }
+    if (payloadBytes)
+        *payloadBytes = bytes;
+    return S_OK;
+}
 TaskResult ReadTaskResult(const std::filesystem::path &result) {
     auto bytes = ReadEnvelope(result, TaskMagic);
     Reader reader{bytes};
@@ -23,7 +60,7 @@ TaskItems ReadTaskItems(const std::filesystem::path &result) {
     Reader reader{bytes};
     TaskItems items;
     items.destination = reader.Text();
-    for (auto count = reader.Count(100000); count--;)
+    for (auto count = reader.Count(MaxTaskItems); count--;)
         items.created.push_back(reader.Text());
     if (reader.pos != bytes.size() || items.destination.empty() ||
         std::any_of(items.created.begin(), items.created.end(), [](auto &s) { return s.empty(); }))
@@ -55,21 +92,16 @@ FileTask ReadTask(const std::filesystem::path &file) {
     t.operation = r.Pod<Operation>();
     t.permanent = r.Pod<bool>();
     t.destination = r.Text();
-    for (auto n = r.Count(100000); n--;)
+    for (auto n = r.Count(MaxTaskItems); n--;)
         t.sources.push_back(r.Text());
     t.keys = r.Pod<DWORD>();
     t.allowed = r.Pod<DWORD>();
     t.preferred = r.Pod<DWORD>();
     t.point = r.Pod<POINTL>();
     t.collectResults = r.Pod<bool>();
-    for (auto n = r.Count(1024 * 1024); n--;)
+    for (auto n = r.Count(MaxTaskFeedbackBytes); n--;)
         t.sourceFeedback.push_back(r.Pod<uint8_t>());
-    if (r.pos != bytes.size() || t.sources.empty() || t.operation < Operation::Copy ||
-        t.operation > Operation::Drop || (t.operation != Operation::Delete && t.destination.empty()) ||
-        (t.allowed & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
-        (t.preferred & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
-        (!t.sourceFeedback.empty() && t.operation != Operation::Drop) ||
-        std::any_of(t.sources.begin(), t.sources.end(), [](auto &s) { return s.empty(); }))
+    if (r.pos != bytes.size() || FAILED(ValidateTaskPayload(t, t.sourceFeedback.size())))
         throw std::runtime_error("无效文件任务");
     return t;
 }
@@ -82,10 +114,16 @@ bool LaunchTask(HWND owner, const FileTask &t, const std::filesystem::path &exec
         process->reset();
     if (resultFile)
         resultFile->clear();
-    if (t.sources.empty() || t.sources.size() > 100000 || t.operation < Operation::Copy ||
-        t.operation > Operation::Drop || (t.operation != Operation::Delete && t.destination.empty()) ||
-        (t.allowed & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
-        (t.preferred & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)))
+    auto validate = [&](size_t feedbackBytes, size_t *payloadBytes = nullptr) {
+        HRESULT hr = ValidateTaskPayload(t, feedbackBytes, payloadBytes);
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE))
+            Report(owner,
+                   L"本次操作的项目数量或路径信息超过支持的范围，请减少选择或缩短路径后重试。操作未提交。");
+        else if (FAILED(hr))
+            Report(owner, L"文件操作参数无效，操作未提交。", hr);
+        return SUCCEEDED(hr);
+    };
+    if (!validate(0))
         return false;
     // 协商来源的异步完成协议；数据包只携带回执接口，不把文件内容或 UI 对象代理给工作进程。
     struct Feedback {
@@ -116,7 +154,7 @@ bool LaunchTask(HWND owner, const FileTask &t, const std::filesystem::path &exec
         STATSTG stat{};
         if (SUCCEEDED(hr))
             hr = feedback.stream->Stat(&stat, STATFLAG_NONAME);
-        if (SUCCEEDED(hr) && (stat.cbSize.QuadPart == 0 || stat.cbSize.QuadPart > 1024 * 1024))
+        if (SUCCEEDED(hr) && (stat.cbSize.QuadPart == 0 || stat.cbSize.QuadPart > MaxTaskFeedbackBytes))
             hr = E_INVALIDARG;
         if (SUCCEEDED(hr)) {
             packet.resize((size_t)stat.cbSize.QuadPart);
@@ -139,18 +177,17 @@ bool LaunchTask(HWND owner, const FileTask &t, const std::filesystem::path &exec
         Log(L"来源仅允许移动且不支持异步回执，拒绝冒报移动完成");
         return false;
     }
+    size_t payloadBytes = 0;
+    if (!validate(packet.size(), &payloadBytes))
+        return false;
     Writer w;
+    w.bytes.reserve(payloadBytes);
     w.Pod(t.operation);
     w.Pod(t.permanent);
     w.Text(t.destination);
     w.Pod((uint32_t)t.sources.size());
-    for (auto &s : t.sources) {
-        if (s.empty()) {
-            Report(owner, L"此项目没有可传递的 Shell 标识，操作未提交。");
-            return false;
-        }
+    for (auto &s : t.sources)
         w.Text(s);
-    }
     w.Pod(t.keys);
     w.Pod(t.allowed);
     w.Pod(t.preferred);
@@ -277,7 +314,7 @@ bool SnapshotFiles(IDataObject *object, std::vector<std::wstring> &paths) {
     if (FAILED(hr))
         return reject(L"无法取得 Shell 项目数组", hr);
     hr = items->GetCount(&count);
-    if (FAILED(hr) || !count || count > 100000)
+    if (FAILED(hr) || !count || count > MaxTaskItems)
         return reject(L"项目数量无效", hr);
     std::vector<std::wstring> snapshot;
     for (DWORD i = 0; i < count; ++i) {
@@ -366,7 +403,7 @@ HRESULT TaskShellItems(const std::vector<std::wstring> &paths, IShellItemArray *
     if (!items)
         return E_POINTER;
     *items = nullptr;
-    if (paths.empty() || paths.size() > 100000)
+    if (paths.empty() || paths.size() > MaxTaskItems)
         return E_INVALIDARG;
     struct Lists {
         std::vector<PCIDLIST_ABSOLUTE> values;

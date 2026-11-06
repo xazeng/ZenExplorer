@@ -46,7 +46,7 @@ size_t TaskTracker::Pending(TaskFeedbackKind kind) const {
     return std::count_if(entries.begin(), entries.end(),
                          [&](const Entry &entry) { return entry.kind == kind && !entry.consumed; });
 }
-void TaskTracker::Poll() {
+void TaskTracker::Poll(ULONGLONG now) {
     if (polling)
         return;
     polling = true;
@@ -82,9 +82,25 @@ void TaskTracker::Poll() {
         if (!entry.ticket.process) {
             it = entries.erase(it); // 无退出凭据时不删除磁盘结果。
         } else if (Exited(entry.ticket)) {
-            if (!CleanupTaskResult(entry.ticket.result))
-                Log(L"任务结果清理未完成 " + entry.ticket.result.filename().wstring());
-            it = entries.erase(it);
+            if (now < entry.nextCleanupAttempt) {
+                ++it;
+                continue;
+            }
+            if (CleanupTaskResult(entry.ticket.result)) {
+                it = entries.erase(it);
+                continue;
+            }
+            // 暂时占用可稍后重试；永久失败不能无限占用观察句柄和跟踪记录。
+            if (++entry.cleanupFailures >= 8) {
+                Log(L"任务结果清理重试已用尽，保留磁盘结果 " + entry.ticket.result.filename().wstring());
+                it = entries.erase(it);
+                continue;
+            }
+            auto delay = std::min<ULONGLONG>(1000ull << (entry.cleanupFailures - 1), 60000ull);
+            entry.nextCleanupAttempt = now + delay;
+            if (FileLogEnabled())
+                Log(L"任务结果清理暂未完成，稍后重试 " + entry.ticket.result.filename().wstring());
+            ++it;
         } else {
             ++it;
         }

@@ -10,6 +10,7 @@ struct TabHit {
 class TabStrip : public IDropTarget {
     LONG refs = 1;
     bool dragging = false, closePressed = false;
+    bool dragTimer = false;
     bool ignoreButtonUp = false;
     HWND ghost{};
     int dropPane = -1, dropIndex = 0;
@@ -18,6 +19,7 @@ class TabStrip : public IDropTarget {
     std::vector<TabHit> naturalHits;
     void UpdateDrag(POINT);
     void EndDrag();
+    void UpdateDragTimer();
     void ResolveDrop(POINT, int &, int &, Id &);
     RECT CloseRect(const TabHit &) const;
     POINT down{};
@@ -60,6 +62,9 @@ class TabStrip : public IDropTarget {
     void Paint();
     bool IsAnimating() const {
         return animating;
+    }
+    bool DragTimerRunning() const {
+        return dragTimer;
     }
     void RefreshDragFont(HFONT font);
     TabHit Hit(POINT) const;

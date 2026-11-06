@@ -1,6 +1,8 @@
 #pragma once
 #include "model.h"
 namespace zen {
+inline constexpr size_t MaxEnvelopeBytes = 32u * 1024u * 1024u;
+inline constexpr uint32_t MaxStoredTextLength = 32768;
 // 格式版本和长度上限均在读取时验证；未来版本不会被旧程序覆盖。
 struct Writer {
     std::vector<uint8_t> bytes;
@@ -36,7 +38,7 @@ struct Reader {
         return n;
     }
     std::wstring Text() {
-        auto n = Count(32768);
+        auto n = Count(MaxStoredTextLength);
         if (pos + n * 2 > bytes.size())
             throw std::runtime_error("字符串截断");
         std::wstring s(n, 0);

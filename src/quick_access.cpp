@@ -8,7 +8,7 @@ static std::filesystem::path RecordsPath(const std::filesystem::path &file, cons
     return DataDir() / L"quick-access" / file.stem() / (std::wstring(name) + L".dat");
 }
 uint64_t QuickAccess::Put(LocationStore &locations, const LocationKey &target, const std::wstring &name) {
-    if (readOnly || target.empty() || name.empty() || name.size() > 32768)
+    if (readOnly || target.empty() || name.empty() || name.size() > MaxStoredTextLength)
         return 0;
     auto identity = locations.EnsureId(target);
     for (auto &entry : links) {
@@ -57,6 +57,36 @@ static QuickAccess Decode(const std::vector<uint8_t> &bytes, LocationStore &loca
         throw std::runtime_error("快捷访问长度无效");
     return result;
 }
+static LocationStore ReadRecords(const std::filesystem::path &file, const std::vector<uint8_t> &bytes) {
+    Reader header{bytes};
+    auto records = ReadEnvelope(RecordsPath(file, header.Pod<GUID>()), RecordsMagic);
+    Reader input{records};
+    LocationStore locations;
+    locations.ReadRecords(input);
+    if (input.pos != records.size())
+        throw std::runtime_error("快捷访问目录资料无效");
+    return locations;
+}
+static bool MissingLocation(const LocationStore &locations, const LocationKey &key) {
+    auto *record = locations.Find(key);
+    return !record || (record->parsingName.empty() && record->pidl.empty());
+}
+static LocationStore ReadCompleteSnapshot(const std::filesystem::path &file,
+                                          const std::filesystem::path &references) {
+    auto bytes = ReadEnvelope(references, QuickMagic);
+    auto locations = ReadRecords(file, bytes);
+    auto count = locations.Count();
+    auto access = Decode(bytes, locations);
+    if (locations.Count() != count)
+        throw std::runtime_error("快捷访问目录引用缺失");
+    std::set<LocationKey> roots;
+    for (const auto &entry : access.links)
+        roots.insert(entry.target);
+    for (const auto &key : locations.References(roots))
+        if (MissingLocation(locations, key))
+            throw std::runtime_error("快捷访问目录资料不完整");
+    return locations;
+}
 void QuickAccess::Load(LocationStore &locations, const std::filesystem::path &file) {
     links.clear();
     nextId = 1;
@@ -65,21 +95,33 @@ void QuickAccess::Load(LocationStore &locations, const std::filesystem::path &fi
     for (int attempt = 0; attempt < 2; ++attempt) {
         try {
             auto bytes = ReadEnvelope(path, QuickMagic);
-            Reader header{bytes};
-            auto generation = header.Pod<GUID>();
             LocationStore source;
             try {
-                auto records = ReadEnvelope(RecordsPath(file, generation), RecordsMagic);
-                Reader input{records};
-                source.ReadRecords(input);
-                if (input.pos != records.size())
-                    throw std::runtime_error("快捷访问目录资料无效");
+                source = ReadRecords(file, bytes);
             } catch (const std::domain_error &) {
                 readOnly = true;
             } catch (...) {
                 source = {};
             }
             auto restored = Decode(bytes, source);
+            if (!attempt && std::any_of(restored.links.begin(), restored.links.end(), [&](const auto &entry) {
+                    return MissingLocation(source, entry.target);
+                })) {
+                try {
+                    auto backup = ReadCompleteSnapshot(file, file.wstring() + L".bak");
+                    for (const auto &entry : restored.links)
+                        if (MissingLocation(source, entry.target)) {
+                            auto key = backup.KeyForId(source.EnsureId(entry.target));
+                            if (!MissingLocation(backup, key))
+                                source.Import(backup, key);
+                        }
+                    Log(L"快捷访问缺失目录资料已按同一 ID 尝试从备份补齐");
+                } catch (const std::domain_error &) {
+                    readOnly = true;
+                } catch (...) {
+                    Log(L"快捷访问目录备份不可用，保留缺失位置引用");
+                }
+            }
             restored.readOnly = readOnly;
             for (auto &entry : restored.links)
                 entry.target = locations.Import(source, entry.target);
@@ -101,9 +143,8 @@ bool QuickAccess::Save(LocationStore &locations, const std::filesystem::path &fi
     try {
         bool backup = false;
         try {
-            auto bytes = ReadEnvelope(file, QuickMagic);
-            LocationStore check;
-            Decode(bytes, check);
+            // 引用及资料完整时才轮换备份，保存过的缺失占位也不能挤掉最后的完整快照。
+            ReadCompleteSnapshot(file, file);
             backup = true;
         } catch (const std::domain_error &) {
             return false;
@@ -130,7 +171,7 @@ bool QuickAccess::Save(LocationStore &locations, const std::filesystem::path &fi
         }
         LocationStore check;
         Decode(data.bytes, check);
-        if (records.bytes.size() > 32 * 1024 * 1024 || data.bytes.size() > 32 * 1024 * 1024)
+        if (records.bytes.size() > MaxEnvelopeBytes || data.bytes.size() > MaxEnvelopeBytes)
             return false;
         auto target = RecordsPath(file, generation);
         if (!WriteEnvelope(target, RecordsMagic, records.bytes, false))

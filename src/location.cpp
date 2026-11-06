@@ -9,6 +9,7 @@ const ShellLocation *LocationStore::Find(const LocationKey &key) const {
 LocationKey LocationStore::Import(const LocationStore &source, const LocationKey &key) {
     auto keys = source.References({key});
     std::map<LocationKey, LocationKey> mapped;
+    std::set<LocationKey> repaired;
     for (const auto &old : keys) {
         const auto *record = source.Find(old);
         if (!record)
@@ -25,6 +26,14 @@ LocationKey LocationStore::Import(const LocationStore &source, const LocationKey
             if (entries.contains(target) && entries.at(target).id != record->id)
                 target = L"location:" + record->id;
             entries[target] = *record;
+        } else {
+            auto &existing = entries.at(target);
+            // 同 ID 的缺失占位可由独立快照补齐；运行期失效的完整记录不能被旧资料覆盖。
+            if (existing.parsingName.empty() && existing.pidl.empty() &&
+                (!record->parsingName.empty() || !record->pidl.empty())) {
+                existing = *record;
+                repaired.insert(target);
+            }
         }
         mapped.emplace(old, target);
     }
@@ -35,7 +44,7 @@ LocationKey LocationStore::Import(const LocationStore &source, const LocationKey
             for (auto &[label, part] : value.parts)
                 if (mapped.contains(part))
                     part = mapped.at(part);
-            if (!presentation.contains(target))
+            if (!presentation.contains(target) || repaired.contains(target))
                 presentation[target] = std::move(value);
         }
     return mapped.contains(key) ? mapped.at(key) : LocationKey{};

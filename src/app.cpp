@@ -499,6 +499,12 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             EnsureView(model.panes[0].selected);
             EnsureView(model.panes[1].selected);
             Layout();
+        } else if (a == 2) {
+            statusUpdatePending = false;
+            if (!closing)
+                UpdateStatus();
+        } else if (a == 3 && !closing) {
+            Save();
         }
         return 0;
     case WM_ZEN_NAV: {
@@ -519,18 +525,21 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         return 0;
     }
     case WM_ZEN_CHANGED: {
+        if (closing)
+            return 0;
         auto it = views.find((Id)a);
-        if (it != views.end()) {
+        if (it == views.end())
+            return 0;
+        if (b != 2 && b != 3)
             it->second->Hook();
-            if (b == 1)
-                ShowError((Id)a, it->second->Navigation().Error());
-        }
+        if (b == 1)
+            ShowError((Id)a, it->second->Navigation().Error());
         Changed();
         if (b == 2)
             RedrawPaneFocus();
         else if (b != 3 && model.PaneOf((Id)a) >= 0)
             Layout(false, model.PaneOf((Id)a));
-        UpdateStatus();
+        QueueStatusUpdate();
         return 0;
     }
     case WM_COMMAND:
@@ -619,7 +628,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             for (auto &[id, v] : views)
                 v->Hook();
             if (dirty)
-                Save();
+                Save(false);
         }
         return 0;
     case WM_COPYDATA: {
@@ -637,6 +646,13 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         Save();
         return TRUE;
     case WM_CLOSE: {
+        if (closing)
+            return 0;
+        // 保存中的 Shell 外呼或错误提示可以重入；等当前保存栈退出后再销毁视图。
+        if (saving) {
+            closeRequested = true;
+            return 0;
+        }
         closing = true;
         Save();
         OleFlushClipboard();
@@ -853,14 +869,44 @@ void App::Activate(int p, Id id, bool focus) {
 }
 void App::Changed() {
     PruneLocations();
-    if (!readOnly)
+    if (!readOnly) {
         dirty = true;
+        ++changeRevision;
+    }
 }
-void App::Save() {
+void App::Save(bool force) {
     if (readOnly || !window)
         return;
-    for (auto &[id, v] : views)
-        v->Capture();
+    if (saving) {
+        saveRequested |= force;
+        return;
+    }
+    if (!force && GetTickCount64() < saveRetryAt)
+        return;
+    saving = true;
+    struct FinishSave {
+        App &app;
+        ~FinishSave() {
+            app.saving = false;
+            if (app.closeRequested) {
+                app.closeRequested = false;
+                app.saveRequested = false;
+                PostMessageW(app.window, WM_CLOSE, 0, 0);
+            } else if (app.saveRequested) {
+                app.saveRequested = false;
+                PostMessageW(app.window, WM_ZEN_ACTION, 3, 0);
+            }
+        }
+    } finish{*this};
+    const uint64_t revision = changeRevision;
+    // Capture 会调用 Shell；只保存 ID，返回后重新查找，避免重入改变容器迭代器。
+    std::vector<Id> ids;
+    ids.reserve(views.size());
+    for (const auto &[id, view] : views)
+        ids.push_back(id);
+    for (Id id : ids)
+        if (auto found = views.find(id); found != views.end())
+            found->second->Capture();
     WINDOWPLACEMENT wp{sizeof(wp)};
     if (GetWindowPlacement(window, &wp)) {
         model.window = wp.rcNormalPosition;
@@ -868,14 +914,24 @@ void App::Save() {
         model.maximized = wp.showCmd == SW_SHOWMAXIMIZED;
     }
     if (SaveModel(model, ConfigDir() / L"session.dat")) {
-        dirty = false;
+        dirty = changeRevision != revision;
         saveFailures = 0;
+        saveRetryAt = 0;
     } else {
-        Log(L"会话保存失败");
-        if (!saveFailures++)
+        dirty = true;
+        bool firstFailure = !saveFailures;
+        saveFailures = std::min(saveFailures + 1, 7);
+        const ULONGLONG delay = std::min<ULONGLONG>(60000, 2000ULL << std::min(saveFailures - 1, 5));
+        saveRetryAt = GetTickCount64() + delay;
+        Log(L"会话保存失败，自动重试间隔毫秒=" + std::to_wstring(delay));
+        if (firstFailure)
             MessageBoxW(window, L"无法保存会话，请检查配置目录权限或磁盘空间。", L"ZenExplorer",
                         MB_OK | MB_ICONWARNING);
     }
+}
+void App::QueueStatusUpdate() {
+    if (!closing && !statusUpdatePending && IsWindow(window))
+        statusUpdatePending = PostMessageW(window, WM_ZEN_ACTION, 2, 0) != FALSE;
 }
 std::wstring App::AddressText(int p) const {
     return p >= 0 && p < 2 && addressBars[p] ? addressBars[p]->Text() : std::wstring{};
@@ -898,6 +954,10 @@ void App::PruneLocations() {
     std::set<LocationKey> retained(model.recent.begin(), model.recent.end());
     for (const auto &entry : model.quickAccess.links)
         retained.insert(entry.target);
+    for (const auto *draft : quickAccessDrafts)
+        if (draft)
+            for (const auto &entry : draft->links)
+                retained.insert(entry.target);
     for (const auto &pane : model.panes)
         for (const auto &tab : pane.tabs) {
             retained.insert(tab.path);
@@ -979,8 +1039,8 @@ void App::CloseTabs(int p, const std::vector<Id> &ids, bool group) {
     for (auto id : ids)
         if (auto *t = model.Find(id))
             named |= !t->name.empty();
-    if (named &&
-        !Confirm(window, group ? L"当前关闭的组包含主目录标签，是否确认" : L"当前关闭的是主目录标签，是否确认"))
+    if (named && !Confirm(window, group ? L"当前关闭的组包含主目录标签，是否确认"
+                                        : L"当前关闭的是主目录标签，是否确认"))
         return;
     model.Remove(p, ids, true, group);
     SyncViews();
@@ -1453,11 +1513,11 @@ void App::TabMenu(int p, Id tab, Id group, POINT pt) {
             return;
         }
         if (cmd == 1) {
-            auto value =
-                Input(window, t->name.empty() ? L"设置主目录" : L"修改名称", Title(*t),
-                      t->name.empty() ? L"为标签命名，并将当前目录设为主目录；"
-                                        L"双击标签可返回。"
-                                      : L"修改名称不会改变主目录；清空名称或选择“取消主目录”可恢复普通标签。");
+            auto value = Input(window, t->name.empty() ? L"设置主目录" : L"修改名称", Title(*t),
+                               t->name.empty()
+                                   ? L"为标签命名，并将当前目录设为主目录；"
+                                     L"双击标签可返回。"
+                                   : L"修改名称不会改变主目录；清空名称或选择“取消主目录”可恢复普通标签。");
             if (value)
                 model.Rename(tab, *value);
         } else if (cmd == 2) {

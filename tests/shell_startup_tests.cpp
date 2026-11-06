@@ -48,6 +48,219 @@ class VirtualHierarchyItem final
         return SHGetIDListFromObject(actual.Get(), out);
     }
 };
+// 在采样视图设置的第一次外呼中触发重入，覆盖保存与关闭标签交错的生命周期。
+class ReenteringShell final : public IShellView {
+    LONG refs = 1;
+
+  public:
+    std::function<void()> callback;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        if (!out)
+            return E_POINTER;
+        *out = nullptr;
+        if (iid == IID_IUnknown || iid == IID_IOleWindow || iid == IID_IShellView) {
+            *out = static_cast<IShellView *>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (iid == IID_IFolderView2 && callback) {
+            auto invoke = std::move(callback);
+            callback = {};
+            invoke();
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = InterlockedDecrement(&refs);
+        if (!count)
+            delete this;
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetWindow(HWND *out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE ContextSensitiveHelp(BOOL) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE TranslateAccelerator(MSG *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE EnableModeless(BOOL) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE UIActivate(UINT) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Refresh() override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE CreateViewWindow(IShellView *, LPCFOLDERSETTINGS, IShellBrowser *, RECT *,
+                                               HWND *) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE DestroyViewWindow() override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentInfo(LPFOLDERSETTINGS) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE AddPropertySheetPages(DWORD, LPFNSVADDPROPSHEETPAGE, LPARAM) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SaveViewState() override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SelectItem(PCUITEMID_CHILD, SVSIF) override {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE GetItemObject(UINT, REFIID, void **out) override {
+        *out = nullptr;
+        return E_NOTIMPL;
+    }
+};
+static bool CheckLifetimeResilience(App &app) {
+    bool ok = true;
+    auto expect = [&](bool value, const char *message) {
+        if (!value) {
+            std::cerr << message << "\n";
+            ok = false;
+        }
+    };
+    auto dispatchChanges = [&] {
+        MSG message{};
+        while (PeekMessageW(&message, app.window, WM_ZEN_CHANGED, WM_ZEN_CHANGED, PM_REMOVE))
+            DispatchMessageW(&message);
+    };
+    dispatchChanges();
+    MSG message{};
+    while (PeekMessageW(&message, app.window, WM_ZEN_ACTION, WM_ZEN_ACTION, PM_REMOVE))
+        DispatchMessageW(&message);
+    auto &view = *app.views.at(app.model.panes[0].selected);
+    app.dirty = false;
+    auto revision = app.changeRevision;
+    for (int i = 0; i < 128; ++i)
+        view.OnStateChange(nullptr, CDBOSC_SELCHANGE);
+    int updates = 0;
+    while (PeekMessageW(&message, app.window, WM_ZEN_ACTION, WM_ZEN_ACTION, PM_REMOVE)) {
+        if (message.wParam == 2)
+            ++updates;
+        DispatchMessageW(&message);
+    }
+    expect(updates == 1 && !app.dirty && app.changeRevision == revision,
+           "selection notifications were not coalesced or dirtied session");
+    int previousPane = app.model.active;
+    app.model.active = 1;
+    view.OnStateChange(nullptr, CDBOSC_SETFOCUS);
+    dispatchChanges();
+    expect(app.model.active == 0 && app.dirty, "focused pane was not persisted");
+    app.dirty = false;
+    view.OnColumnClicked(nullptr, 0);
+    dispatchChanges();
+    expect(app.dirty, "column setting changes did not dirty session");
+    app.Activate(previousPane);
+
+    // 没有解析名称的虚拟目录，在管理草稿存活期间不能被普通 Changed 清理。
+    const LocationKey draftKey = L"zen-shell:uncommitted-quick-access";
+    auto record = *app.model.locations.Find(Home);
+    record.id.clear();
+    record.parsingName.clear();
+    app.model.locations.Set(draftKey, record);
+    QuickAccess draft;
+    draft.Put(app.model.locations, draftKey, L"草稿目录");
+    app.quickAccessDrafts.push_back(&draft);
+    app.Changed();
+    expect(app.model.locations.Pidl(draftKey) != nullptr, "quick access draft lost directory identity");
+    std::erase(app.quickAccessDrafts, &draft);
+    app.PruneLocations();
+    expect(!app.model.locations.Find(draftKey), "released quick access draft retained directory identity");
+
+    // 离开一栏后，仍需等整个外部拖动结束；两栏分别结束后都不能残留空闲轮询。
+    expect(!app.strips[0]->DragTimerRunning() && !app.strips[1]->DragTimerRunning(),
+           "idle tab strips started drag timers");
+    DWORD effect = DROPEFFECT_COPY;
+    POINTL outside{-10000, -10000};
+    app.strips[0]->DragEnter(nullptr, 0, outside, &effect);
+    app.strips[0]->DragLeave();
+    app.strips[1]->DragEnter(nullptr, 0, outside, &effect);
+    expect(app.strips[0]->DragTimerRunning() && app.strips[1]->DragTimerRunning(),
+           "cross-pane external drag stopped its completion observer");
+    app.strips[0]->DetachExternal();
+    expect(!app.strips[0]->DragTimerRunning() && app.strips[1]->DragTimerRunning(),
+           "external drag timers were not independent");
+    app.strips[1]->FinishExternal(false);
+    expect(!app.strips[1]->DragTimerRunning(), "finished external drag retained timer");
+
+    Id retryId = app.model.Add(0, DataDir().wstring(), 0, -1, false);
+    auto retry = std::make_unique<ShellView>(app, retryId);
+    expect(FAILED(retry->Create(nullptr, app.viewBounds[0])), "invalid view creation unexpectedly succeeded");
+    retry->SetFailure(E_OUTOFMEMORY);
+    app.views[retryId] = std::move(retry);
+    app.views.at(retryId)->Retry();
+    ULONGLONG until = GetTickCount64() + 5000;
+    while (app.views.at(retryId)->Navigation().Pending() && GetTickCount64() < until) {
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(10);
+    }
+    auto &recreated = *app.views.at(retryId);
+    expect(recreated.Initialized() && recreated.shell && !recreated.Navigation().Pending() &&
+               SUCCEEDED(recreated.Navigation().Error()),
+           "failed view creation could not recover on retry");
+    app.CloseTabs(0, {retryId});
+
+    Id reentrantId = app.model.Add(0, Home, 0, -1, false);
+    ComPtr<ReenteringShell> fake;
+    fake.Attach(new ReenteringShell);
+    int callbacks = 0;
+    fake->callback = [&] {
+        ++callbacks;
+        expect(app.saving, "capture ran without save guard");
+        app.Save();
+        app.CloseTabs(0, {reentrantId});
+        SendMessageW(app.window, WM_CLOSE, 0, 0);
+        expect(IsWindow(app.window) && !app.closing && app.closeRequested,
+               "close destroyed views while a save was active");
+    };
+    auto reentrant = std::make_unique<ShellView>(app, reentrantId);
+    reentrant->shell = fake;
+    app.views[reentrantId] = std::move(reentrant);
+    app.Save();
+    expect(callbacks == 1 && !app.saving && app.dirty && !app.views.contains(reentrantId),
+           "reentrant capture lost dirty state or retained closed view");
+    expect(PeekMessageW(&message, app.window, WM_CLOSE, WM_CLOSE, PM_REMOVE) != FALSE,
+           "close was not deferred until save returned");
+
+    // 用禁止替换的读句柄模拟短期保存失败，不等待实际退避时间。
+    HANDLE lock = CreateFileW((ConfigDir() / L"tabs.dat").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    expect(lock != INVALID_HANDLE_VALUE, "could not hold session file for failure regression");
+    if (lock != INVALID_HANDLE_VALUE) {
+        app.Changed();
+        app.Save();
+        expect(app.saveFailures == 1 && app.dirty && app.saveRetryAt > GetTickCount64(),
+               "failed save did not schedule backoff");
+        for (int i = 0; i < 8; ++i)
+            app.Save(false);
+        expect(app.saveFailures == 1, "automatic save ignored failure backoff");
+        for (int i = 0; i < 7; ++i) {
+            app.saveRetryAt = 0;
+            app.Save(false);
+        }
+        auto remaining = app.saveRetryAt - GetTickCount64();
+        expect(app.saveFailures == 7 && remaining <= 60000 && remaining > 59000,
+               "save retry delay was not bounded");
+        CloseHandle(lock);
+        app.Save();
+        expect(!app.saveFailures && !app.saveRetryAt, "explicit save did not bypass or reset backoff");
+    }
+    return ok;
+}
 struct CheckState {
     App *app;
     Id original, background, cached;
@@ -336,6 +549,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             if (WindowText(app.AddressEdit(0)) != editText)
                 state->failed = true;
             SendMessageW(app.AddressEdit(0), WM_KEYDOWN, VK_ESCAPE, 0);
+            if (!CheckLifetimeResilience(app))
+                state->failed = true;
             app.Activate(1, state->background);
         } else if (state->stage == 1) {
 
@@ -627,8 +842,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             app.EditAddress(1);
             SendMessageW(app.addressBars[1]->EditWindow(), WM_KEYDOWN, VK_RETURN, 0);
             view.Refresh();
-            if (view.Navigation().Pending() || SUCCEEDED(view.Navigation().Error()) ||
-                tab->path != missing || tab->history != failedHistory || tab->historyIndex != failedIndex - 1)
+            if (view.Navigation().Pending() || SUCCEEDED(view.Navigation().Error()) || tab->path != missing ||
+                tab->history != failedHistory || tab->historyIndex != failedIndex - 1)
                 state->failed = true;
 
             app.Navigate(id, missing + L"-another");
@@ -645,7 +860,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
                 }
                 Sleep(10);
             }
-            if (FAILED(view.Navigation().Error()) || tab->path != originalPath || tab->historyIndex != failedIndex)
+            if (FAILED(view.Navigation().Error()) || tab->path != originalPath ||
+                tab->historyIndex != failedIndex)
                 state->failed = true;
             app.Travel(-1);
             app.EditAddress(1);
@@ -723,15 +939,17 @@ int main() {
     // 提示框可能来自 Shell 的嵌套消息循环；仅关闭本测试进程的错误对话框。
     std::jthread dialogs([](std::stop_token stop) {
         while (!stop.stop_requested()) {
-            EnumWindows([](HWND w, LPARAM) -> BOOL {
-                DWORD process = 0;
-                GetWindowThreadProcessId(w, &process);
-                wchar_t cls[32]{};
-                GetClassNameW(w, cls, ARRAYSIZE(cls));
-                if (process == GetCurrentProcessId() && IsWindowVisible(w) && !wcscmp(cls, L"#32770"))
-                    PostMessageW(w, WM_CLOSE, 0, 0);
-                return TRUE;
-            }, 0);
+            EnumWindows(
+                [](HWND w, LPARAM) -> BOOL {
+                    DWORD process = 0;
+                    GetWindowThreadProcessId(w, &process);
+                    wchar_t cls[32]{};
+                    GetClassNameW(w, cls, ARRAYSIZE(cls));
+                    if (process == GetCurrentProcessId() && IsWindowVisible(w) && !wcscmp(cls, L"#32770"))
+                        PostMessageW(w, WM_CLOSE, 0, 0);
+                    return TRUE;
+                },
+                0);
             Sleep(25);
         }
     });

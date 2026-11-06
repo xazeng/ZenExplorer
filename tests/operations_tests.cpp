@@ -6,6 +6,77 @@ static void Require(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
 }
+static Writer EncodeTask(const FileTask &task) {
+    Writer writer;
+    writer.Pod(task.operation);
+    writer.Pod(task.permanent);
+    writer.Text(task.destination);
+    writer.Pod((uint32_t)task.sources.size());
+    for (const auto &source : task.sources)
+        writer.Text(source);
+    writer.Pod(task.keys);
+    writer.Pod(task.allowed);
+    writer.Pod(task.preferred);
+    writer.Pod(task.point);
+    writer.Pod(task.collectResults);
+    writer.Pod((uint32_t)task.sourceFeedback.size());
+    writer.bytes.insert(writer.bytes.end(), task.sourceFeedback.begin(), task.sourceFeedback.end());
+    return writer;
+}
+static void TaskPayloadLimits() {
+    FileTask task{Operation::Copy, L"destination", {L"source"}};
+    size_t size = 0;
+    Require(SUCCEEDED(ValidateTaskPayload(task, 0, &size)) && size == EncodeTask(task).bytes.size(),
+            "task payload size matches wire format");
+    task.sources[0].assign(MaxStoredTextLength, L'x');
+    Require(SUCCEEDED(ValidateTaskPayload(task, 0)), "maximum source string accepted");
+    task.sources[0].push_back(L'x');
+    Require(FAILED(ValidateTaskPayload(task, 0)), "oversized source string rejected");
+    task.sources = {std::wstring(L"a\0b", 3)};
+    Require(FAILED(ValidateTaskPayload(task, 0)), "embedded null rejected before submission");
+    task.sources = {L"source"};
+    task.destination.assign(MaxStoredTextLength + 1, L'd');
+    Require(FAILED(ValidateTaskPayload(task, 0)), "oversized destination string rejected");
+    task.destination = L"d";
+    task.sources.assign(MaxTaskItems, L"s");
+    Require(SUCCEEDED(ValidateTaskPayload(task, 0)), "maximum item count accepted");
+    task.sources.push_back(L"s");
+    Require(FAILED(ValidateTaskPayload(task, 0)), "oversized item count rejected");
+    task.sources = {L"source"};
+    task.operation = Operation::Drop;
+    Require(SUCCEEDED(ValidateTaskPayload(task, MaxTaskFeedbackBytes)), "maximum feedback packet accepted");
+    Require(FAILED(ValidateTaskPayload(task, size_t(MaxTaskFeedbackBytes) + 1)),
+            "oversized feedback packet rejected");
+    task.operation = Operation::Copy;
+    Require(FAILED(ValidateTaskPayload(task, 1)), "feedback packet rejected for non-drop operation");
+
+    // 只构造协议数据，不启动工作进程或创建数万个源文件。
+    task.sources = {std::wstring(MaxStoredTextLength, L'x')};
+    Require(SUCCEEDED(ValidateTaskPayload(task, 0, &size)), "initial large path accepted");
+    const size_t fullPathBytes = sizeof(uint32_t) + MaxStoredTextLength * sizeof(wchar_t);
+    while (fullPathBytes <= MaxEnvelopeBytes - size) {
+        task.sources.emplace_back(MaxStoredTextLength, L'x');
+        size += fullPathBytes;
+    }
+    Require(MaxEnvelopeBytes - size > sizeof(uint32_t), "boundary has space for final path");
+    task.sources.emplace_back((MaxEnvelopeBytes - size - sizeof(uint32_t)) / sizeof(wchar_t), L'x');
+    Require(SUCCEEDED(ValidateTaskPayload(task, 0, &size)) && size == MaxEnvelopeBytes,
+            "exact envelope limit accepted");
+    auto encoded = EncodeTask(task);
+    Require(encoded.bytes.size() == MaxEnvelopeBytes, "boundary preflight matches serialized payload");
+    auto file = DataDir() / L"tasks" / L"payload-limit.task";
+    Require(WriteEnvelope(file, TaskMagic, encoded.bytes, false), "boundary task write");
+    auto restored = ReadTask(file);
+    Require(restored.sources == task.sources && restored.destination == task.destination,
+            "boundary task remains readable without format changes");
+    task.operation = Operation::Drop;
+    Require(FAILED(ValidateTaskPayload(task, 1)), "feedback packet counts toward total payload limit");
+    task.operation = Operation::Copy;
+    task.sources.back().push_back(L'x');
+    Require(FAILED(ValidateTaskPayload(task, 0, &size)) && size == 0,
+            "over-limit task rejected before serialization");
+    Require(std::filesystem::remove(file), "remove boundary fixture");
+}
 // 提交进程随即退出；观察进程不持有工作进程句柄，不向其提供窗口。
 int wmain(int argc, wchar_t **argv) {
     OleInitialize(nullptr);
@@ -27,6 +98,7 @@ int wmain(int argc, wchar_t **argv) {
         for (auto p : {input, copied, moved})
             std::filesystem::create_directories(p);
         SetEnvironmentVariableW(L"ZENEXPLORER_ROOT_DIR", base.c_str());
+        TaskPayloadLimits();
         // 模拟主窗口已占用单实例标识：工作模式必须绕过这个互斥量。
         uint64_t hash = 1469598103934665603ull;
         for (auto c : ConfigDir().wstring())

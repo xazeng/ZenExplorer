@@ -81,7 +81,6 @@ void TabStrip::Create() {
     SendMessageW(tooltip, TTM_ADDTOOLW, 0, (LPARAM)&tool);
     SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, app.S(520));
     RegisterDragDrop(hwnd, this);
-    SetTimer(hwnd, 1, 32, nullptr);
 }
 int TabStrip::Arrange(int width) {
     const bool timerRunning = animating;
@@ -378,7 +377,7 @@ void TabStrip::Paint() {
                 DrawIconEx(dc, r.left, r.top + app.S(5), icon, app.S(16), app.S(16), 0, nullptr, DI_NORMAL);
             if (!t->name.empty()) {
                 RECT badge{r.left + app.S(16) - app.S(12), r.top + app.S(5) + app.S(16) - app.S(12),
-                          r.left + app.S(16), r.top + app.S(5) + app.S(16)};
+                           r.left + app.S(16), r.top + app.S(5) + app.S(16)};
                 DrawHomeBadge(dc, badge);
             }
             r.left += app.S(23);
@@ -533,6 +532,7 @@ void TabStrip::RestoreExpanded() {
 }
 void TabStrip::FinishExternal(bool success) {
     external = false;
+    UpdateDragTimer();
     externalData.Reset();
     releasedAt = 0;
     if (success) {
@@ -543,6 +543,7 @@ void TabStrip::FinishExternal(bool success) {
 }
 std::vector<GroupExpansionState> TabStrip::DetachExternal() {
     external = false;
+    UpdateDragTimer();
     externalData.Reset();
     releasedAt = 0;
     auto result = std::move(expanded);
@@ -661,6 +662,7 @@ void TabStrip::UpdateDrag(POINT screen) {
 }
 void TabStrip::EndDrag() {
     dragging = false;
+    UpdateDragTimer();
     dropPane = -1;
     if (ghost) {
         DestroyWindow(ghost);
@@ -668,6 +670,15 @@ void TabStrip::EndDrag() {
     }
     SendMessageW(tooltip, TTM_ACTIVATE, TRUE, 0);
     app.Layout();
+}
+void TabStrip::UpdateDragTimer() {
+    const bool needed = dragging || external;
+    if (needed && !dragTimer)
+        dragTimer = SetTimer(hwnd, 1, 32, nullptr) != 0;
+    else if (!needed && dragTimer) {
+        KillTimer(hwnd, 1);
+        dragTimer = false;
+    }
 }
 void TabStrip::FinishMove(POINT screen) {
     int target = -1, index = 0;
@@ -759,6 +770,7 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             (abs(pt.x - down.x) > GetSystemMetricsForDpi(SM_CXDRAG, app.dpi) ||
              abs(pt.y - down.y) > GetSystemMetricsForDpi(SM_CYDRAG, app.dpi))) {
             dragging = true;
+            UpdateDragTimer();
             for (auto &strip : app.strips)
                 if (strip)
                     strip->FinishAnimation();
@@ -795,11 +807,14 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             if (dragging)
                 UpdateDrag(screen);
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                bool wasExternal = external;
                 EndDrag();
                 source = {};
-                external = false;
                 ReleaseCapture();
-                RestoreExpanded();
+                if (wasExternal)
+                    FinishExternal(false);
+                else
+                    RestoreExpanded();
             } else if (external &&
                        !((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000)) {
                 if (!releasedAt)
@@ -906,6 +921,10 @@ LRESULT TabStrip::Message(UINT m, WPARAM a, LPARAM b) {
             RestoreExpanded();
         }
         return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, 1);
+        dragTimer = false;
+        break;
     }
     return DefWindowProcW(hwnd, m, a, b);
 }
@@ -924,6 +943,7 @@ HRESULT TabStrip::DragEnter(IDataObject *data, DWORD, POINTL p, DWORD *e) {
     externalData = data;
     releasedAt = 0;
     external = true;
+    UpdateDragTimer();
     for (auto &strip : app.strips)
         if (strip)
             strip->FinishAnimation();
