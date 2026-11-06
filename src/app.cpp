@@ -139,6 +139,7 @@ void App::UpdateFrame() {
             InvalidateRect(child, nullptr, FALSE);
 }
 App::~App() {
+    ClearStatusWatch();
     addressBars[0].reset();
     addressBars[1].reset();
     if (mainMenu)
@@ -507,6 +508,17 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             Save();
         }
         return 0;
+    case WM_ZEN_STATUS_FILES: {
+        PIDLIST_ABSOLUTE *items = nullptr;
+        LONG event = 0;
+        HANDLE notification = SHChangeNotification_Lock((HANDLE)a, (DWORD)b, &items, &event);
+        if (notification) {
+            // 仅失效统计，不主动刷新 Shell 列表或在通知栈中访问文件属性。
+            SHChangeNotification_Unlock(notification);
+            QueueStatusUpdate();
+        }
+        return 0;
+    }
     case WM_ZEN_NAV: {
         std::unique_ptr<NavRequest> r((NavRequest *)b);
         if (model.Find(r->id)) {
@@ -530,6 +542,8 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         auto it = views.find((Id)a);
         if (it == views.end())
             return 0;
+        if (b == 3)
+            it->second->MarkSettingsChanged();
         if (b != 2 && b != 3)
             it->second->Hook();
         if (b == 1)
@@ -625,8 +639,10 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
             for (int p = 0; p < 2; ++p)
                 if (GetWindowLongPtrW(AddressEdit(p), GWL_STYLE) & WS_VISIBLE)
                     PostMessageW(AddressEdit(p), WM_APP + 101, 0, 0);
-            for (auto &[id, v] : views)
-                v->Hook();
+            // 后台视图保留系统更新；这里只兜底检查两栏当前视图的延迟创建子窗口。
+            for (const auto &pane : model.panes)
+                if (auto view = views.find(pane.selected); view != views.end())
+                    view->second->Hook();
             if (dirty)
                 Save(false);
         }
@@ -667,6 +683,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         return 0;
     }
     case WM_DESTROY:
+        ClearStatusWatch();
         PostQuitMessage(0);
         return 0;
     }
@@ -760,7 +777,7 @@ void App::RedrawPaneFocus() {
     }
 }
 void App::Layout(bool updateStatus, int pane) {
-    if (!status)
+    if (!status || closing)
         return;
     RECT rc;
     GetClientRect(window, &rc);
@@ -822,12 +839,57 @@ void App::Layout(bool updateStatus, int pane) {
             ShowWindow(error[p], failed ? SW_SHOW : SW_HIDE);
         UpdateAddress(p);
     }
-    if (updateStatus)
-        UpdateStatus();
+    UpdateNavigationControls();
+    // 普通目录布局重用统计；虚拟提供程序或订阅失败时保留原来的刷新机会。
+    if (SyncStatusContext() ||
+        (updateStatus && (!statusWatch || model.locations.FileSystemPath(statusLocation).empty())))
+        QueueStatusUpdate();
+}
+void App::CaptureLeavingViews() {
+    if (closing)
+        return;
+    const Id previous[] = {visibleTabs[0], visibleTabs[1]};
+    for (int p = 0; p < 2; ++p)
+        visibleTabs[p] = model.panes[p].selected;
+    for (Id id : previous)
+        if (id && id != visibleTabs[0] && id != visibleTabs[1])
+            leavingViews.insert(id);
+    // 重入切换也更新可见集合，并交给外层处理离开的中间标签。
+    if (capturingLeavingViews)
+        return;
+    capturingLeavingViews = true;
+    struct Reset {
+        bool &flag;
+        ~Reset() {
+            flag = false;
+        }
+    } reset{capturingLeavingViews};
+    std::set<Id> sampled;
+    while (!leavingViews.empty() && !closing) {
+        const Id id = *leavingViews.begin();
+        leavingViews.erase(leavingViews.begin());
+        if (id == visibleTabs[0] || id == visibleTabs[1] || !model.Find(id))
+            continue;
+        if (auto view = views.find(id); view != views.end() && view->second->shell &&
+                                        !view->second->Navigation().Pending() &&
+                                        SUCCEEDED(view->second->Navigation().Error())) {
+            // 同一外层调用内反复切回的标签留给自动保存，避免扩展重入形成采样循环。
+            if (sampled.insert(id).second)
+                view->second->Capture();
+            else
+                view->second->MarkSettingsChanged();
+        }
+    }
 }
 void App::EnsureView(Id id) {
-    if (!model.Find(id) || views.contains(id))
+    CaptureLeavingViews();
+    if (closing || !model.Find(id))
         return;
+    if (auto view = views.find(id); view != views.end()) {
+        // 激活及组操作补选都会经过此入口，在显示前接入后台延迟创建的子窗口。
+        view->second->Hook();
+        return;
+    }
     Layout(false, model.PaneOf(id));
     RefreshLocalIcon(id);
     auto v = std::make_unique<ShellView>(*this, id);
@@ -852,6 +914,8 @@ void App::Activate(int p, Id id, bool focus) {
         model.panes[p].selected = id;
     model.EnsureVisibleSelection(p);
     EnsureView(model.panes[p].selected);
+    if (closing)
+        return;
     Layout(true, p);
     if (paneChanged)
         RedrawPaneFocus();
@@ -904,9 +968,12 @@ void App::Save(bool force) {
     ids.reserve(views.size());
     for (const auto &[id, view] : views)
         ids.push_back(id);
+    bool captureIncomplete = false;
     for (Id id : ids)
-        if (auto found = views.find(id); found != views.end())
-            found->second->Capture();
+        if (auto found = views.find(id);
+            found != views.end() && found->second->shell && !found->second->Navigation().Pending() &&
+            SUCCEEDED(found->second->Navigation().Error()) && (force || found->second->NeedsCapture()))
+            captureIncomplete |= !found->second->Capture();
     WINDOWPLACEMENT wp{sizeof(wp)};
     if (GetWindowPlacement(window, &wp)) {
         model.window = wp.rcNormalPosition;
@@ -914,9 +981,17 @@ void App::Save(bool force) {
         model.maximized = wp.showCmd == SW_SHOWMAXIMIZED;
     }
     if (SaveModel(model, ConfigDir() / L"session.dat")) {
-        dirty = changeRevision != revision;
+        dirty = changeRevision != revision || captureIncomplete;
         saveFailures = 0;
-        saveRetryAt = 0;
+        if (captureIncomplete) {
+            // 保存已知模型后再尝试失败的视图采样；不能每 700ms 重写相同快照。
+            captureFailures = std::min(captureFailures + 1, 7);
+            saveRetryAt =
+                GetTickCount64() + std::min<ULONGLONG>(60000, 2000ULL << std::min(captureFailures - 1, 5));
+        } else {
+            captureFailures = 0;
+            saveRetryAt = 0;
+        }
     } else {
         dirty = true;
         bool firstFailure = !saveFailures;
@@ -930,6 +1005,7 @@ void App::Save(bool force) {
     }
 }
 void App::QueueStatusUpdate() {
+    ++statusRevision;
     if (!closing && !statusUpdatePending && IsWindow(window))
         statusUpdatePending = PostMessageW(window, WM_ZEN_ACTION, 2, 0) != FALSE;
 }
@@ -981,6 +1057,10 @@ void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex
     if (it != views.end()) {
         // 位置与历史由视图统一提交：新地址要求成功，已有历史允许停留在失败位置。
         it->second->Capture();
+        // 采集期间 Shell 可重入关闭或移动标签，返回后重新定位。
+        it = views.find(id);
+        if (closing || it == views.end() || !model.Find(id))
+            return;
         it->second->Browse({path, append, historyIndex});
         Layout();
     }
@@ -1009,6 +1089,9 @@ void App::NewTab(int p, const LocationKey &path, Id group, int index, Id opener)
     BuildMenu();
 }
 void App::SyncViews(int pane) {
+    CaptureLeavingViews();
+    if (closing)
+        return;
     ResourceTrace trace(L"清理标签资源");
     std::erase_if(views, [&](auto &pair) { return !model.Find(pair.first); });
     PruneLocations();
@@ -1231,12 +1314,7 @@ void App::ShowError(Id id, HRESULT hr) {
     Log(L"目录访问失败 " + ErrorText(hr));
     Layout();
 }
-void App::UpdateStatus() {
-    if (!status)
-        return;
-    auto *t = model.Find(model.panes[model.active].selected);
-    if (!t)
-        return;
+void App::UpdateNavigationControls() {
     for (int p = 0; p < 2; ++p) {
         auto *tab = model.Find(model.panes[p].selected);
         auto view = tab ? views.find(tab->id) : views.end();
@@ -1246,18 +1324,86 @@ void App::UpdateStatus() {
         EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 2), tab != nullptr);
         EnableWindow(GetDlgItem(window, NavigationBase + p * 4 + 3), view != views.end());
     }
-    auto it = views.find(t->id);
+}
+void App::ClearStatusWatch() {
+    const ULONG registration = statusWatch;
+    statusWatch = 0;
+    auto previous = std::move(statusWatchPidl);
+    if (registration)
+        SHChangeNotifyDeregister(registration);
+}
+bool App::SyncStatusContext() {
+    const auto *tab = model.Find(model.panes[model.active].selected);
+    const Id id = tab ? tab->id : 0;
+    const LocationKey path = tab ? tab->path : LocationKey{};
+    const auto found = views.find(id);
+    IShellView *shell = found == views.end() ? nullptr : found->second->shell.Get();
+    const auto pidl = shell ? model.locations.Pidl(path) : nullptr;
+    const size_t pidlSize = pidl ? ILGetSize(pidl) : 0;
+    const bool sameIdentity = pidlSize == statusWatchPidl.size() &&
+                              (!pidlSize || memcmp(pidl, statusWatchPidl.data(), pidlSize) == 0);
+    if (statusTab == id && statusLocation == path && statusShell == shell && sameIdentity)
+        return false;
+    std::vector<BYTE> identity;
+    if (pidlSize) {
+        const auto *bytes = reinterpret_cast<const BYTE *>(pidl);
+        identity.assign(bytes, bytes + pidlSize);
+    }
+    ClearStatusWatch();
+    statusTab = id;
+    statusLocation = path;
+    statusShell = shell;
+    // 只监听活动目录，使用已有 PIDL；不为布局重新解析设备或网络位置。
+    if (!closing && IsWindow(window) && shell)
+        if (!identity.empty()) {
+            statusWatchPidl = std::move(identity);
+            SHChangeNotifyEntry entry{reinterpret_cast<PCIDLIST_ABSOLUTE>(statusWatchPidl.data()), FALSE};
+            statusWatch = SHChangeNotifyRegister(
+                window, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+                SHCNE_CREATE | SHCNE_DELETE | SHCNE_RENAMEITEM | SHCNE_MKDIR | SHCNE_RMDIR |
+                    SHCNE_RENAMEFOLDER | SHCNE_ATTRIBUTES | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR |
+                    SHCNE_DRIVEADD | SHCNE_DRIVEADDGUI | SHCNE_DRIVEREMOVED | SHCNE_MEDIAINSERTED |
+                    SHCNE_MEDIAREMOVED | SHCNE_SERVERDISCONNECT | SHCNE_NETSHARE | SHCNE_NETUNSHARE,
+                WM_ZEN_STATUS_FILES, 1, &entry);
+        }
+    return true;
+}
+void App::UpdateStatus() {
+    if (!status || closing || updatingStatus)
+        return;
+    updatingStatus = true;
+    const uint64_t revision = statusRevision;
+    struct Finish {
+        App &app;
+        uint64_t revision;
+        ~Finish() {
+            app.updatingStatus = false;
+            if (app.statusRevision != revision)
+                app.QueueStatusUpdate();
+        }
+    } finish{*this, revision};
+    UpdateNavigationControls();
+    SyncStatusContext();
+    const Id id = statusTab;
+    const LocationKey path = statusLocation;
+    auto it = views.find(id);
+    ComPtr<IShellView> source = it == views.end() ? nullptr : it->second->shell;
     int total = 0, selected = 0;
     uint64_t bytes = 0;
     bool unknown = false;
-    if (it != views.end()) {
-        auto &v = *it->second;
+    if (source) {
         ComPtr<IFolderView2> f;
-        if (v.shell && SUCCEEDED(v.shell.As(&f))) {
+        if (SUCCEEDED(source.As(&f))) {
             f->ItemCount(SVGIO_ALLVIEW, &total);
-            auto items = v.Selected();
-            selected = (int)items.size();
-            for (auto &item : items) {
+            ComPtr<IShellItemArray> items;
+            DWORD count = 0;
+            if (SUCCEEDED(f->Items(SVGIO_SELECTION | SVGIO_FLAG_VIEWORDER, IID_PPV_ARGS(&items))) && items)
+                items->GetCount(&count);
+            for (DWORD i = 0; i < count; ++i) {
+                ComPtr<IShellItem> item;
+                if (FAILED(items->GetItemAt(i, &item)) || !item)
+                    continue;
+                ++selected;
                 SFGAOF attr = 0;
                 item->GetAttributes(SFGAO_FOLDER, &attr);
                 if (attr & SFGAO_FOLDER)
@@ -1273,6 +1419,12 @@ void App::UpdateStatus() {
             }
         }
     }
+    // 属性读取可重入切换、导航或关闭。旧上下文的统计不能覆盖当前状态栏。
+    const auto *current = model.Find(model.panes[model.active].selected);
+    it = views.find(id);
+    if (closing || !IsWindow(status) || statusRevision != revision || !current || current->id != id ||
+        current->path != path || (it == views.end() ? nullptr : it->second->shell.Get()) != source.Get())
+        return;
     auto text = std::to_wstring(total) + L" 个项目　已选择 " + std::to_wstring(selected) + L" 个项目　" +
                 SizeText(bytes) + (unknown ? L"（部分大小未知）" : L"");
     SendMessageW(status, SB_SETTEXTW, 0, (LPARAM)text.c_str());
@@ -1919,6 +2071,12 @@ void App::FileMenu(ShellView &v, POINT pt, bool background) {
         return;
     }
     hr = session.Invoke(cmd, pt);
+    if (background)
+        if (auto *view = source()) {
+            // 系统背景菜单可改变模式或排序；仅在实际执行后标记，不在展示菜单时采样。
+            view->MarkSettingsChanged();
+            Changed();
+        }
     if (FAILED(hr) && !closing && IsWindow(window))
         Report(window, L"系统菜单命令执行失败", hr);
 }

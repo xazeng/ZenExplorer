@@ -37,6 +37,9 @@ struct TaskItems {
 TaskItems ReadTaskItems(const std::filesystem::path &result);
 // 仅删除任务目录中已消费结果的精确文件；调用者须确认写入进程已退出。
 bool CleanupTaskResult(const std::filesystem::path &result);
+// 仅供本次跟踪结果消费后调用；再次检查退出凭据及 GUID 文件名，精确回收任务与临时文件。
+// 不扫描目录，不解释或释放封送数据，也不终止进程。
+bool CleanupExitedTaskFiles(const std::filesystem::path &result, HANDLE process);
 // 测试可指定待验证程序；生产调用默认启动当前可执行文件。
 bool LaunchTask(HWND owner, const FileTask &task, const std::filesystem::path &executable = {},
                 std::filesystem::path *resultFile = nullptr, std::shared_ptr<void> *process = nullptr,

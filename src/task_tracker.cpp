@@ -86,20 +86,20 @@ void TaskTracker::Poll(ULONGLONG now) {
                 ++it;
                 continue;
             }
-            if (CleanupTaskResult(entry.ticket.result)) {
+            if (CleanupExitedTaskFiles(entry.ticket.result, entry.ticket.process.get())) {
                 it = entries.erase(it);
                 continue;
             }
             // 暂时占用可稍后重试；永久失败不能无限占用观察句柄和跟踪记录。
             if (++entry.cleanupFailures >= 8) {
-                Log(L"任务结果清理重试已用尽，保留磁盘结果 " + entry.ticket.result.filename().wstring());
+                Log(L"任务残留清理重试已用尽，保留未清理文件 " + entry.ticket.result.filename().wstring());
                 it = entries.erase(it);
                 continue;
             }
             auto delay = std::min<ULONGLONG>(1000ull << (entry.cleanupFailures - 1), 60000ull);
             entry.nextCleanupAttempt = now + delay;
             if (FileLogEnabled())
-                Log(L"任务结果清理暂未完成，稍后重试 " + entry.ticket.result.filename().wstring());
+                Log(L"任务残留清理暂未完成，稍后重试 " + entry.ticket.result.filename().wstring());
             ++it;
         } else {
             ++it;

@@ -33,6 +33,11 @@ add_executable(zen_navigation_tests tests/navigation_tests.cpp src/app.manifest)
 target_link_libraries(zen_navigation_tests PRIVATE zen_core)
 add_test(NAME navigation_contracts COMMAND zen_navigation_tests)
 
+add_executable(zen_logging_tests tests/logging_tests.cpp src/app.manifest)
+target_link_libraries(zen_logging_tests PRIVATE zen_core)
+add_test(NAME bounded_logging COMMAND zen_logging_tests)
+set_tests_properties(bounded_logging PROPERTIES TIMEOUT 45)
+
 add_executable(zen_task_tracker_tests tests/task_tracker_tests.cpp src/app.manifest)
 target_link_libraries(zen_task_tracker_tests PRIVATE zen_operations)
 add_test(NAME task_tracking COMMAND zen_task_tracker_tests)
@@ -43,7 +48,8 @@ add_dependencies(zen_operations_tests ZenExplorer)
 add_test(NAME independent_operations COMMAND zen_operations_tests)
 set_tests_properties(independent_operations PROPERTIES TIMEOUT 150)
 
-add_executable(zen_shell_startup_tests tests/shell_startup_tests.cpp src/app.rc src/app.manifest)
+add_executable(zen_shell_startup_tests tests/shell_startup_tests.cpp tests/status_tests.cpp
+  tests/view_capture_tests.cpp tests/task_feedback_tests.cpp src/app.rc src/app.manifest)
 target_link_libraries(zen_shell_startup_tests PRIVATE zen_ui)
 add_test(NAME shell_startup_restore COMMAND zen_shell_startup_tests)
 set_tests_properties(shell_startup_restore PROPERTIES TIMEOUT 100)

@@ -4,10 +4,12 @@
 #include "task_feedback.h"
 #include <shldisp.h>
 #include <unordered_map>
+#include <set>
 namespace zen {
 class ShellView;
 class TabStrip;
-inline constexpr UINT WM_ZEN_NAV = WM_APP + 10, WM_ZEN_CHANGED = WM_APP + 11, WM_ZEN_ACTION = WM_APP + 12;
+inline constexpr UINT WM_ZEN_NAV = WM_APP + 10, WM_ZEN_CHANGED = WM_APP + 11, WM_ZEN_ACTION = WM_APP + 12,
+                      WM_ZEN_STATUS_FILES = WM_APP + 13;
 struct NavRequest {
     Id id;
     LocationKey path;
@@ -50,9 +52,18 @@ class App {
     void PruneLocations();
     bool readOnly = false, dirty = false, closing = false, sizing = false, restoring = false;
     bool saving = false, saveRequested = false, closeRequested = false, statusUpdatePending = false;
+    bool updatingStatus = false, capturingLeavingViews = false;
     uint64_t changeRevision = 0;
+    uint64_t statusRevision = 0;
     ULONGLONG saveRetryAt = 0;
-    int saveFailures = 0;
+    int saveFailures = 0, captureFailures = 0;
+    Id visibleTabs[2]{};
+    std::set<Id> leavingViews;
+    Id statusTab = 0;
+    LocationKey statusLocation;
+    IShellView *statusShell = nullptr; // 仅用于上下文身份比较，不解引用或延长后台视图生命周期。
+    ULONG statusWatch = 0;
+    std::vector<BYTE> statusWatchPidl;
     ComPtr<IContextMenu2> menu2;
     ComPtr<IContextMenu3> menu3;
     std::unordered_map<Id, HICON> icons;
@@ -74,9 +85,13 @@ class App {
     void RedrawPaneFocus();
     void Activate(int p, Id id = 0, bool focus = false);
     void EnsureView(Id id);
+    void CaptureLeavingViews();
     void Changed();
     void Save(bool force = true);
     void QueueStatusUpdate();
+    void UpdateNavigationControls();
+    bool SyncStatusContext();
+    void ClearStatusWatch();
     void UpdateStatus();
     void UpdateAddress(int p);
     std::wstring AddressText(int p) const;

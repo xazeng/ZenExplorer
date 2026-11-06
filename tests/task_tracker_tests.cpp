@@ -14,8 +14,12 @@ static std::shared_ptr<void> ExitSignal(bool signalled = false) {
     CHECK(signal);
     return signal;
 }
-static std::filesystem::path ResultFile(const wchar_t *name) {
-    return DataDir() / L"tasks" / (std::wstring(name) + L".task.result");
+static std::filesystem::path ResultFile() {
+    GUID id{};
+    CHECK(SUCCEEDED(CoCreateGuid(&id)));
+    wchar_t token[40]{};
+    CHECK(StringFromGUID2(id, token, 40));
+    return DataDir() / L"tasks" / (std::wstring(token) + L".task.result");
 }
 static void WriteResult(const std::filesystem::path &path) {
     Writer writer;
@@ -27,7 +31,7 @@ static void WriteResult(const std::filesystem::path &path) {
 static void CompletionBeforeExit() {
     TaskTracker tracker;
     auto process = ExitSignal();
-    auto file = ResultFile(L"completion-before-exit");
+    auto file = ResultFile();
     int callbacks = 0;
     tracker.Track({file, process}, TaskFeedbackKind::Paste, [&](const TaskCompletion &completion) {
         CHECK(completion.result && completion.result->invoked == S_OK);
@@ -50,7 +54,7 @@ static void CompletionBeforeExit() {
 static void MissingAndCorruptResults() {
     for (bool corrupt : {false, true}) {
         TaskTracker tracker;
-        auto file = ResultFile(corrupt ? L"corrupt" : L"missing");
+        auto file = ResultFile();
         if (corrupt) {
             std::filesystem::create_directories(file.parent_path());
             std::ofstream(file, std::ios::binary) << "invalid result";
@@ -71,7 +75,7 @@ static void MissingAndCorruptResults() {
 }
 static void ReentrantFeedback() {
     TaskTracker tracker;
-    auto first = ResultFile(L"reentrant-first"), second = ResultFile(L"reentrant-second");
+    auto first = ResultFile(), second = ResultFile();
     WriteResult(first);
     WriteResult(second);
     int firstCalls = 0, secondCalls = 0;
@@ -94,7 +98,7 @@ static void ReentrantFeedback() {
 }
 static void InvalidOptionalDetails() {
     TaskTracker tracker;
-    auto file = ResultFile(L"invalid-details");
+    auto file = ResultFile();
     WriteResult(file);
     auto details = file;
     details += L".items";
@@ -111,7 +115,7 @@ static void InvalidOptionalDetails() {
 }
 static void DestructionDoesNotCancel() {
     auto process = ExitSignal();
-    auto file = ResultFile(L"still-running");
+    auto file = ResultFile();
     WriteResult(file);
     {
         TaskTracker tracker;
@@ -130,7 +134,7 @@ static std::shared_ptr<void> PreventDeletion(const std::filesystem::path &file) 
 }
 static void CleanupRetriesWithoutRepeatingFeedback() {
     TaskTracker tracker;
-    auto file = ResultFile(L"cleanup-retry");
+    auto file = ResultFile();
     WriteResult(file);
     auto locked = PreventDeletion(file);
     int callbacks = 0;
@@ -150,7 +154,7 @@ static void CleanupRetriesWithoutRepeatingFeedback() {
 }
 static void PermanentCleanupFailureReleasesObservation() {
     TaskTracker tracker;
-    auto file = ResultFile(L"cleanup-permanent-failure");
+    auto file = ResultFile();
     WriteResult(file);
     auto locked = PreventDeletion(file);
     auto process = ExitSignal(true);
@@ -166,6 +170,133 @@ static void PermanentCleanupFailureReleasesObservation() {
     locked.reset();
     CHECK(CleanupTaskResult(file));
 }
+static std::vector<std::filesystem::path> ArtifactFiles(const std::filesystem::path &result) {
+    const auto token = result.filename().wstring().substr(0, 38);
+    std::vector<std::filesystem::path> files;
+    for (const auto *ending : {L".task", L".task.tmp", L".task.result", L".task.result.tmp",
+                               L".task.result.items", L".task.result.items.tmp"})
+        files.push_back(result.parent_path() / (token + ending));
+    return files;
+}
+static void WriteArtifacts(const std::filesystem::path &result, bool includeResult = true) {
+    std::filesystem::create_directories(result.parent_path());
+    // 正常结果写入会提交并移走 .tmp，先写结果再制造需要验证的临时残留。
+    if (includeResult)
+        WriteResult(result);
+    for (const auto &file : ArtifactFiles(result))
+        if (file != result) {
+            std::ofstream stream(file, std::ios::binary);
+            stream << "partial task artifact";
+            CHECK(stream.good());
+        }
+    for (const auto &file : ArtifactFiles(result))
+        CHECK(std::filesystem::exists(file) == (includeResult || file != result));
+}
+static void ExitedTaskCleansOnlyItsArtifacts() {
+    auto unrelated = ResultFile();
+    WriteArtifacts(unrelated);
+    for (bool resultPresent : {false, true}) {
+        auto result = ResultFile();
+        WriteArtifacts(result, resultPresent);
+        auto unknown = result;
+        unknown += L".backup";
+        std::ofstream(unknown) << "keep unknown sibling";
+        int callbacks = 0;
+        TaskTracker tracker;
+        tracker.Track({result, ExitSignal(true)}, TaskFeedbackKind::Drop,
+                      [&](const TaskCompletion &completion) {
+                          CHECK(completion.status == (resultPresent ? TaskCompletion::Status::Result
+                                                                    : TaskCompletion::Status::Missing));
+                          ++callbacks;
+                          return true;
+                      });
+        tracker.Poll(0);
+        CHECK(callbacks == 1 && tracker.Count() == 1);
+        CHECK(std::filesystem::exists(ArtifactFiles(result).front()));
+        tracker.Poll(0);
+        CHECK(tracker.Count() == 0 && callbacks == 1);
+        for (const auto &file : ArtifactFiles(result))
+            CHECK(!std::filesystem::exists(file));
+        CHECK(std::filesystem::exists(unknown));
+    }
+    for (const auto &file : ArtifactFiles(unrelated))
+        CHECK(std::filesystem::exists(file));
+}
+static void LiveAndUnobservedTasksKeepArtifacts() {
+    for (bool observed : {false, true}) {
+        auto result = ResultFile();
+        WriteArtifacts(result);
+        auto process = observed ? ExitSignal() : std::shared_ptr<void>{};
+        TaskTracker tracker;
+        tracker.Track({result, process});
+        tracker.Poll(0);
+        CHECK(tracker.Count() == (observed ? 1u : 0u));
+        CHECK(!CleanupExitedTaskFiles(result, process.get()));
+        CHECK(!CleanupExitedTaskFiles(result, GetCurrentProcess()));
+        for (const auto &file : ArtifactFiles(result))
+            CHECK(std::filesystem::exists(file));
+        if (observed) {
+            CHECK(SetEvent(process.get()));
+            tracker.Poll(0);
+            CHECK(tracker.Count() == 0);
+        }
+    }
+}
+static void OriginalTaskCleanupRetriesWithoutRepeatingFeedback() {
+    auto result = ResultFile();
+    WriteArtifacts(result);
+    auto original = ArtifactFiles(result).front();
+    auto locked = PreventDeletion(original);
+    TaskTracker tracker;
+    int callbacks = 0;
+    tracker.Track({result, ExitSignal(true)}, TaskFeedbackKind::Paste, [&](const TaskCompletion &) {
+        ++callbacks;
+        return true;
+    });
+    tracker.Poll(1000);
+    tracker.Poll(1000);
+    CHECK(callbacks == 1 && tracker.Count() == 1 && std::filesystem::exists(original));
+    CHECK(!std::filesystem::exists(result)); // 其他已可清理的文件不被占用项阻塞。
+    locked.reset();
+    tracker.Poll(1999);
+    CHECK(tracker.Count() == 1 && std::filesystem::exists(original));
+    tracker.Poll(2000);
+    CHECK(tracker.Count() == 0 && callbacks == 1);
+    for (const auto &file : ArtifactFiles(result))
+        CHECK(!std::filesystem::exists(file));
+}
+static void ArtifactCleanupBoundaries() {
+    auto process = ExitSignal(true);
+    auto result = ResultFile();
+    auto malformedName = result.filename().wstring();
+    malformedName[1] = L'G';
+    auto malformed = result.parent_path() / malformedName;
+    WriteArtifacts(malformed);
+    CHECK(!CleanupExitedTaskFiles(malformed, process.get()));
+    for (const auto &file : ArtifactFiles(malformed))
+        CHECK(std::filesystem::exists(file));
+
+    auto outside = DataDir() / L"other" / result.filename();
+    WriteArtifacts(outside);
+    CHECK(
+        !CleanupExitedTaskFiles(result.parent_path() / L".." / L"other" / result.filename(), process.get()));
+    for (const auto &file : ArtifactFiles(outside))
+        CHECK(std::filesystem::exists(file));
+
+    WriteArtifacts(result);
+    CHECK(!CleanupExitedTaskFiles(result.wstring() + L".items", process.get()));
+    CHECK(!CleanupExitedTaskFiles(result.wstring() + L".backup", process.get()));
+    for (const auto &file : ArtifactFiles(result))
+        CHECK(std::filesystem::exists(file));
+    // 即使名称属于此任务，也不删除目录或递归处理目录中的内容。
+    auto original = ArtifactFiles(result).front();
+    CHECK(std::filesystem::remove(original));
+    std::filesystem::create_directories(original);
+    auto sentinel = original / L"keep.txt";
+    std::ofstream(sentinel) << "keep directory contents";
+    CHECK(!CleanupExitedTaskFiles(result, process.get()));
+    CHECK(std::filesystem::is_directory(original) && std::filesystem::exists(sentinel));
+}
 int main() {
     auto root = std::filesystem::current_path() / L".test-data" /
                 (L"task-tracker-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
@@ -177,13 +308,18 @@ int main() {
         void (*run)();
     };
     bool failed = false;
-    for (const auto &test : {Case{"completion_before_exit", CompletionBeforeExit},
-                             Case{"missing_and_corrupt_results", MissingAndCorruptResults},
-                             Case{"reentrant_feedback", ReentrantFeedback},
-                             Case{"invalid_optional_details", InvalidOptionalDetails},
-                             Case{"destruction_does_not_cancel", DestructionDoesNotCancel},
-                             Case{"cleanup_retry", CleanupRetriesWithoutRepeatingFeedback},
-                             Case{"cleanup_permanent_failure", PermanentCleanupFailureReleasesObservation}}) {
+    for (const auto &test :
+         {Case{"completion_before_exit", CompletionBeforeExit},
+          Case{"missing_and_corrupt_results", MissingAndCorruptResults},
+          Case{"reentrant_feedback", ReentrantFeedback},
+          Case{"invalid_optional_details", InvalidOptionalDetails},
+          Case{"destruction_does_not_cancel", DestructionDoesNotCancel},
+          Case{"cleanup_retry", CleanupRetriesWithoutRepeatingFeedback},
+          Case{"cleanup_permanent_failure", PermanentCleanupFailureReleasesObservation},
+          Case{"exited_task_artifacts", ExitedTaskCleansOnlyItsArtifacts},
+          Case{"active_task_artifacts", LiveAndUnobservedTasksKeepArtifacts},
+          Case{"original_task_cleanup_retry", OriginalTaskCleanupRetriesWithoutRepeatingFeedback},
+          Case{"artifact_cleanup_boundaries", ArtifactCleanupBoundaries}}) {
         try {
             test.run();
             std::cout << test.name << ": passed\n";

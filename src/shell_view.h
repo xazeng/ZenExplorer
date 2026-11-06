@@ -20,6 +20,11 @@ class ShellView : public IExplorerBrowserEvents,
     bool destroyed = false;
     bool initialized = false, creating = false;
     bool browserSized = false;
+    bool capturing = false;
+    // 全部视图在 UI 线程创建；防止重入销毁后，同 ID 的新对象复用原地址。
+    inline static uint64_t nextLifetimeId = 0;
+    const uint64_t lifetimeId = ++nextLifetimeId;
+    uint64_t settingsRevision = 1, capturedRevision = 0;
     RECT browserBounds{};
     NavigationState navigation;
     NavigationState previousNavigation;
@@ -48,7 +53,14 @@ class ShellView : public IExplorerBrowserEvents,
     HRESULT Browse(const NavigationRequest &request, bool fallback = false);
     void Retry();
     void Destroy();
-    void Capture();
+    bool NeedsCapture() const {
+        return settingsRevision != capturedRevision;
+    }
+    void MarkSettingsChanged() {
+        ++settingsRevision;
+    }
+    // 强制采样；自动保存可先检查 NeedsCapture。失败或重入变更时保留待采集标记。
+    bool Capture();
     void Apply();
     HRESULT ApplyViewMode();
     void Hook();

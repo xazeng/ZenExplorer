@@ -373,6 +373,90 @@ static void CheckLocationImportRepair() {
     CHECK(!restored.Find(placeholder)->usable &&
           restored.DisplayName(placeholder) == invalidated.displayName);
 }
+static void CheckLocationIndexLifecycle() {
+    LocationStore store, identities;
+    const LocationKey first = L"C:\\indexed-first", alias = L"zen-shell:indexed-alias";
+    const auto firstId = store.EnsureId(first);
+    auto record = *store.Find(first);
+    CHECK(store.Insert(alias, record));
+    auto selected = store.KeyForId(firstId);
+    CHECK((selected == first || selected == alias) && store.Count() == 2);
+    // 删除同 ID 的一个键不能同时移除仍被引用的别名。
+    store.Retain({alias});
+    CHECK(store.Count() == 1 && store.KeyForId(firstId) == alias);
+
+    const auto replacementId = identities.EnsureId(L"C:\\replacement-id");
+    record.id = replacementId;
+    record.parsingName = L"C:\\replaced-target";
+    store.Set(alias, record);
+    CHECK(store.KeyForId(replacementId) == alias);
+    auto missing = store.KeyForId(firstId);
+    CHECK(missing != alias && store.Find(missing)->id == firstId &&
+          store.Find(missing)->parsingName.empty() && store.Find(missing)->pidl.empty());
+    // 常规资料刷新保留原身份；插入重复键失败不能留下另一身份的索引。
+    record.id.clear();
+    record.displayName = L"更新后的目录";
+    store.Set(alias, record);
+    CHECK(store.EnsureId(alias) == replacementId && store.KeyForId(replacementId) == alias);
+    const auto rejectedId = identities.EnsureId(L"C:\\rejected-id");
+    record.id = rejectedId;
+    const auto count = store.Count();
+    CHECK(!store.Insert(alias, record) && store.Count() == count);
+    auto rejected = store.KeyForId(rejectedId);
+    CHECK(rejected != alias && store.Find(rejected)->parsingName.empty());
+
+    LocationStore copied(store);
+    store.Retain({});
+    CHECK(store.Count() == 0 && copied.KeyForId(replacementId) == alias);
+    LocationStore assigned;
+    assigned.EnsureId(L"C:\\discarded-before-copy");
+    assigned = copied;
+    CHECK(!assigned.Find(L"C:\\discarded-before-copy") && assigned.KeyForId(replacementId) == alias);
+    copied.Retain({missing});
+    CHECK(assigned.KeyForId(replacementId) == alias && copied.Count() == 1);
+
+    LocationStore moved(std::move(assigned));
+    CHECK(assigned.Count() == 0 && moved.KeyForId(replacementId) == alias);
+    CHECK(assigned.EnsureId(L"C:\\reused-after-move") != replacementId);
+    assigned = std::move(moved);
+    CHECK(moved.Count() == 0 && assigned.KeyForId(replacementId) == alias &&
+          !assigned.Find(L"C:\\reused-after-move"));
+    // 裁剪后的旧 ID 只能重新生成占位，不能指向已经释放的位置键。
+    assigned.Retain({missing});
+    auto replaced = assigned.KeyForId(replacementId);
+    CHECK(replaced != alias && assigned.Find(replaced)->parsingName.empty() &&
+          assigned.EnsureId(replaced) == replacementId);
+}
+static void CheckLocationIndexRoundTrip() {
+    LocationStore source;
+    std::set<LocationKey> keys;
+    std::vector<std::pair<std::wstring, LocationKey>> references;
+    for (int i = 0; i < 4096; ++i) {
+        LocationKey key = L"C:\\indexed-snapshot\\" + std::to_wstring(i);
+        references.emplace_back(source.EnsureId(key), key);
+        keys.insert(key);
+    }
+    Writer records;
+    source.WriteRecords(records, keys);
+    Reader reader{records.bytes};
+    LocationStore restored;
+    restored.ReadRecords(reader);
+    CHECK(reader.pos == records.bytes.size() && restored.Count() == references.size());
+    for (const auto &[identity, key] : references)
+        CHECK(restored.KeyForId(identity) == key);
+
+    // 多次独立导入沿用已有 ID，不额外生成别名或占位；索引不进入持久化格式。
+    LocationStore imported;
+    for (const auto &[identity, key] : references)
+        CHECK(imported.Import(restored, key) == key && imported.EnsureId(key) == identity);
+    CHECK(imported.Count() == references.size());
+    Writer reencoded;
+    imported.WriteRecords(reencoded, keys);
+    CHECK(reencoded.bytes == records.bytes);
+    for (const auto &[identity, key] : references)
+        CHECK(imported.Import(restored, key) == key && imported.KeyForId(identity) == key);
+    CHECK(imported.Count() == references.size());
+}
 static void CheckQuickAccessRecovery() {
     for (bool corrupt : {false, true}) {
         LocationStore source;
@@ -771,6 +855,8 @@ int main(int argc, char **argv) {
         CheckLocationReferencesAndCleanup();
         CheckQuickAccess();
         CheckLocationImportRepair();
+        CheckLocationIndexLifecycle();
+        CheckLocationIndexRoundTrip();
         CheckQuickAccessRecovery();
         CheckStorageReliability();
         CheckLocationText();

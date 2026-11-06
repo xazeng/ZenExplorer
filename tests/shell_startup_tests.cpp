@@ -8,6 +8,9 @@
 #include <thread>
 #include <wrl/implements.h>
 using namespace zen;
+bool CheckStatusUpdates();
+bool CheckViewCapture();
+bool CheckPasteFeedbackFiltering(App &app);
 // 模拟没有文件系统路径且不实现 GetParent 的设备扩展，仅提供有效对象标识。
 class VirtualHierarchyItem final
     : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
@@ -259,6 +262,88 @@ static bool CheckLifetimeResilience(App &app) {
         app.Save();
         expect(!app.saveFailures && !app.saveRetryAt, "explicit save did not bypass or reset backoff");
     }
+    return ok;
+}
+static bool CheckCurrentViewHooks(App &app, Id background) {
+    bool ok = true;
+    auto expect = [&](bool value, const char *message) {
+        if (!value) {
+            std::cerr << message << "\n";
+            ok = false;
+        }
+    };
+    const Id selected[] = {app.model.panes[0].selected, app.model.panes[1].selected};
+    const int active = app.model.active;
+    auto &left = *app.views.at(selected[0]);
+    auto &right = *app.views.at(selected[1]);
+    auto &hidden = *app.views.at(background);
+    auto child = [&](ShellView &view) {
+        HWND window = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD, 0, 0, 10, 10, view.host, nullptr,
+                                    GetModuleHandleW(nullptr), nullptr);
+        expect(window != nullptr, "could not create delayed Shell child");
+        return window;
+    };
+    auto hooked = [&](HWND window, ShellView &view) {
+        DWORD_PTR data = 0;
+        return GetWindowSubclass(window, ShellView::Subclass, (UINT_PTR)&view, &data) &&
+               data == reinterpret_cast<DWORD_PTR>(&view);
+    };
+    HWND leftChild = child(left), rightChild = child(right), hiddenChild = child(hidden);
+    app.dirty = false;
+    SendMessageW(app.window, WM_TIMER, 1, 0);
+    expect(hooked(leftChild, left) && hooked(rightChild, right),
+           "maintenance did not hook both current panes");
+    expect(!hooked(hiddenChild, hidden), "maintenance scanned an inactive tab");
+    DestroyWindow(leftChild);
+    DestroyWindow(rightChild);
+
+    // 激活前补接延迟创建的窗口，但不得重建原 Shell 视图或清除其选择。
+    ComPtr<IShellView> originalShell = hidden.shell;
+    HWND originalHost = hidden.host;
+    ComPtr<IFolderView2> folder;
+    if (SUCCEEDED(hidden.shell.As(&folder)))
+        folder->SelectItem(0, SVSI_SELECT | SVSI_DESELECTOTHERS);
+    auto selection = [&] {
+        std::vector<std::wstring> paths;
+        for (auto &item : hidden.Selected())
+            paths.push_back(ItemName(item.Get()));
+        return paths;
+    };
+    auto before = selection();
+    expect(!before.empty(), "could not prepare background selection preservation check");
+    app.Activate(1, background);
+    expect(hooked(hiddenChild, hidden), "activation did not hook delayed background child");
+    expect(hidden.shell.Get() == originalShell.Get() && hidden.host == originalHost && selection() == before,
+           "activating background tab recreated its view or changed selection");
+    DestroyWindow(hiddenChild);
+    app.Activate(1, selected[1]);
+
+    // 后台创建／导航通知仍可立即接入新窗口，并在销毁时撤销 OLE 注册引用。
+    ULONG refs = hidden.AddRef();
+    hidden.Release();
+    hiddenChild = child(hidden);
+    SendMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)background, 0);
+    expect(hooked(hiddenChild, hidden), "background view notification did not hook new child");
+    DestroyWindow(hiddenChild);
+    ULONG after = hidden.AddRef();
+    hidden.Release();
+    expect(after == refs, "background child destruction retained drop registration");
+
+    // 非活动标签和另一栏的纯选择通知不重复统计活动栏；激活时仍由 Layout 刷新。
+    MSG message{};
+    while (PeekMessageW(&message, app.window, WM_ZEN_ACTION, WM_ZEN_ACTION, PM_REMOVE))
+        DispatchMessageW(&message);
+    app.model.active = 0;
+    for (int i = 0; i < 64; ++i) {
+        hidden.OnStateChange(nullptr, CDBOSC_SELCHANGE);
+        right.OnStateChange(nullptr, CDBOSC_SELCHANGE);
+    }
+    expect(!app.statusUpdatePending, "inactive selection scheduled active status refresh");
+    left.OnStateChange(nullptr, CDBOSC_SELCHANGE);
+    expect(app.statusUpdatePending, "active selection did not schedule status refresh");
+    while (PeekMessageW(&message, app.window, WM_ZEN_ACTION, WM_ZEN_ACTION, PM_REMOVE))
+        DispatchMessageW(&message);
+    app.Activate(active);
     return ok;
 }
 struct CheckState {
@@ -549,7 +634,7 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             if (WindowText(app.AddressEdit(0)) != editText)
                 state->failed = true;
             SendMessageW(app.AddressEdit(0), WM_KEYDOWN, VK_ESCAPE, 0);
-            if (!CheckLifetimeResilience(app))
+            if (!CheckPasteFeedbackFiltering(app) || !CheckLifetimeResilience(app))
                 state->failed = true;
             app.Activate(1, state->background);
         } else if (state->stage == 1) {
@@ -557,6 +642,8 @@ static void CALLBACK Check(HWND, UINT, UINT_PTR, DWORD) {
             app.Activate(1, state->original);
         } else if (state->stage == 2) {
             checkMode(FVM_ICON);
+            if (!CheckCurrentViewHooks(app, state->background))
+                state->failed = true;
             setIcons();
             app.Navigate(id, tab->path, false);
         } else if (state->stage == 3) {
@@ -965,6 +1052,8 @@ int main() {
     Id cached = model.Add(1, (dir / L"not-present").wstring(), 0, -1, false);
     model.Find(cached)->displayName = L"离线目录显示名称";
     if (FAILED(OleInitialize(nullptr)))
+        return 1;
+    if (!CheckStatusUpdates() || !CheckViewCapture())
         return 1;
     // 模拟没有可解析文字的设备位置：重启恢复必须使用落盘的对象标识。
     PIDLIST_ABSOLUTE homePidl = nullptr;

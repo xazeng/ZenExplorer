@@ -2,6 +2,51 @@
 #include "storage.h"
 #include <map>
 namespace zen {
+LocationStore::LocationStore(LocationStore &&other) {
+    Swap(other);
+}
+LocationStore &LocationStore::operator=(LocationStore other) noexcept {
+    Swap(other);
+    return *this;
+}
+void LocationStore::Swap(LocationStore &other) noexcept {
+    entries.swap(other.entries);
+    idIndex.swap(other.idIndex);
+    presentation.swap(other.presentation);
+}
+const LocationKey *LocationStore::IndexedKey(const std::wstring &id) const {
+    auto found = idIndex.find(id);
+    return found == idIndex.end() ? nullptr : &found->second;
+}
+void LocationStore::RemoveIndex(const std::wstring &id, const LocationKey &key) {
+    if (id.empty())
+        return;
+    auto [first, last] = idIndex.equal_range(id);
+    for (auto it = first; it != last; ++it)
+        if (it->second == key) {
+            idIndex.erase(it);
+            return;
+        }
+}
+void LocationStore::Store(const LocationKey &key, ShellLocation location) {
+    auto found = entries.find(key);
+    if (found != entries.end() && found->second.id == location.id) {
+        found->second = std::move(location);
+        return;
+    }
+    const std::wstring previous = found == entries.end() ? std::wstring{} : found->second.id;
+    const auto identity = location.id;
+    // 先分配新索引，主表写入失败时撤回；成功后再移除旧身份，避免异常留下悬空映射。
+    if (!identity.empty())
+        idIndex.emplace(identity, key);
+    try {
+        entries.insert_or_assign(key, std::move(location));
+    } catch (...) {
+        RemoveIndex(identity, key);
+        throw;
+    }
+    RemoveIndex(previous, key);
+}
 const ShellLocation *LocationStore::Find(const LocationKey &key) const {
     auto it = entries.find(key);
     return it == entries.end() ? nullptr : &it->second;
@@ -15,23 +60,20 @@ LocationKey LocationStore::Import(const LocationStore &source, const LocationKey
         if (!record)
             continue;
         LocationKey target = old;
-        bool matched = false;
-        for (const auto &[existingKey, existing] : entries)
-            if (!record->id.empty() && existing.id == record->id) {
-                target = existingKey;
-                matched = true;
-                break;
-            }
+        const auto *existingKey = IndexedKey(record->id);
+        bool matched = existingKey != nullptr;
+        if (matched)
+            target = *existingKey;
         if (!matched) {
             if (entries.contains(target) && entries.at(target).id != record->id)
                 target = L"location:" + record->id;
-            entries[target] = *record;
+            Store(target, *record);
         } else {
             auto &existing = entries.at(target);
             // 同 ID 的缺失占位可由独立快照补齐；运行期失效的完整记录不能被旧资料覆盖。
             if (existing.parsingName.empty() && existing.pidl.empty() &&
                 (!record->parsingName.empty() || !record->pidl.empty())) {
-                existing = *record;
+                Store(target, *record);
                 repaired.insert(target);
             }
         }
@@ -50,13 +92,16 @@ LocationKey LocationStore::Import(const LocationStore &source, const LocationKey
     return mapped.contains(key) ? mapped.at(key) : LocationKey{};
 }
 bool LocationStore::Insert(const LocationKey &key, ShellLocation location) {
-    return entries.emplace(key, std::move(location)).second;
+    if (entries.contains(key))
+        return false;
+    Store(key, std::move(location));
+    return true;
 }
 void LocationStore::Set(const LocationKey &key, ShellLocation location) {
     if (location.id.empty())
         if (auto old = Find(key))
             location.id = old->id;
-    entries[key] = std::move(location);
+    Store(key, std::move(location));
 }
 std::wstring LocationStore::EnsureId(const LocationKey &key) {
     if (key.empty())
@@ -66,7 +111,7 @@ std::wstring LocationStore::EnsureId(const LocationKey &key) {
         if (!key.Stored().starts_with(L"zen-shell:") && !key.Stored().starts_with(L"location:"))
             value.parsingName = key.Stored();
         value.displayName = LocationName(key.Stored());
-        entries.emplace(key, std::move(value));
+        Store(key, std::move(value));
     }
     auto &value = entries.at(key);
     if (value.id.empty()) {
@@ -75,7 +120,9 @@ std::wstring LocationStore::EnsureId(const LocationKey &key) {
             throw std::runtime_error("生成目录 ID 失败");
         wchar_t id[40]{};
         StringFromGUID2(guid, id, 40);
-        value.id = id;
+        std::wstring identity = id;
+        idIndex.emplace(identity, key);
+        value.id.swap(identity);
     }
     return value.id;
 }
@@ -85,16 +132,15 @@ LocationKey LocationStore::KeyForId(const std::wstring &id) {
     GUID guid{};
     if (FAILED(CLSIDFromString(id.c_str(), &guid)))
         throw std::runtime_error("目录 ID 无效");
-    for (const auto &[key, value] : entries)
-        if (value.id == id)
-            return key;
+    if (auto key = IndexedKey(id))
+        return *key;
     // 位置资料不可用时仍保留引用，不能把标签重置成其他目录。
     LocationKey key = L"location:" + id;
     ShellLocation missing;
     missing.id = id;
     missing.displayName = L"目录资料不可用";
     missing.usable = false;
-    entries[key] = std::move(missing);
+    Store(key, std::move(missing));
     return key;
 }
 std::set<LocationKey> LocationStore::References(const std::set<LocationKey> &roots) const {
@@ -246,7 +292,12 @@ HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &desti
 }
 void LocationStore::Retain(const std::set<LocationKey> &keys) {
     auto retained = References(keys);
-    std::erase_if(entries, [&](const auto &entry) { return !retained.contains(entry.first); });
+    for (auto it = entries.begin(); it != entries.end();)
+        if (!retained.contains(it->first)) {
+            RemoveIndex(it->second.id, it->first);
+            it = entries.erase(it);
+        } else
+            ++it;
     std::erase_if(presentation, [&](const auto &entry) { return !retained.contains(entry.first); });
 }
 LocationKey LocationStore::Refresh(IShellItem *item) {

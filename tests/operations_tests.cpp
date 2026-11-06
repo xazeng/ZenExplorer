@@ -1,4 +1,5 @@
 #include "operations.h"
+#include "task_outcomes.h"
 #include <fstream>
 #include <iostream>
 using namespace zen;
@@ -77,6 +78,69 @@ static void TaskPayloadLimits() {
             "over-limit task rejected before serialization");
     Require(std::filesystem::remove(file), "remove boundary fixture");
 }
+static void TaskOutcomeSequences() {
+    for (HRESULT status : {COPYENGINE_S_USER_IGNORED, COPYENGINE_S_PENDING, COPYENGINE_S_PENDING_DELETE,
+                           COPYENGINE_S_PENDING_BATCH_COPY, E_ACCESSDENIED}) {
+        TaskOutcomes outcomes;
+        outcomes.Record(L"source", status);
+        outcomes.Record(L"source", status);
+        auto summary = outcomes.Summarize();
+        Require(outcomes.RetainedCount() == 1 && summary.incomplete &&
+                    summary.failure == (FAILED(status) ? status : S_OK),
+                "duplicate incomplete notifications retain only latest source result");
+        outcomes.Record(L"source", S_OK);
+        summary = outcomes.Summarize();
+        Require(outcomes.RetainedCount() == 0 && !summary.incomplete && summary.failure == S_OK,
+                "successful completion replaces pending, ignored and failed results");
+    }
+    TaskOutcomes outcomes;
+    outcomes.Record(L"first", S_OK);
+    outcomes.Record(L"first", E_ACCESSDENIED);
+    outcomes.Record(L"second", COPYENGINE_S_PENDING);
+    auto summary = outcomes.Summarize();
+    Require(outcomes.RetainedCount() == 2 && summary.incomplete && summary.failure == E_ACCESSDENIED,
+            "failure after success is retained alongside another source");
+    outcomes.Record(L"first", COPYENGINE_S_PENDING_BATCH_COPY);
+    summary = outcomes.Summarize();
+    Require(summary.failure == S_OK && summary.incomplete && outcomes.RetainedCount() == 2,
+            "later pending result replaces prior failure without completing source");
+    outcomes.Record(L"second", S_OK);
+    Require(outcomes.RetainedCount() == 1 && outcomes.Summarize().incomplete,
+            "one source completing does not clear another pending source");
+    outcomes.Record(L"first", S_FALSE);
+    Require(outcomes.RetainedCount() == 0 && !outcomes.Summarize().incomplete,
+            "other terminal success codes do not leave stale results");
+    outcomes.Record(L"first", E_ACCESSDENIED);
+    outcomes.Record(L"first", E_ABORT);
+    Require(outcomes.Summarize().failure == E_ABORT, "latest failure replaces earlier failure");
+    Require(outcomes.Summarize(E_FAIL).failure == E_FAIL, "overall operation failure keeps priority");
+    outcomes.Record(L"first", S_OK);
+    summary = outcomes.Summarize(E_FAIL);
+    Require(summary.failure == E_FAIL && !summary.incomplete,
+            "item recovery cannot erase the overall operation failure");
+}
+static void SuccessfulTaskOutcomesDoNotAccumulate() {
+    TaskOutcomes outcomes;
+    const std::wstring prefix = L"C:\\large-directory\\" + std::wstring(180, L'x');
+    for (int item = 0; item < 50000; ++item)
+        outcomes.Record(prefix + std::to_wstring(item), S_OK);
+    Require(outcomes.RetainedCount() == 0 && !outcomes.Summarize().incomplete,
+            "successful descendant paths are not retained");
+    outcomes.Record(L"pending", COPYENGINE_S_PENDING);
+    outcomes.Record(L"failed", E_ACCESSDENIED);
+    for (int item = 0; item < 50000; ++item) {
+        auto source = prefix + std::to_wstring(item);
+        outcomes.Record(source, COPYENGINE_S_PENDING);
+        outcomes.Record(source, S_OK);
+    }
+    auto summary = outcomes.Summarize();
+    Require(outcomes.RetainedCount() == 2 && summary.incomplete && summary.failure == E_ACCESSDENIED,
+            "many pending-success transitions retain only outstanding sources");
+    outcomes.Record(L"pending", S_OK);
+    outcomes.Record(L"failed", S_OK);
+    Require(outcomes.RetainedCount() == 0 && !outcomes.Summarize().incomplete,
+            "all outstanding sources can recover without historical failure retention");
+}
 // 提交进程随即退出；观察进程不持有工作进程句柄，不向其提供窗口。
 int wmain(int argc, wchar_t **argv) {
     OleInitialize(nullptr);
@@ -99,6 +163,8 @@ int wmain(int argc, wchar_t **argv) {
             std::filesystem::create_directories(p);
         SetEnvironmentVariableW(L"ZENEXPLORER_ROOT_DIR", base.c_str());
         TaskPayloadLimits();
+        TaskOutcomeSequences();
+        SuccessfulTaskOutcomesDoNotAccumulate();
         // 模拟主窗口已占用单实例标识：工作模式必须绕过这个互斥量。
         uint64_t hash = 1469598103934665603ull;
         for (auto c : ConfigDir().wstring())

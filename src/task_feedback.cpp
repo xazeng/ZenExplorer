@@ -45,6 +45,8 @@ bool FileTaskFeedback::ApplyPaste(PasteFeedback &pending, const TaskCompletion &
     if (!PasteCurrent(pending, GetForegroundWindow(), GetFocus()))
         return true;
     auto it = app.views.find(pending.tab);
+    if (it == app.views.end())
+        return true;
     HRESULT selection = it->second->SelectPasteResults(pending.created);
     if (selection == S_FALSE)
         return false;
@@ -53,12 +55,31 @@ bool FileTaskFeedback::ApplyPaste(PasteFeedback &pending, const TaskCompletion &
     return true;
 }
 bool FileTaskFeedback::PasteCurrent(const PasteFeedback &pending, HWND foreground, HWND focus) const {
-    auto it = app.views.find(pending.tab);
-    return pending.pane >= 0 && pending.pane < 2 && app.pasteGeneration == pending.generation &&
-           app.model.active == pending.pane && app.model.PaneOf(pending.tab) == pending.pane &&
-           app.model.panes[pending.pane].selected == pending.tab && it != app.views.end() &&
-           !it->second->Navigation().Pending() &&
-           ItemName(it->second->Current().Get()) == pending.destination && focus == pending.focus &&
-           foreground == app.window && GetTickCount64() <= pending.deadline;
+    auto candidate = [&]() -> ShellView * {
+        // 已失效的反馈不再查询 Shell，避免后台目录或扩展拖慢结果消费。
+        if (focus != pending.focus || foreground != app.window || GetTickCount64() > pending.deadline ||
+            pending.pane < 0 || pending.pane >= 2 || app.pasteGeneration != pending.generation ||
+            app.model.active != pending.pane || app.model.PaneOf(pending.tab) != pending.pane ||
+            app.model.panes[pending.pane].selected != pending.tab)
+            return nullptr;
+        auto it = app.views.find(pending.tab);
+        return it != app.views.end() && !it->second->Navigation().Pending() ? it->second.get() : nullptr;
+    };
+    auto *source = candidate();
+    if (!source)
+        return false;
+    const auto path = app.model.Find(pending.tab)->path;
+    HWND liveForeground = GetForegroundWindow(), liveFocus = GetFocus();
+    ComPtr<IShellView> shell = source->shell;
+    auto *identity = shell.Get();
+    if (candidate() != source || source->shell.Get() != identity)
+        return false;
+    bool sameDestination = ItemName(source->Current().Get()) == pending.destination;
+    // Shell 查询及接口释放均可能重入；只接受仍属于原视图和交互状态的结果。
+    shell.Reset();
+    auto *current = candidate();
+    return sameDestination && current == source && current->shell.Get() == identity &&
+           app.model.Find(pending.tab)->path == path && GetForegroundWindow() == liveForeground &&
+           GetFocus() == liveFocus;
 }
 } // namespace zen

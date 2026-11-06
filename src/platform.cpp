@@ -29,30 +29,135 @@ bool FileLogEnabled() {
     wchar_t enabled[2]{};
     return GetEnvironmentVariableW(L"ZENEXPLORER_FILE_LOG", enabled, 2) == 1 && enabled[0] == L'1';
 }
-void Log(const std::wstring &s) {
-    // 默认不创建目录或文件；诊断时显式设置为 1，子任务继承该开关。
-    if (!FileLogEnabled())
-        return;
-    std::error_code ec;
-    auto p = LogDir();
-    std::filesystem::create_directories(p, ec);
-    HANDLE f =
-        CreateFileW((p / L"application.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f != INVALID_HANDLE_VALUE) {
-        SYSTEMTIME t{};
-        GetLocalTime(&t);
-        wchar_t prefix[80];
-        swprintf_s(prefix, L"%04u-%02u-%02u %02u:%02u:%02u [%lu] ", t.wYear, t.wMonth, t.wDay, t.wHour,
-                   t.wMinute, t.wSecond, GetCurrentProcessId());
-        auto msg = std::wstring(prefix) + s + L"\r\n";
-        int n = WideCharToMultiByte(CP_UTF8, 0, msg.c_str(), (int)msg.size(), nullptr, 0, nullptr, nullptr);
-        std::string utf(n, 0);
-        WideCharToMultiByte(CP_UTF8, 0, msg.c_str(), (int)msg.size(), utf.data(), n, nullptr, nullptr);
-        DWORD wrote;
-        WriteFile(f, utf.data(), n, &wrote, nullptr);
-        CloseHandle(f);
+namespace {
+constexpr LONGLONG MaxLogBytes = 4 * 1024 * 1024;
+constexpr size_t MaxLogRecordBytes = 64 * 1024;
+struct LogHandle {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ~LogHandle() {
+        Reset();
     }
+    void Reset(HANDLE next = INVALID_HANDLE_VALUE) {
+        if (value != INVALID_HANDLE_VALUE)
+            CloseHandle(value);
+        value = next;
+    }
+};
+bool MissingLogFile() {
+    return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+}
+bool TrimOversizedArchive(const std::filesystem::path &file) {
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &info))
+        return MissingLogFile();
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return false;
+    ULARGE_INTEGER size{};
+    size.HighPart = info.nFileSizeHigh;
+    size.LowPart = info.nFileSizeLow;
+    // 旧版本可能生成无限增长的日志；不把超限旧文件继续带入保留档。
+    return size.QuadPart <= MaxLogBytes || DeleteFileW(file.c_str());
+}
+std::string LogRecord(const std::wstring &s) {
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    wchar_t prefix[80];
+    swprintf_s(prefix, L"%04u-%02u-%02u %02u:%02u:%02u [%lu] ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+               t.wSecond, GetCurrentProcessId());
+    size_t length = std::min(s.size(), MaxLogRecordBytes);
+    // 先限制 UTF-16 输入，避免为了截断一条诊断消息又分配同等大小的副本。
+    if (length < s.size() && length && s[length - 1] >= 0xd800 && s[length - 1] <= 0xdbff)
+        --length;
+    auto message = std::wstring(prefix) + s.substr(0, length);
+    int bytes =
+        WideCharToMultiByte(CP_UTF8, 0, message.data(), (int)message.size(), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0)
+        return {};
+    std::string record(bytes, 0);
+    if (!WideCharToMultiByte(CP_UTF8, 0, message.data(), (int)message.size(), record.data(), bytes, nullptr,
+                             nullptr))
+        return {};
+    if (length < s.size() || record.size() + 2 > MaxLogRecordBytes) {
+        constexpr char suffix[] = " [truncated]";
+        size_t end = std::min(record.size(), MaxLogRecordBytes - (sizeof(suffix) - 1) - 2);
+        while (end < record.size() && (static_cast<unsigned char>(record[end]) & 0xc0) == 0x80)
+            --end;
+        record.resize(end);
+        record += suffix;
+    }
+    return record + "\r\n";
+}
+void AppendLog(const std::string &record) {
+    if (record.empty())
+        return;
+    auto folder = LogDir();
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    if (ec)
+        return;
+    // 同一目录的主进程、工作进程及不同会话共用文件锁；锁忙即丢弃本条，不等待。
+    LogHandle lock{CreateFileW((folder / L"application.log.lock").c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr)};
+    OVERLAPPED range{};
+    if (lock.value == INVALID_HANDLE_VALUE ||
+        !LockFileEx(lock.value, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &range))
+        return;
+    // 关闭锁文件句柄即释放字节锁；锁文件不能在运行中删除，否则其他进程可能锁住不同文件。
+    const auto file = folder / L"application.log";
+    const auto older = folder / L"application.log.1";
+    const auto oldest = folder / L"application.log.2";
+    if (!TrimOversizedArchive(older) || !TrimOversizedArchive(oldest))
+        return;
+    LogHandle active{CreateFileW(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr)};
+    LARGE_INTEGER size{};
+    if (active.value == INVALID_HANDLE_VALUE || !GetFileSizeEx(active.value, &size))
+        return;
+    if (size.QuadPart > MaxLogBytes - (LONGLONG)record.size()) {
+        active.Reset();
+        // 先取得当前文件的删除访问权，读者禁止轮转时不提前覆盖旧档。
+        active.Reset(CreateFileW(file.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (active.value == INVALID_HANDLE_VALUE || !GetFileSizeEx(active.value, &size))
+            return;
+        if (size.QuadPart > MaxLogBytes) {
+            if (!DeleteFileW(file.c_str()))
+                return;
+        } else {
+            if (!MoveFileExW(older.c_str(), oldest.c_str(), MOVEFILE_REPLACE_EXISTING) && !MissingLogFile())
+                return;
+            if (!MoveFileExW(file.c_str(), older.c_str(), MOVEFILE_REPLACE_EXISTING))
+                return;
+        }
+        active.Reset();
+        active.Reset(CreateFileW(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (active.value == INVALID_HANDLE_VALUE)
+            return;
+        size.QuadPart = 0;
+    }
+    if (!SetFilePointerEx(active.value, size, nullptr, FILE_BEGIN))
+        return;
+    DWORD written = 0;
+    if (!WriteFile(active.value, record.data(), (DWORD)record.size(), &written, nullptr) ||
+        written != record.size()) {
+        // 尽力撤回短写，避免下一条记录接在半条 UTF-8 内容后面；失败不递归记录日志。
+        if (SetFilePointerEx(active.value, size, nullptr, FILE_BEGIN))
+            SetEndOfFile(active.value);
+    }
+}
+} // namespace
+void Log(const std::wstring &s) noexcept {
+    const DWORD previousError = GetLastError();
+    try {
+        // 默认不创建目录或文件；诊断时显式设置为 1，子任务继承该开关。
+        if (FileLogEnabled())
+            AppendLog(LogRecord(s));
+    } catch (...) {
+        // 诊断失败（包括内存分配失败）不能中断原业务。
+    }
+    SetLastError(previousError);
 }
 ResourceTrace::ResourceTrace(std::wstring name) : phase(std::move(name)) {
     enabled = FileLogEnabled();

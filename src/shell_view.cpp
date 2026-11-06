@@ -146,6 +146,7 @@ void ShellView::Destroy() {
     if (destroyed)
         return;
     destroyed = true;
+    MarkSettingsChanged();
     initialized = false;
     browserSized = false;
     ResourceTrace trace(L"销毁 Shell 视图 tab=" + std::to_wstring(id));
@@ -256,7 +257,20 @@ HRESULT ShellView::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     if (!pidl || (navigation.Pending() && !navigation.Matches(pidl)))
         return E_ABORT;
     if (!navigation.Pending()) {
+        App &owner = app;
+        const Id tabId = id;
+        const uint64_t lifetime = lifetimeId;
+        auto *tab = owner.model.Find(tabId);
+        if (!tab)
+            return E_ABORT;
+        const auto path = tab->path;
         Capture();
+        auto found = owner.views.find(tabId);
+        tab = owner.model.Find(tabId);
+        if (!tab || tab->path != path || found == owner.views.end() || found->second.get() != this ||
+            found->second->lifetimeId != lifetime || found->second->destroyed ||
+            found->second->Navigation().Pending())
+            return E_ABORT;
         ComPtr<IShellItem> item;
         HRESULT hr = SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&item));
         if (FAILED(hr))
@@ -274,6 +288,7 @@ HRESULT ShellView::OnNavigationPending(PCIDLIST_ABSOLUTE pidl) {
     return S_OK;
 }
 HRESULT ShellView::OnViewCreated(IShellView *v) {
+    MarkSettingsChanged();
     shell = v;
     // 新 Shell 子视图需要一次实际尺寸同步，即使宿主矩形没有变化。
     browserSized = false;
@@ -335,7 +350,8 @@ HRESULT ShellView::OnStateChange(IShellView *, ULONG change) {
     if (change == CDBOSC_SELCHANGE) {
         ++app.pasteGeneration;
         // 文件选择不属于会话；高频通知只合并刷新状态栏。
-        app.QueueStatusUpdate();
+        if (app.model.panes[app.model.active].selected == id)
+            app.QueueStatusUpdate();
     } else if (change == CDBOSC_KILLFOCUS) {
         app.QueueStatusUpdate();
     } else if (change == CDBOSC_SETFOCUS) {
@@ -344,13 +360,17 @@ HRESULT ShellView::OnStateChange(IShellView *, ULONG change) {
             app.model.active = p;
             PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 2);
         }
-    } else
+    } else {
+        MarkSettingsChanged();
         PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 3);
+    }
     return S_OK;
 }
 HRESULT ShellView::OnColumnClicked(IShellView *, int) {
-    if (!destroyed && !app.closing)
+    if (!destroyed && !app.closing) {
+        MarkSettingsChanged();
         PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 3);
+    }
     return S_OK;
 }
 void ShellView::Resize(RECT r) {
@@ -542,64 +562,110 @@ HRESULT ShellView::DeletePaths(std::vector<std::wstring> &paths) {
     paths = std::move(snapshot);
     return S_OK;
 }
-void ShellView::Capture() {
+bool ShellView::Capture() {
     auto *t = app.model.Find(id);
-    if (!t || !shell || navigation.Pending() || FAILED(navigation.Error()))
-        return;
+    if (!t || !shell || destroyed || capturing || navigation.Pending() || FAILED(navigation.Error()))
+        return false;
+    // 离开视图及退出时即使没有通知也会强制采样；失败后仍须能再次采集。
+    if (!NeedsCapture())
+        MarkSettingsChanged();
     App &owner = app;
     const Id tabId = id;
-    const auto path = t->path;
+    const uint64_t lifetime = lifetimeId;
+    const uint64_t revision = settingsRevision;
     ShellView *source = this;
+    capturing = true;
+    struct FinishCapture {
+        App &owner;
+        Id tabId;
+        ShellView *source;
+        uint64_t lifetime;
+        ~FinishCapture() {
+            auto found = owner.views.find(tabId);
+            if (found != owner.views.end() && found->second.get() == source &&
+                found->second->lifetimeId == lifetime)
+                found->second->capturing = false;
+        }
+    } finish{owner, tabId, source, lifetime};
+    const auto path = t->path;
     ComPtr<IShellView> sourceShell = shell;
+    IShellView *shellIdentity = sourceShell.Get();
+    bool complete = true;
+    auto available = [&complete](HRESULT hr) {
+        // 特殊命名空间可不实现部分设置；暂时失败则不能当作已采集。
+        if (FAILED(hr) && hr != E_NOINTERFACE && hr != E_NOTIMPL &&
+            hr != HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+            complete = false;
+        return SUCCEEDED(hr);
+    };
     std::optional<std::pair<FOLDERVIEWMODE, int>> mode;
     std::optional<std::vector<SORTCOLUMN>> sort;
     std::optional<std::vector<Column>> columns;
     ComPtr<IFolderView2> f;
-    if (SUCCEEDED(sourceShell.As(&f))) {
+    if (available(sourceShell.As(&f))) {
         FOLDERVIEWMODE currentMode;
         int iconSize = 0;
-        if (SUCCEEDED(f->GetViewModeAndIconSize(&currentMode, &iconSize)))
+        if (available(f->GetViewModeAndIconSize(&currentMode, &iconSize)))
             mode = std::make_pair(currentMode, iconSize);
         int n = 0;
-        if (SUCCEEDED(f->GetSortColumnCount(&n)) && n > 0 && n < 64) {
-            std::vector<SORTCOLUMN> values(n);
-            if (SUCCEEDED(f->GetSortColumns(values.data(), n)))
-                sort = std::move(values);
+        if (available(f->GetSortColumnCount(&n))) {
+            if (n < 0 || n >= 64)
+                complete = false;
+            else if (n > 0) {
+                std::vector<SORTCOLUMN> values(n);
+                if (available(f->GetSortColumns(values.data(), n)))
+                    sort = std::move(values);
+            }
         }
         ComPtr<IColumnManager> cm;
         ComPtr<IShellItem> folder;
         ComPtr<IPersistFolder2> persisted;
         PIDLIST_ABSOLUTE pidl = nullptr;
-        if (SUCCEEDED(f->GetFolder(IID_PPV_ARGS(&persisted))) && SUCCEEDED(persisted->GetCurFolder(&pidl))) {
-            SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&folder));
+        if (available(f->GetFolder(IID_PPV_ARGS(&persisted))) && available(persisted->GetCurFolder(&pidl))) {
+            available(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(&folder)));
         }
         CoTaskMemFree(pidl);
         SFGAOF folderFlags = 0;
-        bool filesystem = folder && SUCCEEDED(folder->GetAttributes(SFGAO_FILESYSTEM, &folderFlags)) &&
+        bool filesystem = folder && available(folder->GetAttributes(SFGAO_FILESYSTEM, &folderFlags)) &&
                           (folderFlags & SFGAO_FILESYSTEM);
-        if (filesystem && SUCCEEDED(sourceShell.As(&cm))) {
+        if (filesystem && available(sourceShell.As(&cm))) {
             UINT count = 0;
-            if (SUCCEEDED(cm->GetColumnCount(CM_ENUM_VISIBLE, &count)) && count < 128) {
-                std::vector<PROPERTYKEY> keys(count);
-                if (SUCCEEDED(cm->GetColumns(CM_ENUM_VISIBLE, keys.data(), count))) {
-                    columns.emplace();
-                    for (auto key : keys) {
-                        CM_COLUMNINFO info{sizeof(info)};
-                        info.dwMask = CM_MASK_WIDTH;
-                        if (SUCCEEDED(cm->GetColumnInfo(key, &info)))
-                            columns->push_back({key, info.uWidth});
+            if (available(cm->GetColumnCount(CM_ENUM_VISIBLE, &count))) {
+                if (count >= 128)
+                    complete = false;
+                else {
+                    std::vector<PROPERTYKEY> keys(count);
+                    if (!count || available(cm->GetColumns(CM_ENUM_VISIBLE, keys.data(), count))) {
+                        std::vector<Column> values;
+                        bool allColumns = true;
+                        for (auto key : keys) {
+                            CM_COLUMNINFO info{sizeof(info)};
+                            info.dwMask = CM_MASK_WIDTH;
+                            if (available(cm->GetColumnInfo(key, &info)))
+                                values.push_back({key, info.uWidth});
+                            else
+                                allColumns = false;
+                        }
+                        if (allColumns)
+                            columns = std::move(values);
                     }
                 }
             }
         }
     }
+    // Release 也属于 Shell 外呼，释放采样引用后再核验代次并提交，期间保持重入保护。
+    f.Reset();
+    sourceShell.Reset();
     // Shell 外呼可能重入关闭、移动或导航。只向仍对应本次采样的视图提交设置。
     auto found = owner.views.find(tabId);
     t = owner.model.Find(tabId);
-    if (!t || t->path != path || found == owner.views.end() || found->second.get() != source ||
-        found->second->shell.Get() != sourceShell.Get() || found->second->Navigation().Pending() ||
+    if (found == owner.views.end() || found->second.get() != source || found->second->lifetimeId != lifetime)
+        return false;
+    auto &live = *found->second;
+    if (!t || t->path != path || live.destroyed || live.settingsRevision != revision ||
+        found->second->shell.Get() != shellIdentity || found->second->Navigation().Pending() ||
         FAILED(found->second->Navigation().Error()))
-        return;
+        return false;
     if (mode) {
         t->viewMode = mode->first;
         t->iconSize = mode->second;
@@ -608,11 +674,15 @@ void ShellView::Capture() {
         t->sort = std::move(*sort);
     if (columns)
         t->columns = std::move(*columns);
+    if (complete)
+        live.capturedRevision = revision;
+    return complete;
 }
 HRESULT ShellView::ApplyViewMode() {
     auto *tab = app.model.Find(id);
     if (!tab || !shell)
         return E_UNEXPECTED;
+    MarkSettingsChanged();
     ComPtr<IFolderView2> view;
     HRESULT hr = shell.As(&view);
     if (SUCCEEDED(hr))
@@ -625,6 +695,7 @@ void ShellView::Apply() {
     auto *t = app.model.Find(id);
     if (!t || !shell)
         return;
+    MarkSettingsChanged();
     ComPtr<IFolderView2> f;
     if (SUCCEEDED(shell.As(&f))) {
         ApplyViewMode();
@@ -683,6 +754,16 @@ bool ShellView::NativeControlMenu(HWND source, HWND host) {
         wchar_t name[128]{};
         GetClassNameW(h, name, 128);
         if (!_wcsicmp(name, L"Edit") || !_wcsicmp(name, WC_HEADERW))
+            return true;
+    }
+    return false;
+}
+static bool HeaderControlMenu(HWND source, HWND host) {
+    for (HWND current = source; current && current != host && IsChild(host, current);
+         current = GetParent(current)) {
+        wchar_t name[128]{};
+        GetClassNameW(current, name, 128);
+        if (!_wcsicmp(name, WC_HEADERW))
             return true;
     }
     return false;
@@ -765,10 +846,28 @@ std::optional<bool> ShellView::ContextMenuBackground(HWND input, POINT point, bo
 }
 LRESULT CALLBACK ShellView::Subclass(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR key, DWORD_PTR data) {
     auto *s = (ShellView *)data;
+    auto settingsCommand = [&] {
+        App &owner = s->app;
+        const Id tabId = s->id;
+        const uint64_t lifetime = s->lifetimeId;
+        // 原生菜单可泵消息并关闭标签；命令返回后重新定位，避免过早采到旧设置。
+        LRESULT result = DefSubclassProc(w, m, a, b);
+        auto found = owner.views.find(tabId);
+        if (!owner.closing && found != owner.views.end() && found->second.get() == s &&
+            found->second->lifetimeId == lifetime && !found->second->destroyed) {
+            found->second->MarkSettingsChanged();
+            PostMessageW(owner.window, WM_ZEN_CHANGED, (WPARAM)tabId, 3);
+        }
+        return result;
+    };
+    if (m == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(a) & MK_CONTROL))
+        return settingsCommand();
     if (m == WM_NOTIFY && b) {
         const UINT code = reinterpret_cast<NMHDR *>(b)->code;
-        if (code == HDN_ENDTRACKW || code == HDN_ENDTRACKA || code == HDN_ENDDRAG)
+        if (code == HDN_ENDTRACKW || code == HDN_ENDTRACKA || code == HDN_ENDDRAG) {
+            s->MarkSettingsChanged();
             PostMessageW(s->app.window, WM_ZEN_CHANGED, (WPARAM)s->id, 3);
+        }
     }
     if (m == WM_KILLFOCUS)
         ++s->app.pasteGeneration;
@@ -791,6 +890,8 @@ LRESULT CALLBACK ShellView::Subclass(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PT
         }
         // 使用真实输入位置避免控件把消息转发到文件视图后被再次截获。
         // 未识别的内容、编辑器和表头保留自己的系统菜单。
+        if (HeaderControlMenu(source, s->host) || HeaderControlMenu(input, s->host))
+            return settingsCommand();
         if (NativeControlMenu(source, s->host) || (source != s->host && !IsChild(s->host, source)))
             return DefSubclassProc(w, m, a, b);
         auto background = s->ContextMenuBackground(input, p, keyboard);

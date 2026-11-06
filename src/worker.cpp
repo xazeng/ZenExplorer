@@ -1,8 +1,8 @@
 #include "operations.h"
+#include "task_outcomes.h"
 #include <wrl/implements.h>
 #include <sherrors.h>
 #include <unordered_set>
-#include <unordered_map>
 #include <shldisp.h>
 using namespace zen;
 // 逐项记录系统结果，避免部分失败被整体返回值掩盖。
@@ -12,12 +12,12 @@ class TaskProgress final
   public:
     HRESULT failure = S_OK;
     bool incomplete = false;
-    std::unordered_map<std::wstring, HRESULT> outcomes;
+    TaskOutcomes outcomes;
     std::unordered_set<std::wstring> roots, seen;
     std::vector<std::wstring> created;
     HRESULT Record(IShellItem *source, IShellItem *newItem, HRESULT hr) {
         auto name = ItemName(source);
-        outcomes[name] = hr;
+        outcomes.Record(name, hr);
         std::optional<std::wstring> createdName;
         // 只回传提交的顶层项目，避免把复制文件夹的后代也作为待选项目。
         if (SUCCEEDED(hr) && hr != COPYENGINE_S_USER_IGNORED && hr != COPYENGINE_S_PENDING && newItem &&
@@ -35,14 +35,9 @@ class TaskProgress final
         return S_OK;
     }
     void Summarize() {
-        // 冲突询问会先回报 PENDING，再回报真正结果，不能永久把 PENDING 当成取消。
-        for (auto &[path, hr] : outcomes) {
-            if (FAILED(hr) && SUCCEEDED(failure))
-                failure = hr;
-            if (FAILED(hr) || hr == COPYENGINE_S_USER_IGNORED || hr == COPYENGINE_S_PENDING ||
-                hr == COPYENGINE_S_PENDING_DELETE || hr == COPYENGINE_S_PENDING_BATCH_COPY)
-                incomplete = true;
-        }
+        auto summary = outcomes.Summarize(failure);
+        failure = summary.failure;
+        incomplete |= summary.incomplete;
     }
     HRESULT STDMETHODCALLTYPE StartOperations() override {
         return S_OK;

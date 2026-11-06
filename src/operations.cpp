@@ -85,6 +85,50 @@ bool CleanupTaskResult(const std::filesystem::path &result) {
         return false;
     return true;
 }
+bool CleanupExitedTaskFiles(const std::filesystem::path &result, HANDLE process) {
+    if (!process || WaitForSingleObject(process, 0) != WAIT_OBJECT_0)
+        return false;
+    const auto name = result.filename().wstring();
+    const std::wstring suffix = L".task.result";
+    if (name.size() != 38 + suffix.size() || !name.ends_with(suffix))
+        return false;
+    const auto token = name.substr(0, 38);
+    GUID id{};
+    wchar_t canonical[40]{};
+    if (token.front() != L'{' || token.back() != L'}' || FAILED(CLSIDFromString(token.c_str(), &id)) ||
+        !StringFromGUID2(id, canonical, 40) || _wcsicmp(token.c_str(), canonical))
+        return false;
+    std::error_code ec;
+    auto root = std::filesystem::weakly_canonical(DataDir() / L"tasks", ec);
+    if (ec)
+        return false;
+    auto parent = std::filesystem::weakly_canonical(result.parent_path(), ec);
+    if (ec || parent != root)
+        return false;
+    bool complete = true;
+    // 名称由已验证的 GUID 构造，不能用通配符扩大到其他任务或未知附属文件。
+    for (const auto *ending : {L".task.tmp", L".task", L".task.result.items.tmp", L".task.result.items",
+                               L".task.result.tmp", L".task.result"}) {
+        const auto file = root / (token + ending);
+        DWORD attributes = GetFileAttributesW(file.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+                complete = false;
+            continue;
+        }
+        if (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+            complete = false;
+            continue;
+        }
+        if (!DeleteFileW(file.c_str())) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+                complete = false;
+        }
+    }
+    return complete;
+}
 FileTask ReadTask(const std::filesystem::path &file) {
     auto bytes = ReadEnvelope(file, TaskMagic);
     Reader r{bytes};

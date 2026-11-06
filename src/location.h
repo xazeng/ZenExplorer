@@ -40,6 +40,8 @@ struct LocationKeyHash {
 };
 class LocationStore {
     std::unordered_map<LocationKey, ShellLocation, LocationKeyHash> entries;
+    // 仅运行期索引，同一 ID 可保留多个位置键；不持有主表迭代器或记录指针。
+    std::unordered_multimap<std::wstring, LocationKey> idIndex;
     struct Presentation {
         std::wstring displayPath, fileSystemPath;
         bool fileSystemKnown = false;
@@ -47,8 +49,16 @@ class LocationStore {
         std::vector<std::pair<std::wstring, LocationKey>> parts;
     };
     std::unordered_map<LocationKey, Presentation, LocationKeyHash> presentation;
+    const LocationKey *IndexedKey(const std::wstring &id) const;
+    void RemoveIndex(const std::wstring &id, const LocationKey &key);
+    void Store(const LocationKey &key, ShellLocation location);
+    void Swap(LocationStore &other) noexcept;
 
   public:
+    LocationStore() = default;
+    LocationStore(const LocationStore &) = default;
+    LocationStore(LocationStore &&other);
+    LocationStore &operator=(LocationStore other) noexcept;
     std::set<LocationKey> References(const std::set<LocationKey> &roots) const;
     std::wstring EnsureId(const LocationKey &key);
     LocationKey KeyForId(const std::wstring &id);

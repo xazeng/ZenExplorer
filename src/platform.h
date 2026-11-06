@@ -25,7 +25,7 @@ std::filesystem::path ConfigDir();
 std::filesystem::path LogDir();
 std::filesystem::path ExeDir();
 bool FileLogEnabled();
-void Log(const std::wstring &message);
+void Log(const std::wstring &message) noexcept;
 // 仅在显式启用文件日志时采样；不记录右键菜单停留时间为扩展执行耗时。
 class ResourceTrace {
     std::wstring phase;
