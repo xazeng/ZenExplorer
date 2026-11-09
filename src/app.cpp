@@ -1047,7 +1047,8 @@ void App::PruneLocations() {
     }
     model.locations.Retain(retained);
 }
-void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex) {
+void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex,
+                   std::vector<BYTE> selectedItem) {
     ++pasteGeneration;
     auto *t = model.Find(id);
     if (!t || path.empty())
@@ -1061,7 +1062,7 @@ void App::Navigate(Id id, const LocationKey &path, bool append, int historyIndex
         it = views.find(id);
         if (closing || it == views.end() || !model.Find(id))
             return;
-        it->second->Browse({path, append, historyIndex});
+        it->second->Browse({path, append, historyIndex, std::move(selectedItem)});
         Layout();
     }
 }

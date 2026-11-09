@@ -5,6 +5,8 @@ struct NavigationRequest {
     LocationKey destination;
     bool appendHistory = true;
     int historyIndex = -1;
+    // 仅属于本次导航，不保存到会话；失败或后续导航会丢弃此选择。
+    std::vector<BYTE> selectedItem;
 };
 // 新地址成功后提交；已有历史即使加载失败也提交其位置。
 class NavigationState {

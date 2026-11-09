@@ -78,7 +78,9 @@ class LocationStore {
     HRESULT Resolve(const LocationKey &key, LocationResolution &result) const;
     HRESULT ResolveItem(const LocationKey &key, IShellItem **item) const;
     // 编辑文字不是位置键；先使用 Shell 解析，再从已知可读层级按对象身份定位。
-    HRESULT ResolveInput(const std::wstring &text, LocationKey &destination);
+    // 提供 selectedItem 时允许普通文件输入，返回父目录及待选文件的绝对 PIDL。
+    HRESULT ResolveInput(const std::wstring &text, LocationKey &destination,
+                         std::vector<BYTE> *selectedItem = nullptr);
     HRESULT ValidateDirectory(const LocationKey &key) const;
     PCIDLIST_ABSOLUTE Pidl(const LocationKey &key) const;
     bool Same(const LocationKey &key, PCIDLIST_ABSOLUTE pidl) const;

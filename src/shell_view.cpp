@@ -319,10 +319,29 @@ HRESULT ShellView::OnNavigationComplete(PCIDLIST_ABSOLUTE pidl) {
     }
     app.RefreshMetadata(id, item.Get());
     UpdateNavigation(item.Get());
+    auto selection = navigation.Request().selectedItem;
     navigation.Complete();
     Trace(L"OnNavigationComplete");
+    App &owner = app;
+    const Id tabId = id;
+    const auto lifetime = lifetimeId;
+    const auto generation = owner.pasteGeneration;
+    ComPtr<IShellView> completedShell = shell;
     Apply();
-    PostMessageW(app.window, WM_ZEN_CHANGED, (WPARAM)id, 0);
+    PostMessageW(owner.window, WM_ZEN_CHANGED, (WPARAM)tabId, 0);
+    auto current = owner.views.find(tabId);
+    // Apply 可重入；迟到的定位不得覆盖新导航或用户后续选择。
+    if (!owner.closing && current != owner.views.end() && current->second.get() == this &&
+        current->second->lifetimeId == lifetime && !current->second->Navigation().Pending() &&
+        owner.pasteGeneration == generation && current->second->shell == completedShell && completedShell &&
+        ValidPidl(selection) &&
+        ILIsParent(pidl, reinterpret_cast<PCIDLIST_ABSOLUTE>(selection.data()), TRUE)) {
+        HRESULT selected =
+            completedShell->SelectItem(ILFindLastID(reinterpret_cast<PCIDLIST_ABSOLUTE>(selection.data())),
+                                       SVSI_SELECT | SVSI_DESELECTOTHERS | SVSI_FOCUSED | SVSI_ENSUREVISIBLE);
+        Log(L"地址文件定位 tab=" + std::to_wstring(tabId) + L" result=" +
+            std::to_wstring((unsigned long)selected));
+    }
     return S_OK;
 }
 HRESULT ShellView::OnNavigationFailed(PCIDLIST_ABSOLUTE pidl) {

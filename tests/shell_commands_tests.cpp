@@ -676,7 +676,36 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                     Fail("stale or missing paste feedback changed selection");
             }
             stage = 20;
-            PostMessageW(app->window, WM_CLOSE, 0, 0);
+            since = GetTickCount64();
+            // 地址栏实际提交跨目录文件路径；占位 exe 不应被执行。
+            std::ofstream(base / L"destination" / L"定位 测试.exe") << "selection only";
+            auto input = (base / L"destination" / L"定位 测试.exe").wstring();
+            std::replace(input.begin(), input.end(), L'\\', L'/');
+            app->addressBars[0]->Edit();
+            SetWindowTextW(app->addressBars[0]->EditWindow(), input.c_str());
+            SendMessageW(app->addressBars[0]->EditWindow(), WM_KEYDOWN, VK_RETURN, 0);
+        } else if (stage == 20 || stage == 21) {
+            auto selected = view.Selected();
+            if (selected.size() != 1 || ItemName(selected.front().Get(), SIGDN_FILESYSPATH) !=
+                                            (base / L"destination" / L"定位 测试.exe").wstring()) {
+                busy = false;
+                return;
+            }
+            if (stage == 20) {
+                // 同目录再次定位，覆盖反斜杠输入及已有视图选择。
+                view.shell->SelectItem(nullptr, SVSI_DESELECTOTHERS);
+                if (!view.Selected().empty())
+                    Fail("address selection could not be cleared before same-folder test");
+                stage = 21;
+                since = GetTickCount64();
+                auto input = (base / L"destination" / L"定位 测试.exe").wstring();
+                app->addressBars[0]->Edit();
+                SetWindowTextW(app->addressBars[0]->EditWindow(), input.c_str());
+                SendMessageW(app->addressBars[0]->EditWindow(), WM_KEYDOWN, VK_RETURN, 0);
+            } else {
+                stage = 22;
+                PostMessageW(app->window, WM_CLOSE, 0, 0);
+            }
         }
     }
     busy = false;
@@ -739,5 +768,5 @@ int wmain(int argc, wchar_t **argv) {
         OleSetClipboard(nullptr);
     originalClipboard.Reset();
     OleUninitialize();
-    return failed || stage != 20 ? 1 : 0;
+    return failed || stage != (probeCode ? 20 : 22) ? 1 : 0;
 }

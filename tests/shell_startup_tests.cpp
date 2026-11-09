@@ -1141,6 +1141,32 @@ int main() {
             !edited.empty() || FAILED(presentation.locations.ResolveInput(L"", edited)) || edited != Home)
             return 1;
         auto tab = presentation.Add(0, key);
+        std::vector<BYTE> selected;
+        for (bool forward : {false, true}) {
+            auto input = (childrenRoot / L"file.txt").wstring();
+            auto directory = childrenRoot.wstring();
+            if (forward) {
+                std::replace(input.begin(), input.end(), L'\\', L'/');
+                std::replace(directory.begin(), directory.end(), L'\\', L'/');
+            }
+            if (FAILED(presentation.locations.ResolveInput(input, edited, &selected)) ||
+                !ValidPidl(selected) ||
+                presentation.locations.FileSystemPath(edited) != childrenRoot.wstring() ||
+                !resolvesTo(directory, childrenRoot))
+                return 1;
+            ComPtr<IShellItem> selectedFile;
+            if (FAILED(SHCreateItemFromIDList(reinterpret_cast<PCIDLIST_ABSOLUTE>(selected.data()),
+                                              IID_PPV_ARGS(&selectedFile))) ||
+                ItemName(selectedFile.Get(), SIGDN_FILESYSPATH) != (childrenRoot / L"file.txt").wstring() ||
+                SUCCEEDED(presentation.locations.ResolveInput(input, edited)))
+                return 1;
+        }
+        if (SUCCEEDED(presentation.locations.ResolveInput((childrenRoot / L"missing.exe").wstring(), edited,
+                                                          &selected)) ||
+            !edited.empty() || !selected.empty() ||
+            FAILED(presentation.locations.ResolveInput(childrenRoot.wstring(), edited, &selected)) ||
+            !selected.empty())
+            return 1;
         presentation.Remove(0, {tab}, true);
         auto file = ConfigDir() / L"display-cache.dat";
         if (!SaveModel(presentation, file))

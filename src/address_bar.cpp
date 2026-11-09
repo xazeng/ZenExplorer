@@ -129,16 +129,18 @@ LRESULT CALLBACK AddressBar::EditProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_P
                 const Id id = tab->id;
                 const auto before = tab->path;
                 LocationKey destination;
-                HRESULT hr = app->model.locations.ResolveInput(text, destination);
+                std::vector<BYTE> selectedItem;
+                HRESULT hr = app->model.locations.ResolveInput(text, destination, &selectedItem);
                 // Shell 解析可能重入；不能把原编辑操作提交给已经切换的标签。
                 tab = app->model.Find(id);
                 if (app->closing || !tab || app->model.panes[p].selected != id || tab->path != before)
                     return 0;
                 if (SUCCEEDED(hr))
-                    app->Navigate(id, destination);
+                    app->Navigate(id, destination, true, -1, std::move(selectedItem));
                 else {
                     Log(L"地址输入解析失败 " + ErrorText(hr));
-                    Report(app->window, L"无法确定此地址对应的目录，请检查路径或通过地址层级选择目录。", hr);
+                    Report(app->window, L"无法确定此地址对应的文件或目录，请检查路径或通过地址层级选择目录。",
+                           hr);
                 }
             }
             return 0;

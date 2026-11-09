@@ -197,8 +197,11 @@ HRESULT LocationStore::ValidateDirectory(const LocationKey &key) const {
     hr = item->GetAttributes(SFGAO_FOLDER | SFGAO_VALIDATE, &attributes);
     return FAILED(hr) ? hr : (attributes & SFGAO_FOLDER) ? S_OK : HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 }
-HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &destination) {
+HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &destination,
+                                    std::vector<BYTE> *selectedItem) {
     destination.clear();
+    if (selectedItem)
+        selectedItem->clear();
     if (text.size() > 32768 || text.find(L'\0') != std::wstring::npos)
         return E_INVALIDARG;
     if (text.empty()) {
@@ -206,10 +209,13 @@ HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &desti
         return S_OK;
     }
     ComPtr<IShellItem> item;
-    HRESULT native = SHCreateItemFromParsingName(text.c_str(), nullptr, IID_PPV_ARGS(&item));
+    auto parsingText = text;
+    if (IsAbsoluteDrivePath(text) || text.starts_with(L"\\\\") || text.starts_with(L"//"))
+        std::replace(parsingText.begin(), parsingText.end(), L'/', L'\\');
+    HRESULT native = SHCreateItemFromParsingName(parsingText.c_str(), nullptr, IID_PPV_ARGS(&item));
     if (FAILED(native)) {
         // 真正的文件系统地址不按显示名称猜测，保留 Shell 的错误结果。
-        if (IsAbsoluteDrivePath(text) || text.starts_with(L"\\\\"))
+        if (IsAbsoluteDrivePath(parsingText) || parsingText.starts_with(L"\\\\"))
             return native;
         auto normalized = text;
         std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
@@ -282,12 +288,36 @@ HRESULT LocationStore::ResolveInput(const std::wstring &text, LocationKey &desti
         }
     }
     SFGAOF attributes = 0;
-    HRESULT hr = item->GetAttributes(SFGAO_FOLDER, &attributes);
+    HRESULT hr = item->GetAttributes(SFGAO_FOLDER | SFGAO_FILESYSTEM, &attributes);
     if (FAILED(hr))
         return hr;
-    if (!(attributes & SFGAO_FOLDER))
-        return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+    std::vector<BYTE> selection;
+    if (!(attributes & SFGAO_FOLDER)) {
+        if (!selectedItem || !(attributes & SFGAO_FILESYSTEM))
+            return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        hr = SHGetIDListFromObject(item.Get(), &pidl);
+        struct FreePidl {
+            PIDLIST_ABSOLUTE value;
+            ~FreePidl() {
+                CoTaskMemFree(value);
+            }
+        } owned{pidl};
+        if (FAILED(hr))
+            return hr;
+        if (!pidl)
+            return E_FAIL;
+        selection.assign(reinterpret_cast<const BYTE *>(pidl),
+                         reinterpret_cast<const BYTE *>(pidl) + ILGetSize(pidl));
+        ComPtr<IShellItem> parent;
+        hr = item->GetParent(&parent);
+        if (FAILED(hr))
+            return hr;
+        item = std::move(parent);
+    }
     destination = Remember(item.Get());
+    if (!destination.empty() && selectedItem)
+        *selectedItem = std::move(selection);
     return destination.empty() ? E_FAIL : S_OK;
 }
 void LocationStore::Retain(const std::set<LocationKey> &keys) {

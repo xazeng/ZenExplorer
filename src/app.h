@@ -97,7 +97,8 @@ class App {
     std::wstring AddressText(int p) const;
     void BuildMenu();
     void Command(UINT id);
-    void Navigate(Id id, const LocationKey &path, bool append = true, int historyIndex = -1);
+    void Navigate(Id id, const LocationKey &path, bool append = true, int historyIndex = -1,
+                  std::vector<BYTE> selectedItem = {});
     void Travel(int delta);
     void NewTab(int pane, const LocationKey &path = Home, Id group = 0, int index = -1, Id opener = 0);
     void CloseTabs(int p, const std::vector<Id> &ids, bool group = false);
