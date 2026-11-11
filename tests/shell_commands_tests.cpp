@@ -12,7 +12,8 @@ static App *app;
 static std::filesystem::path base;
 static bool busy = false, failed = false, legacy = false;
 // 手工诊断入口，不加入 CTest；执行已安装的 VS Code 系统菜单。
-static bool probeCode = false, probeFolder = false;
+static bool probeCode = false, probeFolder = false, undoOnly = false;
+static std::shared_ptr<void> undoWorker;
 static ComPtr<IDataObject> originalClipboard;
 static int stage = 0;
 static Id openedFrom = 0;
@@ -260,11 +261,19 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                     // 直接调用系统复制，与资源管理器使用相同的 Shell 剪贴板协议。
                     hr = app->ShellVerb(view, L"copy", false);
                     ComPtr<IDataObject> data;
-                    OleGetClipboard(&data);
+                    HRESULT clipboardHr = OleGetClipboard(&data);
                     auto paths = DataItems(data.Get());
-                    if (hr != S_OK || paths.size() != 1 || paths[0] != path)
+                    if (hr != S_OK || paths.size() != 1 || paths[0] != path) {
+                        ComPtr<IShellItemArray> diagnostic;
+                        HRESULT dataHr =
+                            data ? SHCreateShellItemArrayFromDataObject(data.Get(), IID_PPV_ARGS(&diagnostic))
+                                 : E_POINTER;
+                        std::cerr << "native copy hr=" << std::hex << hr << " clipboardHr=" << clipboardHr
+                                  << " dataHr=" << dataHr << std::dec << " count=" << paths.size()
+                                  << " selected=" << view.Selected().size()
+                                  << " clipboard=" << GetClipboardSequenceNumber() << "\n";
                         Fail("native copy clipboard mismatch");
-                    else {
+                    } else {
                         auto &dest = *app->views.at(app->model.panes[1].selected);
                         app->Paste(dest);
                         stage = 6;
@@ -273,7 +282,7 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 }
             }
         } else if (stage == 6) {
-            bool done = (app->tasks.PendingPastes() == 0);
+            bool done = !undoOnly && app->tasks.PendingPastes() == 0;
             auto tasks = DataDir() / L"tasks";
             if (std::filesystem::exists(tasks))
                 for (auto &entry : std::filesystem::directory_iterator(tasks)) {
@@ -284,6 +293,8 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                         Fail("independent paste failed");
                     done = true;
                 }
+            if (undoOnly && undoWorker && WaitForSingleObject(undoWorker.get(), 0) != WAIT_OBJECT_0)
+                done = false;
             if (done && std::filesystem::exists(base / L"destination" / L"clipboard-source.txt")) {
                 std::ifstream file(base / L"destination" / L"clipboard-source.txt");
                 std::string value;
@@ -291,6 +302,15 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
                 if (value != "clipboard regression")
                     Fail("paste contents mismatch");
                 auto &dest = *app->views.at(app->model.panes[1].selected);
+                if (undoOnly) {
+                    // 结果与进程退出均已确认；给系统记录传播留出观察时间，不把文件出现当作完成。
+                    ShellMenu menu;
+                    HRESULT available = menu.Create(dest.shell.Get(), true, app->window);
+                    if (FAILED(available) || !menu.Find(L"undo")) {
+                        busy = false;
+                        return;
+                    }
+                }
                 HRESULT hr = app->ShellVerb(dest, L"undo", true);
                 std::cout << "undo result " << std::hex << hr << std::dec << "\n";
                 if (hr != S_OK)
@@ -300,6 +320,12 @@ static void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
             }
         } else if (stage == 7) {
             if (!std::filesystem::exists(base / L"destination" / L"clipboard-source.txt")) {
+                if (undoOnly) {
+                    stage = 22;
+                    PostMessageW(app->window, WM_CLOSE, 0, 0);
+                    busy = false;
+                    return;
+                }
                 // 本程序复制后，使用原生 Shell 粘贴反向验证互通。
                 app->CopySelection(view, false);
                 auto &dest = *app->views.at(app->model.panes[1].selected);
@@ -726,7 +752,10 @@ int wmain(int argc, wchar_t **argv) {
     // 仅手工诊断进程移除开发终端的 Node 模式，避免 Code.exe 被当作脚本解释器。
     if (probeCode)
         SetEnvironmentVariableW(L"ELECTRON_RUN_AS_NODE", nullptr);
-    OleGetClipboard(&originalClipboard);
+    // 独立复制后通过正式主窗口撤销；全程不读取、替换或固化用户剪贴板。
+    undoOnly = argc == 2 && std::wstring(argv[1]) == L"--undo-only";
+    if (!undoOnly)
+        OleGetClipboard(&originalClipboard);
     base = std::filesystem::current_path() / L".test-data" /
            (L"commands 中文空格-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
             std::to_wstring(GetTickCount64()));
@@ -754,6 +783,13 @@ int wmain(int argc, wchar_t **argv) {
     {
         App instance;
         app = &instance;
+        if (undoOnly) {
+            FileTask task{Operation::Copy, (base / L"destination").wstring(),
+                          {(base / L"files" / L"clipboard-source.txt").wstring()}};
+            if (!LaunchTask(nullptr, task, {}, nullptr, &undoWorker))
+                return 1;
+            stage = 6;
+        }
         since = GetTickCount64();
         UINT_PTR timer = SetTimer(nullptr, 0, 250, Tick);
         instance.Run(GetModuleHandleW(nullptr), SW_HIDE, L"");
@@ -761,11 +797,13 @@ int wmain(int argc, wchar_t **argv) {
         app = nullptr;
     }
     Gdiplus::GdiplusShutdown(token);
-    if (originalClipboard) {
-        OleSetClipboard(originalClipboard.Get());
-        OleFlushClipboard();
-    } else
-        OleSetClipboard(nullptr);
+    if (!undoOnly) {
+        if (originalClipboard) {
+            OleSetClipboard(originalClipboard.Get());
+            OleFlushClipboard();
+        } else
+            OleSetClipboard(nullptr);
+    }
     originalClipboard.Reset();
     OleUninitialize();
     return failed || stage != (probeCode ? 20 : 22) ? 1 : 0;

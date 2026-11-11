@@ -9,7 +9,9 @@ bool TaskCancelled(HRESULT result) {
 HRESULT ValidateTaskPayload(const FileTask &task, size_t feedbackBytes, size_t *payloadBytes) {
     if (payloadBytes)
         *payloadBytes = 0;
-    if (task.sources.empty() || task.operation < Operation::Copy || task.operation > Operation::Drop ||
+    if ((task.operation == Operation::Paste ? !task.sources.empty() || !task.clipboardSequence
+                                            : task.sources.empty() || task.clipboardSequence != 0) ||
+        task.operation < Operation::Copy || task.operation > Operation::Drop ||
         (task.operation != Operation::Delete && task.destination.empty()) ||
         (task.allowed & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
         (task.preferred & ~(DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)) ||
@@ -19,7 +21,7 @@ HRESULT ValidateTaskPayload(const FileTask &task, size_t feedbackBytes, size_t *
         return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
     // 固定字段包括目标字符串长度、源项目数量和回执包长度，字符串内容单独计入。
     size_t bytes = sizeof(Operation) + 2 * sizeof(bool) + 3 * sizeof(DWORD) + sizeof(POINTL) +
-                   3 * sizeof(uint32_t) + feedbackBytes;
+                   4 * sizeof(uint32_t) + feedbackBytes;
     auto addText = [&](const std::wstring &text, bool source) -> HRESULT {
         if (text.size() > MaxStoredTextLength)
             return HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE);
@@ -108,7 +110,7 @@ bool CleanupExitedTaskFiles(const std::filesystem::path &result, HANDLE process)
     bool complete = true;
     // 名称由已验证的 GUID 构造，不能用通配符扩大到其他任务或未知附属文件。
     for (const auto *ending : {L".task.tmp", L".task", L".task.result.items.tmp", L".task.result.items",
-                               L".task.result.tmp", L".task.result"}) {
+                               L".task.result.tmp", L".task.result", L".task.ready", L".task.ready.tmp"}) {
         const auto file = root / (token + ending);
         DWORD attributes = GetFileAttributesW(file.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -145,6 +147,7 @@ FileTask ReadTask(const std::filesystem::path &file) {
     t.collectResults = r.Pod<bool>();
     for (auto n = r.Count(MaxTaskFeedbackBytes); n--;)
         t.sourceFeedback.push_back(r.Pod<uint8_t>());
+    t.clipboardSequence = r.Pod<DWORD>();
     if (r.pos != bytes.size() || FAILED(ValidateTaskPayload(t, t.sourceFeedback.size())))
         throw std::runtime_error("无效文件任务");
     return t;
@@ -239,6 +242,7 @@ bool LaunchTask(HWND owner, const FileTask &t, const std::filesystem::path &exec
     w.Pod(t.collectResults);
     w.Pod((uint32_t)packet.size());
     w.bytes.insert(w.bytes.end(), packet.begin(), packet.end());
+    w.Pod(t.clipboardSequence);
     GUID id{};
     HRESULT hr = CoCreateGuid(&id);
     wchar_t token[40]{};

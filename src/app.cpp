@@ -671,7 +671,7 @@ LRESULT App::Message(UINT m, WPARAM a, LPARAM b) {
         }
         closing = true;
         Save();
-        OleFlushClipboard();
+        // 本程序的复制/剪切已在 CopySelection 中固化；退出时不要固化外部远程来源。
         views.clear();
         for (auto &strip : strips)
             if (strip && IsWindow(strip->hwnd))
@@ -1823,34 +1823,13 @@ void App::CopySelection(ShellView &v, bool cut) {
 }
 void App::Paste(ShellView &v, IShellItem *destination) {
     ++pasteGeneration;
-    ComPtr<IDataObject> data;
-    HRESULT clipboardHr = OleGetClipboard(&data);
-    if (FAILED(clipboardHr)) {
-        Log(L"粘贴无法取得剪贴板 " + ErrorText(clipboardHr));
-        return;
-    }
+    DWORD sequence = GetClipboardSequenceNumber();
     auto current = destination ? ComPtr<IShellItem>(destination) : v.Current();
-    std::vector<std::wstring> paths;
-    SFGAOF flags = 0;
-    HRESULT targetHr = current ? current->GetAttributes(SFGAO_FILESYSTEM | SFGAO_FOLDER, &flags) : E_POINTER;
-    bool fileTarget = SUCCEEDED(targetHr) &&
-                      (flags & (SFGAO_FILESYSTEM | SFGAO_FOLDER)) == (SFGAO_FILESYSTEM | SFGAO_FOLDER);
-    if (!fileTarget)
-        Log(L"粘贴回退原因：目标不是可用文件系统目录 flags=" + std::to_wstring(flags) + L" " +
-            ErrorText(targetHr));
-    bool independent = fileTarget && SnapshotFiles(data.Get(), paths);
-    if (!independent) {
-        Report(window, L"此来源或目标尚不能独立执行，操作未开始。", E_NOTIMPL);
-        return;
-    }
     auto dest = ItemName(current.Get());
     if (dest.empty())
         return;
-    bool move = (PreferredEffect(data.Get()) & DROPEFFECT_MOVE) != 0;
     std::filesystem::path result;
-    DWORD sequence = GetClipboardSequenceNumber();
     PasteFeedback pending{{}, sequence};
-    pending.move = move;
     pending.pane = model.PaneOf(v.id);
     pending.generation = pasteGeneration;
     pending.focus = GetFocus();
@@ -1864,8 +1843,8 @@ void App::Paste(ShellView &v, IShellItem *destination) {
     Log(L"粘贴反馈准备 tab=" + std::to_wstring(v.id) + L" enabled=" + std::to_wstring(pending.tab != 0) +
         L" foreground=" + std::to_wstring(GetForegroundWindow() == window) + L" focus=" + focusClass +
         L" pane=" + std::to_wstring(pending.pane) + L" active=" + std::to_wstring(model.active));
-    FileTask task{Operation::Paste, dest, paths, false};
-    task.preferred = PreferredEffect(data.Get());
+    FileTask task{Operation::Paste, dest, {}, false};
+    task.clipboardSequence = sequence;
     task.collectResults = dest == ItemName(v.Current().Get());
     if (LaunchTask(window, task, {}, &result, &pending.process)) {
         pending.result = result;

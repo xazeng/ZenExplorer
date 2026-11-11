@@ -14,9 +14,11 @@ struct FileTask {
     bool collectResults = true;
     // 仅用于通知普通文件拖放来源完成；文件操作不通过此对象读取内容。
     std::vector<uint8_t> sourceFeedback;
+    // 粘贴只提交意图和剪贴板版本，来源由操作进程在交付阶段取得。
+    DWORD clipboardSequence = 0;
 };
 // 开发阶段采用新的任务格式，不读取旧操作任务；会话格式不变。
-inline constexpr uint32_t TaskMagic = 0x324E455A;
+inline constexpr uint32_t TaskMagic = 0x334E455A;
 inline constexpr uint32_t MaxTaskItems = 100000;
 inline constexpr uint32_t MaxTaskFeedbackBytes = 1024 * 1024;
 // 校验实际待写入的回执包大小，成功时返回不含封装头的序列化长度；不访问 Shell 或文件系统。

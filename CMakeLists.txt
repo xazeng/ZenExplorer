@@ -14,7 +14,7 @@ target_link_libraries(zen_core PUBLIC shell32 ole32 oleaut32 oleacc shlwapi uuid
 # 应用和 Shell 回归复用相同实现，资源与入口仍由各可执行文件持有。
 add_library(zen_operations STATIC src/operations.cpp src/task_tracker.cpp)
 target_link_libraries(zen_operations PUBLIC zen_core)
-add_library(zen_worker STATIC src/worker.cpp)
+add_library(zen_worker STATIC src/worker.cpp src/native_transfer.cpp)
 target_link_libraries(zen_worker PUBLIC zen_operations)
 add_library(zen_ui STATIC src/app.cpp src/shell_menu.cpp src/shell_view.cpp src/tabs.cpp
   src/ui_icons.cpp src/task_feedback.cpp src/address_bar.cpp src/quick_access_ui.cpp)
@@ -47,6 +47,12 @@ target_link_libraries(zen_operations_tests PRIVATE zen_operations)
 add_dependencies(zen_operations_tests ZenExplorer)
 add_test(NAME independent_operations COMMAND zen_operations_tests)
 set_tests_properties(independent_operations PROPERTIES TIMEOUT 150)
+
+add_executable(zen_remote_transfer_tests tests/remote_transfer_tests.cpp src/app.manifest)
+target_link_libraries(zen_remote_transfer_tests PRIVATE zen_worker)
+add_dependencies(zen_remote_transfer_tests ZenExplorer)
+add_test(NAME remote_clipboard_transfer COMMAND zen_remote_transfer_tests)
+set_tests_properties(remote_clipboard_transfer PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 
 add_executable(zen_shell_startup_tests tests/shell_startup_tests.cpp tests/status_tests.cpp
   tests/view_capture_tests.cpp tests/task_feedback_tests.cpp src/app.rc src/app.manifest)

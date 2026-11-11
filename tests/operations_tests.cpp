@@ -22,9 +22,16 @@ static Writer EncodeTask(const FileTask &task) {
     writer.Pod(task.collectResults);
     writer.Pod((uint32_t)task.sourceFeedback.size());
     writer.bytes.insert(writer.bytes.end(), task.sourceFeedback.begin(), task.sourceFeedback.end());
+    writer.Pod(task.clipboardSequence);
     return writer;
 }
 static void TaskPayloadLimits() {
+    FileTask paste{Operation::Paste, L"destination"};
+    Require(FAILED(ValidateTaskPayload(paste, 0)), "paste requires clipboard version");
+    paste.clipboardSequence = 42;
+    Require(SUCCEEDED(ValidateTaskPayload(paste, 0)), "paste intent has no source paths");
+    paste.sources = {L"must-be-resolved-by-worker"};
+    Require(FAILED(ValidateTaskPayload(paste, 0)), "paste rejects caller source snapshot");
     FileTask task{Operation::Copy, L"destination", {L"source"}};
     size_t size = 0;
     Require(SUCCEEDED(ValidateTaskPayload(task, 0, &size)) && size == EncodeTask(task).bytes.size(),
